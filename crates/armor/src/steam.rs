@@ -220,8 +220,12 @@ fn make_executable(dir: &Path) -> Result<(), String> {
 }
 
 /// The links the client looks for in its `HOME` (Valve's `steam.sh` makes
-/// them; the client refuses to start without `~/.steam/steam`): `steam`
-/// and `root` to the client's directory, `bin64` to its ARM64 programs.
+/// most of them; the client refuses to start without `~/.steam/steam`):
+/// `steam` and `root` to the client's directory, `bin64` to its ARM64
+/// programs, `bin32` to the i386 ones, and `sdk32`, `sdk64` and `sdkarm64`
+/// to the Steam API libraries for games (`sdkarm64` holds the
+/// `steam-launch-wrapper` every game is started with; the x86 `steam.sh`
+/// does not know it: without it no game starts, measured 2026-10-15).
 pub fn link_home(home: &Path, steam_dir: &Path) -> Result<(), String> {
     let dot = home.join(".steam");
     fs::create_dir_all(&dot).map_err(|e| format!("{}: {e}", dot.display()))?;
@@ -229,6 +233,10 @@ pub fn link_home(home: &Path, steam_dir: &Path) -> Result<(), String> {
         ("steam", steam_dir.to_path_buf()),
         ("root", steam_dir.to_path_buf()),
         ("bin64", steam_dir.join("steamrtarm64")),
+        ("bin32", steam_dir.join("ubuntu12_32")),
+        ("sdk32", steam_dir.join("linux32")),
+        ("sdk64", steam_dir.join("linux64")),
+        ("sdkarm64", steam_dir.join("linuxarm64")),
     ] {
         let path = dot.join(link);
         let _ = fs::remove_file(&path);
