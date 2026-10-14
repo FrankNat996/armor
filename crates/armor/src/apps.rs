@@ -50,6 +50,10 @@ pub struct AppConf {
     /// The Microsoft Visual C++ 2015-2022 runtime installed in the prefix
     /// (`run`, when a program needed it).
     pub vcredist: bool,
+    /// The Windows engine: empty or `hangover` (Hangover's Wine, the prefix
+    /// in `prefix/`), or `proton` (Steam's ARM64 Proton, the prefix in
+    /// `proton/pfx`; ADR-0040).
+    pub engine: String,
     pub env: Vec<(String, String)>,
 }
 
@@ -64,6 +68,9 @@ pub fn render_app_conf(conf: &AppConf, reasons: &[(String, String)]) -> String {
     );
     if conf.vcredist {
         text.push_str("vcredist = yes\n");
+    }
+    if conf.engine == "proton" {
+        text.push_str("engine = proton\n");
     }
     for (name, value) in &conf.env {
         if let Some((_, why)) = reasons.iter().find(|(n, _)| n == name) {
@@ -94,6 +101,7 @@ pub fn parse_app_conf(text: &str) -> Result<AppConf, String> {
             "dxvk" if value == "yes" || value == "no" => conf.dxvk = value == "yes",
             "mono" if value == "yes" || value == "no" => conf.mono = value == "yes",
             "vcredist" if value == "yes" || value == "no" => conf.vcredist = value == "yes",
+            "engine" if value == "hangover" || value == "proton" => conf.engine = value.to_string(),
             "env" => {
                 let (name, val) = value
                     .split_once('=')
@@ -734,6 +742,242 @@ fn install_steam(name: String) -> Result<(), String> {
     }
 }
 
+/// Steam's ARM64 Proton and its container, from the Steam client installed
+/// by armor (ADR-0040).
+pub struct SteamProton {
+    /// The client's directory (`STEAM_COMPAT_CLIENT_INSTALL_PATH`).
+    steam: PathBuf,
+    /// Proton's script.
+    proton: PathBuf,
+    /// The ARM64 Steam Linux Runtime's entry point.
+    entry_point: PathBuf,
+}
+
+/// The ARM64 Proton of the Steam client installed by armor, if it is there
+/// with its runtime.
+fn steam_proton(places: &Places) -> Option<SteamProton> {
+    let steam = places.app("Steam").join("Steam");
+    let common = steam.join("steamapps/common");
+    let proton = common.join(STEAM_PROTON).join("proton");
+    let entry_point = common.join(STEAM_RUNTIME).join("_v2-entry-point");
+    (proton.is_file() && entry_point.is_file()).then_some(SteamProton {
+        steam,
+        proton,
+        entry_point,
+    })
+}
+
+/// The directory of Steam's ARM64 Proton, and of its runtime, under
+/// `steamapps/common` (Valve's names, 2026-10-15).
+const STEAM_PROTON: &str = "Proton Experimental (ARM64)";
+const STEAM_RUNTIME: &str = "SteamLinuxRuntime_4-arm64";
+
+/// A command that runs a Windows program (the arguments that follow) with
+/// Proton in its container, for application directory `app`: the prefix
+/// in `<app>/proton/pfx`, as Steam does for a game.
+fn proton_command(proton: &SteamProton, app: &Path, conf: &AppConf) -> Command {
+    let mut command = Command::new(&proton.entry_point);
+    command
+        .args(["--verb=waitforexitandrun", "--"])
+        .arg(&proton.proton)
+        .arg("waitforexitandrun")
+        .env("STEAM_COMPAT_DATA_PATH", app.join("proton"))
+        .env("STEAM_COMPAT_CLIENT_INSTALL_PATH", &proton.steam);
+    let mut defaults = vec![(
+        "WINEDEBUG".to_string(),
+        // Only the loader's errors: the missing DLLs `armor run` explains.
+        "-all,err+module".to_string(),
+    )];
+    for (name, value) in &conf.env {
+        defaults.retain(|(n, _)| n != name);
+        defaults.push((name.clone(), value.clone()));
+    }
+    for (name, value) in defaults {
+        if std::env::var_os(&name).is_none_or(|v| v.is_empty()) {
+            command.env(name, value);
+        }
+    }
+    command
+}
+
+/// The command that runs a Windows program of an installed application,
+/// with its engine (`app.conf`'s `engine`).
+fn engine_command(places: &Places, app: &Path, conf: &AppConf) -> Result<Command, String> {
+    if conf.engine == "proton" {
+        let proton = steam_proton(places).ok_or_else(|| {
+            format!(
+                "this application runs with Steam's ARM64 Proton, which is missing: install \
+                 Steam with `armor install steam`, sign in, and choose \"{STEAM_PROTON}\" for \
+                 a game once so that Steam downloads it"
+            )
+        })?;
+        return Ok(proton_command(&proton, app, conf));
+    }
+    places.check_wine()?;
+    Ok(wine_command(&places.wine, app, conf))
+}
+
+/// The menu entries of the shortcuts in a prefix's Start Menus (read by
+/// armor, `shortcuts.rs`): the shortcut itself as the program, the icon
+/// taken from the program into `<app>/icons/`. Uninstallers are left out.
+fn link_entries(app: &Path, prefix: &Path) -> Vec<(PathBuf, Entry)> {
+    let icons = app.join("icons");
+    let mut entries = Vec::new();
+    for (n, link) in crate::shortcuts::start_menu_links(prefix)
+        .into_iter()
+        .enumerate()
+    {
+        let name = link
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        if name.is_empty() || is_uninstaller(&name) {
+            continue;
+        }
+        let (Ok(bytes), Some(windows)) = (
+            fs::read(&link),
+            crate::shortcuts::windows_path(prefix, &link),
+        ) else {
+            continue;
+        };
+        let Some(shortcut) = crate::shortcuts::parse_lnk(&bytes) else {
+            continue;
+        };
+        let (icon_file, index) = match (&shortcut.icon_location, &shortcut.target) {
+            (Some(location), _) => (Some(location.clone()), shortcut.icon_index),
+            (None, Some(target)) => (Some(target.clone()), 0),
+            (None, None) => (None, 0),
+        };
+        let icon = icon_file
+            .and_then(|file| crate::shortcuts::host_path(prefix, &file))
+            .and_then(|host| {
+                let bytes = fs::read(&host).ok()?;
+                let ico = if host
+                    .extension()
+                    .is_some_and(|e| e.eq_ignore_ascii_case("ico"))
+                {
+                    bytes
+                } else {
+                    crate::shortcuts::pe_icon(&bytes, index)?
+                };
+                fs::create_dir_all(&icons).ok()?;
+                let path = icons.join(format!("{n}.ico"));
+                fs::write(&path, ico).ok()?;
+                Some(path.to_string_lossy().into_owned())
+            });
+        entries.push((
+            link,
+            Entry {
+                name,
+                arguments: vec![windows],
+                icon,
+                wm_class: None,
+            },
+        ));
+    }
+    entries
+}
+
+/// `armor install` of a Windows program with Steam's ARM64 Proton
+/// (ADR-0040): the prefix made by Proton in `<app>/proton/pfx`, the
+/// installer run there, the menu entries from its Start Menu shortcuts.
+fn install_with_proton(
+    places: &Places,
+    proton: &SteamProton,
+    file: &Path,
+    msi: bool,
+    extra: &[OsString],
+    mut name: String,
+    explicit_name: bool,
+) -> Result<(), String> {
+    let mut app = places.app(&name);
+    if app.exists() {
+        return Err(format!(
+            "{name} is already installed ({}): `armor remove {name}` first",
+            app.display()
+        ));
+    }
+    fs::create_dir_all(app.join("proton")).map_err(|e| format!("{}: {e}", app.display()))?;
+    // Proton carries DXVK and Wine Mono; the renderer is chosen as for
+    // Hangover.
+    let mut conf = AppConf {
+        kind: "windows".to_string(),
+        engine: "proton".to_string(),
+        dxvk: true,
+        mono: true,
+        ..AppConf::default()
+    };
+    let mut reasons = Vec::new();
+    for (variable, value, why) in dxvk_settings(&gpu_drivers()) {
+        eprintln!("armor: {variable}={value}: {why}");
+        conf.env.push((variable.clone(), value));
+        reasons.push((variable, why));
+    }
+    fs::write(app.join("app.conf"), render_app_conf(&conf, &reasons))
+        .map_err(|e| format!("{}: {e}", app.display()))?;
+    eprintln!(
+        "armor: running {} with Steam's {STEAM_PROTON}",
+        file.display()
+    );
+    let mut installer = proton_command(proton, &app, &conf);
+    if msi {
+        installer.args(["msiexec", "/i"]);
+    }
+    let status = installer
+        .arg(file)
+        .args(extra)
+        .status()
+        .map_err(|e| format!("{}: {e}", proton.entry_point.display()))?;
+    let prefix = app.join("proton/pfx");
+    let programs = prefix.join("drive_c/ProgramData/Microsoft/Windows/Start Menu/Programs");
+    if !explicit_name {
+        let shortcuts: Vec<PathBuf> = link_entries(&app, &prefix)
+            .into_iter()
+            .map(|(link, _)| {
+                link.strip_prefix(&programs)
+                    .map(Path::to_path_buf)
+                    .unwrap_or(link)
+            })
+            .collect();
+        if let Some(better) = name_from_shortcuts(&shortcuts)
+            && better != name
+            && !places.app(&better).exists()
+        {
+            let renamed = places.app(&better);
+            fs::rename(&app, &renamed).map_err(|e| format!("{}: {e}", renamed.display()))?;
+            eprintln!("armor: named {better} after its menu entries (`--name` chooses another)");
+            name = better;
+            app = renamed;
+        }
+    }
+    let prefix = app.join("proton/pfx");
+    let entries: Vec<Entry> = link_entries(&app, &prefix)
+        .into_iter()
+        .map(|(_, e)| e)
+        .collect();
+    let names = write_entry_files(places, &name, &app, "windows", entries)?;
+    if !status.success() && names.is_empty() {
+        fs::remove_dir_all(&app).map_err(|e| format!("{}: {e}", app.display()))?;
+        return Err(format!(
+            "the installer ended with {} and created no menu entry (cancelled?): nothing was \
+             kept; run `armor install` again to retry",
+            status_text(status)
+        ));
+    }
+    if names.is_empty() {
+        eprintln!(
+            "armor: {name} installed, but its installer created no menu shortcut; run a \
+             program with `armor run {name} 'C:\\path\\to\\program.exe'`"
+        );
+    } else {
+        eprintln!("armor: {name} installed with Steam's ARM64 Proton; in the menu:");
+        for entry in &names {
+            eprintln!("  {entry}");
+        }
+    }
+    Ok(())
+}
+
 /// How long `armor install` waits, after the installer ends, for the
 /// processes it left in the prefix.
 const INSTALLER_GRACE: std::time::Duration = std::time::Duration::from_secs(60);
@@ -851,6 +1095,17 @@ fn install(args: &[OsString]) -> Result<(), String> {
     }
     if kind == Installer::Archive {
         return install_archive(&places, &file, name, explicit_name);
+    }
+    if let Some(proton) = steam_proton(&places) {
+        return install_with_proton(
+            &places,
+            &proton,
+            &file,
+            kind == Installer::WindowsMsi,
+            extra,
+            name,
+            explicit_name,
+        );
     }
     places.check_wine()?;
     let mut app = places.app(&name);
@@ -2061,8 +2316,7 @@ fn run(args: &[OsString]) -> Result<ExitCode, String> {
         report_run(&name, &app, &run);
         return Ok(run.code);
     }
-    places.check_wine()?;
-    let mut command = wine_command(&places.wine, &app, &conf);
+    let mut command = engine_command(&places, &app, &conf)?;
     command.args(&arguments);
     let first = run_watched(command, &name, &app)?;
     // Only when the program could not start (not for an optional DLL a
@@ -2092,7 +2346,7 @@ fn run(args: &[OsString]) -> Result<ExitCode, String> {
         return Ok(first.code);
     }
     let conf = read_conf(&app)?;
-    let mut command = wine_command(&places.wine, &app, &conf);
+    let mut command = engine_command(&places, &app, &conf)?;
     command.args(&arguments);
     let second = run_watched(command, &name, &app)?;
     report_run(&name, &app, &second);
@@ -2129,7 +2383,7 @@ fn install_vcredist(
 ) -> Result<(), String> {
     let installers = crate::engines::fetch_vcredist(&places.data_home.join("armor/engines"))?;
     for installer in &installers {
-        let status = wine_command(&places.wine, app, conf)
+        let status = engine_command(places, app, conf)?
             .arg(installer)
             .args(["/install", "/quiet", "/norestart"])
             .status()
@@ -2466,7 +2720,7 @@ fn remove(args: &[OsString]) -> Result<(), String> {
     let places = Places::from_env()?;
     let app = installed(&places, &name)?;
     let conf = read_conf(&app).unwrap_or_default();
-    if conf.kind == "windows" && places.wineserver().is_file() {
+    if conf.kind == "windows" && conf.engine != "proton" && places.wineserver().is_file() {
         let _ = wine_command(&places.wineserver(), &app, &conf)
             .arg("-k")
             .status();
@@ -2823,6 +3077,7 @@ mod tests {
             dxvk: true,
             mono: true,
             vcredist: true,
+            engine: "proton".to_string(),
             env: vec![(
                 "DXVK_FILTER_DEVICE_NAME".to_string(),
                 "llvmpipe".to_string(),

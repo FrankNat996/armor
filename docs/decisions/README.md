@@ -50,6 +50,7 @@ Every significant decision has its own file `NNNN-title.md`. ADRs are never dele
 | [0037](0037-chromium-applications-in-m8.md) | Chromium-based applications move from M7 to M8 | Accepted (2026-10-14) |
 | [0038](0038-steam-installed-by-armor.md) | Steam installed by armor: Valve's ARM64 client from Valve's manifest | Accepted (2026-10-15) |
 | [0039](0039-armor-updates-itself.md) | armor updates itself from its releases (a notice and a button, pre-releases included) | Accepted (2026-10-15) |
+| [0040](0040-steam-proton-for-windows-programs.md) | Windows programs run with Steam's ARM64 Proton when Steam is installed | Accepted (2026-10-15) |
 
 ## Template
 ```markdown

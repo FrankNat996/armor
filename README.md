@@ -85,7 +85,7 @@ Or, without a terminal: double-click a Windows installer, a `.deb` or an AppImag
 | You give armor | armor uses | armor's part |
 |---|---|---|
 | an x86 Linux program | **the armor engine**: a translator from x86-64 and i386 to ARM64, with an interpreter and a JIT compiler | the engine itself |
-| a Windows `.exe` or `.msi` | **[Hangover](https://github.com/AndreRH/hangover)**: Wine built for ARM64, with [FEX](https://github.com/FEX-Emu/FEX) translating the x86 code; **[DXVK](https://github.com/doitsujin/dxvk)** for Direct3D; **Wine Mono** for .NET | downloads and verifies them, gives each application its own prefix, chooses the graphics settings for the GPU, creates the menu entries |
+| a Windows `.exe` or `.msi` | **Steam's ARM64 Proton** when Steam is installed (`armor install steam`), else **[Hangover](https://github.com/AndreRH/hangover)**: Wine built for ARM64, with [FEX](https://github.com/FEX-Emu/FEX) translating the x86 code; **[DXVK](https://github.com/doitsujin/dxvk)** for Direct3D; **Wine Mono** for .NET | downloads and verifies them, gives each application its own prefix, chooses the graphics settings for the GPU, creates the menu entries |
 | an x86-64 `.deb`, AppImage or `.tar` archive | **Debian's or Ubuntu's amd64 archive** for the libraries, then the armor engine | resolves, downloads, verifies and unpacks the packages into the application's own root |
 | Steam and its games | **Valve's ARM64 Steam client** and Proton | downloads the client from Valve, verified, and starts it in a place of its own |
 

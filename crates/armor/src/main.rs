@@ -39,6 +39,7 @@ mod gil;
 mod inspect;
 mod limits;
 mod profile;
+mod shortcuts;
 mod steam;
 mod update;
 
