@@ -818,7 +818,7 @@ fn engine_command(places: &Places, app: &Path, conf: &AppConf) -> Result<Command
 }
 
 /// The menu entries of the shortcuts in a prefix's Start Menus (read by
-/// armor, `shortcuts.rs`): the shortcut itself as the program, the icon
+/// armor, `shortcuts.rs`): the shortcut opened with Wine's `start`, the icon
 /// taken from the program into `<app>/icons/`. Uninstallers are left out.
 fn link_entries(app: &Path, prefix: &Path) -> Vec<(PathBuf, Entry)> {
     let icons = app.join("icons");
@@ -869,7 +869,10 @@ fn link_entries(app: &Path, prefix: &Path) -> Vec<(PathBuf, Entry)> {
             link,
             Entry {
                 name,
-                arguments: vec![windows],
+                // Through Wine's `start`, which applies the shortcut's
+                // working folder (7-Zip's file manager complained without
+                // it); `/wait` keeps `armor run` waiting for the program.
+                arguments: vec!["start.exe".to_string(), "/wait".to_string(), windows],
                 icon,
                 wm_class: None,
             },
