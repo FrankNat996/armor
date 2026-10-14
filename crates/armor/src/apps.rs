@@ -709,7 +709,12 @@ fn install_steam(name: String) -> Result<(), String> {
             vec![Entry {
                 name: "Steam".to_string(),
                 arguments: Vec::new(),
-                icon: Some("steam".to_string()),
+                // The client's own icon arrives with its first update.
+                icon: Some(
+                    crate::steam::icon(&app.join("Steam"))
+                        .to_string_lossy()
+                        .into_owned(),
+                ),
                 wm_class: Some("steam".to_string()),
             }],
         )

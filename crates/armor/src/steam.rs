@@ -245,6 +245,12 @@ pub const RESTART_STATUS: i32 = 42;
 /// How many times in a row `armor run` starts it again.
 pub const MAX_RESTARTS: usize = 5;
 
+/// The client's icon inside `steam_dir` (an `.ico` with sizes up to 256
+/// pixels), there once the client has updated itself.
+pub fn icon(steam_dir: &Path) -> PathBuf {
+    steam_dir.join("public/steam_tray.ico")
+}
+
 /// The client's program inside `steam_dir`.
 pub fn client(steam_dir: &Path) -> PathBuf {
     steam_dir.join("steamrtarm64/steam")
