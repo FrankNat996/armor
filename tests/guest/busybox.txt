@@ -1,0 +1,57 @@
+# busybox applets compared by `cargo xtask difftest` (docs/testing.md).
+# Format: `name: arguments`, split on spaces; an argument with spaces goes
+# in double or single quotes. Every case runs in tests/guest/data with
+# fruits.txt as stdin.
+true: true
+false: false
+echo: echo hello world
+basename: basename /a/b/c.txt .txt
+dirname: dirname /a/b/c.txt
+uname: uname -m
+cat: cat fruits.txt
+cat-stdin: cat
+wc: wc fruits.txt
+head: head -n 2 fruits.txt
+tail: tail -n 1 fruits.txt
+sort: sort fruits.txt
+sort-unique: sort -u fruits.txt
+sort-reverse: sort -r fruits.txt
+uniq: uniq -c fruits.txt
+cut: cut -c 1-3 fruits.txt
+tr: tr a-z A-Z
+grep: grep -n apple fruits.txt
+sed: sed s/a/A/g fruits.txt
+expr: expr 6 + 7
+expr-length: expr length banana
+printf: printf %d-%s\n 42 x
+ls: ls /etc/apt
+ls-long: ls -l fruits.txt
+stat: stat -c %s fruits.txt
+sha256sum: sha256sum fruits.txt
+md5sum: md5sum fruits.txt
+base64: base64 fruits.txt
+od: od -c fruits.txt
+xxd: xxd fruits.txt
+find: find /etc/apt -maxdepth 1 -name s*
+pwd: pwd
+nl: nl fruits.txt
+rev: rev fruits.txt
+tac: tac fruits.txt
+fold: fold -w 3 fruits.txt
+id: id -u
+seq: seq 1 5
+seq-fraction: seq 0 0.5 2
+sleep: sleep 0.01
+awk: awk {s+=length($0)}END{print(s/NR,s*1.5,int(s/3))} fruits.txt
+missing-applet: cksum fruits.txt
+# stdout is a pipe nobody reads (difftest: names ending in -closed-stdout).
+yes-closed-stdout: yes
+echo-closed-stdout: echo hello
+# The shell: arithmetic, pipelines (fork), command substitution, loops,
+# exit status (milestone M3, ADR-0019).
+sh-arithmetic: sh -c "echo $((6*7))"
+sh-pipeline: sh -c "cat fruits.txt | sort -r | head -n 2"
+sh-substitution: sh -c "x=$(wc -l < fruits.txt); echo lines $x"
+sh-loop: sh -c "for f in apple cherry; do grep -c $f fruits.txt; done"
+sh-status: sh -c "false || echo recovered; exit 3"
+sh-redirect: sh -c "ls /nonexistent 2>/dev/null; echo $?"

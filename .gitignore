@@ -1,0 +1,11 @@
+# Rust build output
+/target/
+
+# Editor and OS files
+*.swp
+*~
+.DS_Store
+
+
+# The window workspace (ADR-0035) builds into ../target/gui; in case it is built in place:
+/gui/target/

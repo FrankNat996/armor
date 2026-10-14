@@ -1,0 +1,27 @@
+[workspace]
+resolver = "3"
+members = ["crates/*", "xtask"]
+
+[workspace.package]
+version = "0.3.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/FrankNat996/armor"
+# Not published until the crate name is checked on crates.io.
+publish = false
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[workspace.lints.clippy]
+# Every `unsafe` block needs a `// SAFETY:` comment (docs/conventions.md).
+undocumented_unsafe_blocks = "deny"
+
+# The armor binary that `cargo xtask difftest` and `run --armor` use:
+# optimized, so that interpreted runtimes (python) finish in reasonable
+# time, but with the checks of a debug build, so that guest inputs that
+# overflow armor's arithmetic still panic instead of wrapping silently.
+[profile.difftest]
+inherits = "release"
+debug-assertions = true
+overflow-checks = true

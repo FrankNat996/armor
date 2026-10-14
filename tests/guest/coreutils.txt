@@ -1,0 +1,58 @@
+# Debian coreutils (amd64, dynamically linked) run by `cargo xtask difftest`.
+# One case per line: `name: program args...`. The program is
+# /usr/bin/<program> inside the guest root built by `cargo xtask fetch-rootfs`;
+# every case runs in tests/guest/data with fruits.txt as stdin (docs/testing.md).
+true: true
+false: false
+echo: echo hello world
+basename: basename /a/b/c.txt .txt
+dirname: dirname /a/b/c.txt
+uname: uname -m
+cat: cat fruits.txt
+cat-stdin: cat
+wc: wc fruits.txt
+tail: tail -n 1 fruits.txt
+sort: sort fruits.txt
+sort-unique: sort -u fruits.txt
+sort-reverse: sort -r fruits.txt
+head: head -n 2 fruits.txt
+uniq: uniq -c fruits.txt
+cut: cut -c 1-3 fruits.txt
+tr: tr a-z A-Z
+expr: expr 6 + 7
+expr-length: expr length banana
+printf: printf %d-%s\n 42 x
+factor: factor 1234567 600851475143
+seq: seq 1 5
+seq-fraction: seq 0 0.1 1
+seq-width: seq -w 1 3 20
+numfmt: numfmt --to=iec 1048576
+numfmt-from: numfmt --from=iec 1.5K 3M
+numfmt-format: numfmt --to=si --format=%.3f 123456789
+ls: ls
+ls-long: ls -l --time-style=+ fruits.txt
+stat: stat -c %s fruits.txt
+sha256sum: sha256sum fruits.txt
+sha512sum: sha512sum fruits.txt
+md5sum: md5sum fruits.txt
+cksum: cksum fruits.txt
+b2sum: b2sum fruits.txt
+base64: base64 fruits.txt
+od: od -c fruits.txt
+nl: nl fruits.txt
+tac: tac fruits.txt
+fold: fold -w 3 fruits.txt
+pwd: pwd
+id: id -u
+date: date -u -d @0 +%Y-%m-%dT%H:%M:%S
+missing-file: cat no-such-file
+# Programs that run other programs (fork, execve: ADR-0019).
+env: env A=1 B=2 printenv A B
+env-empty: env -i printenv
+timeout: timeout 10 echo in time
+nice: nice -n 5 echo nice
+nohup: nohup echo detached
+# stdout is a pipe nobody reads (difftest: names ending in -closed-stdout).
+yes-closed-stdout: yes
+cat-closed-stdout: cat fruits.txt
+

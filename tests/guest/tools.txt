@@ -1,0 +1,38 @@
+# Debian amd64 grep, sed, gawk, findutils, and (since 2026-10-13) gzip,
+# xz, bzip2, tar, diffutils, make and dash (dynamically linked) run by
+# `cargo xtask difftest` from the guest root of `cargo xtask fetch-rootfs`.
+# Same format as coreutils.txt; every case runs in tests/guest/data with
+# fruits.txt as stdin (docs/testing.md).
+grep: grep -n an fruits.txt
+grep-count: grep -c a fruits.txt
+grep-invert: grep -v e fruits.txt
+grep-regex: grep -E "^(apple|cherry)" fruits.txt
+grep-ignore-case: grep -i APPLE fruits.txt
+grep-perl: grep -P "an{1,2}a" fruits.txt
+grep-missing: grep zzz fruits.txt
+sed: sed s/a/A/g fruits.txt
+sed-delete: sed /cherry/d fruits.txt
+sed-numbers: sed -n 2p fruits.txt
+sed-regex: sed -E "s/(.)(.*)/\2\1/" fruits.txt
+gawk: gawk '{ print NR, length($0), toupper($0) }' fruits.txt
+gawk-sum: gawk '{ n += length($0) } END { printf "%d %.3f\n", n, n / NR }' fruits.txt
+gawk-math: gawk 'BEGIN { printf "%.6f %.6f %.6f %d\n", sqrt(2), exp(1), log(10), int(-3.7) }' 
+gawk-split: gawk -F a '{ print NF }' fruits.txt
+gawk-bignum: gawk -M 'BEGIN { print 2^100 }' 
+find: find . -name "*.txt"
+find-type: find . -maxdepth 1 -type f
+xargs: xargs echo got
+gzip-roundtrip: sh -c "gzip -c fruits.txt | gzip -dc"
+gzip-bytes: sh -c "gzip -c -n -9 fruits.txt | od -An -tx1"
+xz-roundtrip: sh -c "xz -c fruits.txt | xz -dc"
+xz-bytes: sh -c "xz -c fruits.txt | od -An -tx1"
+bzip2-roundtrip: sh -c "bzip2 -c fruits.txt | bzip2 -dc | md5sum"
+tar-list: sh -c "tar --mtime=@0 --owner=0 --group=0 -cf - fruits.txt | tar -tvf -"
+tar-roundtrip: sh -c "tar -cf - fruits.txt | tar -xOf -"
+tar-gzip: sh -c "tar --mtime=@0 -czf - fruits.txt | tar -xzOf - | wc -l"
+diff: sh -c "seq 3 | diff - fruits.txt; echo exit $?"
+diff-same: sh -c "diff fruits.txt fruits.txt; echo exit $?"
+cmp: sh -c "seq 3 | cmp - fruits.txt; echo exit $?"
+make: sh -c "printf 'all: one two\n\techo done\none:\n\techo first\ntwo:\n\techo second\n' | make -f -"
+make-variables: sh -c "printf 'N := $(shell seq 3)\nall:\n\t@echo n=$(N) words=$(words $(N))\n' | make -f -"
+dash-loop: sh -c 'i=0; s=0; while [ $i -lt 2000 ]; do i=$((i+1)); s=$((s+i)); done; echo $s'

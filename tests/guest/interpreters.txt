@@ -1,0 +1,23 @@
+# Interpreters from Debian amd64 (perl-base, python3.13-minimal) run by
+# `cargo xtask difftest` from the guest root of `cargo xtask fetch-rootfs`.
+# Same format as coreutils.txt; every case runs in tests/guest/data with
+# fruits.txt as stdin (docs/testing.md).
+perl-print: perl -e 'print "hello from perl\n"'
+perl-lines: perl -ne 'print "$.: ", uc' fruits.txt
+perl-math: perl -e 'printf "%.10f %d %s\n", atan2(1,1)*4, 2**40, 7/2'
+perl-big-hash: perl -e 'my %h; $h{$_} = $_ * 2 for 1..20000; my $s = 0; $s += $h{$_} for keys %h; print scalar(keys %h), " $s\n"'
+perl-regex: perl -ne 'print "$1\n" if /^(\w)\w*a$/' fruits.txt
+perl-hash: perl -e '%h = map { $_ => length } qw(apple banana kiwi); print join(",", map {"$_=$h{$_}"} sort keys %h), "\n"'
+perl-sort: perl -e 'print join(" ", sort { $a <=> $b } (10, 2, 33, 4)), "\n"'
+perl-sprintf: perl -e 'print sprintf("%05.1f|%-6s|%x", 3.14159, "ab", 255), "\n"'
+perl-system: perl -e 'system("echo", "from", "child"); print "status $?\n"'
+python-print: python3.13 -c 'print("hello from python")'
+python-math: python3.13 -c 'import math; print(math.pi, math.sqrt(2), 2**100, 7/2, round(2.675, 2))'
+python-lines: python3.13 -c 'import sys; print([l.strip().upper() for l in sys.stdin])'
+python-dict: python3.13 -c 'd = {w: len(w) for w in open("fruits.txt").read().split()}; print(sorted(d.items()))'
+python-format: python3.13 -c 'print(f"{3.14159:08.3f}|{255:#x}|{1e300*1e10}|{-0.0}")'
+python-exception: python3.13 -c 'import sys; sys.exit(int("x"))'
+python-bigint: python3.13 -c 'print(pow(7, 1000, 10**40), 2**200 // 3**50)'
+python-subprocess: python3.13 -c 'import os; print(os.system("echo from child"))'
+python-complex: python3.13 -c "z = complex(1, 2); w = complex(3, -4); print(z * w, z / w, abs(w), z ** 3, w.conjugate())"
+python-math-libm: python3.13 -c 'import math; print(math.fsum([0.1] * 10), math.hypot(3, 4, 12), math.fmod(10.5, 3), math.remainder(10.5, 3), math.gamma(5.5), math.lgamma(3.3), math.erf(0.5), math.erfc(2), math.expm1(1e-5), math.log1p(1e-5), math.atan2(1, -2), math.cbrt(27), math.dist((0, 0), (3, 4)))'

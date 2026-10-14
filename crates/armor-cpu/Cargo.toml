@@ -1,0 +1,15 @@
+[package]
+name = "armor-cpu"
+description = "Guest CPU state and interpreter for armor"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+armor-mem = { path = "../armor-mem" }
+armor-x86 = { path = "../armor-x86" }

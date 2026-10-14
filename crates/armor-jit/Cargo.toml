@@ -1,0 +1,17 @@
+[package]
+name = "armor-jit"
+description = "AArch64 code generation for armor's JIT (milestone M6)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+armor-cpu = { path = "../armor-cpu" }
+armor-mem = { path = "../armor-mem" }
+armor-x86 = { path = "../armor-x86" }
+libc = "0.2.190"

@@ -1,0 +1,18 @@
+# The window of armor (ADR-0035): its own workspace, so that the engine's
+# workspace keeps only `libc` (ADR-0008) and builds without GTK.
+[workspace]
+
+[package]
+name = "armor-gui"
+description = "The window of armor: installed x86 applications, install, open, remove"
+version = "0.3.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/FrankNat996/armor"
+publish = false
+
+[dependencies]
+gtk = { package = "gtk4", version = "0.11", features = ["v4_10"] }
+
+[profile.release]
+strip = true
