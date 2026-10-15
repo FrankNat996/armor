@@ -14,6 +14,8 @@ mod decoder_check;
 mod difftest;
 mod encoder_check;
 mod fuzz;
+mod gl;
+mod glgen;
 mod oracle;
 mod package;
 mod progress;
@@ -53,10 +55,13 @@ commands:
                                  parser and syscall arguments, long, with a
                                  new seed (docs/testing.md)
   fetch-busybox                  download the pinned Debian busybox-static (amd64)
-  fetch-rootfs [--i386]          download Debian amd64 coreutils, grep, sed, gawk,
+  fetch-rootfs [--i386|--games]  download Debian amd64 coreutils, grep, sed, gawk,
                                  findutils, gzip, xz, bzip2, tar, diffutils, make,
                                  dash, perl, python and their libraries into the
-                                 guest root target/guest/rootfs
+                                 guest root target/guest/rootfs (--i386: i386
+                                 coreutils into target/guest/rootfs-i386;
+                                 --games: plus Mesa, X11, SDL2, sound and
+                                 libstdc++ into target/guest/rootfs-games)
   decoder-check <elf>...         compare the decoder with objdump on every
                                  instruction of the given executables
   encoder-check                  compare the JIT's AArch64 encoder with the
@@ -68,7 +73,14 @@ commands:
                                  (--check: fail if they are stale instead)
   coverage [--check]             update the decoder and syscall coverage badges
                                  in README.md (needs the x86_64 toolchain)
-  package                        build target/package/armor_<version>_arm64.deb";
+  package                        build target/package/armor_<version>_arm64.deb
+  gl-gen [--check]               generate armor's OpenGL table and the guest's
+                                 libGL stubs from third_party/khronos/gl.xml
+                                 (--check: fail if they are stale instead)
+  gl-check                       draw with OpenGL under armor, with the guest's
+                                 Mesa and with the host's GPU (--host-gl), and
+                                 compare the pixels (needs an X display and
+                                 fetch-rootfs --games)";
 
 const GUEST_CC: &str = "x86_64-linux-gnu-gcc";
 const QEMU: &str = "qemu-x86_64";
@@ -184,6 +196,7 @@ fn main() -> ExitCode {
         Some("fetch-rootfs") => match args.get(1).map(String::as_str) {
             None => rootfs::fetch(rootfs::Arch::Amd64),
             Some("--i386") => rootfs::fetch(rootfs::Arch::I386),
+            Some("--games") => rootfs::fetch(rootfs::Arch::Games),
             Some(other) => Err(format!("fetch-rootfs: unknown option {other}")),
         },
         Some("decoder-check") => decoder_check::run(&args[1..]),
@@ -194,6 +207,12 @@ fn main() -> ExitCode {
             _ => Err(format!("usage: cargo xtask progress [--check]\n\n{USAGE}")),
         },
         Some("package") => package::run(&Paths::new().root),
+        Some("gl-gen") => match &args[1..] {
+            [] => glgen::run(&Paths::new().root, false),
+            [flag] if flag == "--check" => glgen::run(&Paths::new().root, true),
+            _ => Err(format!("usage: cargo xtask gl-gen [--check]\n\n{USAGE}")),
+        },
+        Some("gl-check") => gl::check(&Paths::new()),
         Some("coverage") => match &args[1..] {
             [] => coverage::run(false),
             [flag] if flag == "--check" => coverage::run(true),
@@ -249,6 +268,8 @@ fn build_all() -> Result<(), String> {
         let out = build_one(&paths, &name)?;
         println!("built {name} -> {}", out.display());
     }
+    let libgl = gl::build_libgl(&paths)?;
+    println!("built armor's libGL -> {}", libgl.display());
     Ok(())
 }
 

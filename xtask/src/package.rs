@@ -6,7 +6,8 @@
 //! with its menu entry "armor" (ADR-0035), the desktop entry "Install with
 //! armor" (a double click on a Windows `.exe` or `.msi`, an x86-64 `.deb` or
 //! an AppImage installs it, in a terminal window that shows the progress) and
-//! the licenses. Nothing runs
+//! the licenses, and armor's x86-64 `libGL.so.1` in
+//! `/usr/lib/armor/x86_64-linux-gnu/` (ADR-0041, for `--host-gl`). Nothing runs
 //! at installation except refreshing the desktop's MIME cache. The Windows
 //! engine is not in the package: `armor engine fetch` downloads it.
 
@@ -145,6 +146,13 @@ pub fn run(root: &Path) -> Result<(), String> {
     chmod(&binary, 0o755)?;
     let window = stage.join("usr/bin/armor-gui");
     copy(&root.join("target/gui/release/armor-gui"), &window)?;
+    // The x86-64 libGL that `--host-gl` gives to programs (built with the
+    // x86-64 cross compiler).
+    let libgl = crate::gl::build_libgl(&crate::Paths::new())?;
+    copy(
+        &libgl,
+        &stage.join("usr/lib/armor/x86_64-linux-gnu/libGL.so.1"),
+    )?;
     write(
         &stage.join("usr/share/applications/armor-install.desktop"),
         INSTALL_ENTRY,
@@ -160,6 +168,8 @@ pub fn run(root: &Path) -> Result<(), String> {
         &doc.join("copyright"),
         "armor: https://github.com/FrankNat996/armor\n\
          License: MIT OR Apache-2.0 (LICENSE-MIT, LICENSE-APACHE in this directory).\n\
+         /usr/lib/armor/x86_64-linux-gnu/libGL.so.1 is generated from the Khronos OpenGL\n\
+         registry (gl.xml, glx.xml; Copyright The Khronos Group Inc., Apache-2.0).\n\
          The Windows engine (Wine, FEX, box64, DXVK, Wine Mono) is not part of this package:\n\
          `armor engine fetch` downloads it from its sources, with its own licences.\n",
     )?;

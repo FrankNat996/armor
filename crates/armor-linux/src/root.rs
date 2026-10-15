@@ -36,18 +36,42 @@ pub const DEFAULT_ROOT: &str = "/usr/x86_64-linux-gnu";
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GuestRoot {
     dir: Option<PathBuf>,
+    /// With `--host-gl` (ADR-0041): armor's x86-64 `libGL.so.1` of stubs,
+    /// which the guest gets in place of every `libGL.so.1` and
+    /// `libOpenGL.so.0` in a library directory; the guest's own `libGL.so.1`
+    /// is then `libGL.so.1.armor-guest`.
+    host_gl: Option<PathBuf>,
 }
+
+/// The name under which the guest's own `libGL.so.1` is reached with
+/// `--host-gl` (the stubs' fallback).
+pub const GUEST_LIBGL: &[u8] = b"libGL.so.1.armor-guest";
 
 impl GuestRoot {
     /// No root: guest paths are host paths.
     pub fn none() -> GuestRoot {
-        GuestRoot { dir: None }
+        GuestRoot {
+            dir: None,
+            host_gl: None,
+        }
     }
 
     pub fn new(dir: impl Into<PathBuf>) -> GuestRoot {
         GuestRoot {
             dir: Some(dir.into()),
+            host_gl: None,
         }
+    }
+
+    /// The same root, with armor's OpenGL stubs at `stubs` (`--host-gl`).
+    pub fn with_host_gl(mut self, stubs: impl Into<PathBuf>) -> GuestRoot {
+        self.host_gl = Some(stubs.into());
+        self
+    }
+
+    /// armor's OpenGL stubs, with `--host-gl`.
+    pub fn host_gl(&self) -> Option<&Path> {
+        self.host_gl.as_deref()
     }
 
     /// `ARMOR_ROOT` if set (an empty value means no root), otherwise
@@ -67,6 +91,24 @@ impl GuestRoot {
 
     /// The host path for guest path `path`.
     pub fn resolve(&self, path: &[u8]) -> Vec<u8> {
+        if let Some(stubs) = &self.host_gl
+            && path.first() == Some(&b'/')
+            && path.windows(5).any(|w| w == b"/lib/" || w == b"/lib6")
+        {
+            let (dir, name) = path.split_at(path.iter().rposition(|b| *b == b'/').unwrap_or(0) + 1);
+            // libOpenGL.so.0 (glvnd's OpenGL without GLX, which libGLU
+            // calls through) gets the same stubs.
+            if name == b"libGL.so.1" || name == b"libOpenGL.so.0" {
+                return stubs.as_os_str().as_bytes().to_vec();
+            }
+            if name == GUEST_LIBGL {
+                return GuestRoot {
+                    dir: self.dir.clone(),
+                    host_gl: None,
+                }
+                .resolve(&[dir, b"libGL.so.1"].concat());
+            }
+        }
         if let (Some(dir), Some(b'/')) = (&self.dir, path.first())
             && !host_only(path)
         {
@@ -82,6 +124,9 @@ impl GuestRoot {
     /// `resolve` for a path read from guest memory.
     pub fn resolve_c(&self, path: CString) -> CString {
         match &self.dir {
+            _ if self.host_gl.is_some() && path.as_bytes().first() == Some(&b'/') => {
+                CString::new(self.resolve(path.as_bytes())).expect("no interior NUL")
+            }
             Some(_) if path.as_bytes().first() == Some(&b'/') => {
                 CString::new(self.resolve(path.as_bytes())).expect("no interior NUL")
             }

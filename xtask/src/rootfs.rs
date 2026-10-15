@@ -16,6 +16,11 @@
 //! programs (ADR-0029) in `target/guest/rootfs-i386`: Debian's i386
 //! `coreutils` and its closure (`PACKAGES_I386`). The coreutils cases run
 //! there too, named `coreutils32/…`.
+//!
+//! `cargo xtask fetch-rootfs --games` makes `target/guest/rootfs-games`:
+//! the x86-64 root plus the libraries of games and graphical programs
+//! (`PACKAGES_GAMES`: Mesa, X11, SDL2, ALSA, PulseAudio, Vulkan,
+//! `libstdc++`), for running games by hand and for `cargo xtask gl-check`.
 
 use std::fs;
 use std::os::unix::fs::symlink;
@@ -264,18 +269,370 @@ const PACKAGES_I386: &[Package] = &[
     },
 ];
 
+/// The games root (`--games`, M8): the packages of `PACKAGES` plus these,
+/// the closure (Pre-Depends and Depends, first alternative) of `libgl1`,
+/// `libgl1-mesa-dri`, `libglx-mesa0`, `libegl1`, `libegl-mesa0`,
+/// `libgles2`, `libopengl0`, `libglu1-mesa`, `libx11-6`, `libxext6`,
+/// `libxrandr2`, `libxi6`, `libxcursor1`, `libxinerama1`, `libxxf86vm1`,
+/// `libxrender1`, `libxfixes3`, `libxss1`, `libxmu6`, `libxkbcommon0`,
+/// `libasound2t64`, `libpulse0`, `libudev1`, `libdbus-1-3`, `libvulkan1`,
+/// `mesa-vulkan-drivers`, `libsdl2-2.0-0` and `libstdc++6` (index of
+/// Debian trixie amd64, 2026-10-14): what x86-64 Linux games ask for
+/// (X11, OpenGL, SDL2, sound) and C++ programs.
+const PACKAGES_GAMES: &[Package] = &[
+    Package {
+        pool_path: "pool/main/a/alsa-lib/libasound2-data_1.2.14-1+deb13u1_all.deb",
+        sha256: "04688afdff3769c0f685541daed7b2f6f0cb946799ddf1d5847ddf11fe245559",
+    },
+    Package {
+        pool_path: "pool/main/a/alsa-lib/libasound2t64_1.2.14-1+deb13u1_amd64.deb",
+        sha256: "5495496142d57e5ad6d581ac5456ec3c87f872c109a2bfb815d154b673eebc67",
+    },
+    Package {
+        pool_path: "pool/main/liba/libasyncns/libasyncns0_0.8-6+b5_amd64.deb",
+        sha256: "e7958777b0e3586349c57ac759a95b68f80d28e5bd1c4225705198b39b436115",
+    },
+    Package {
+        pool_path: "pool/main/libb/libbsd/libbsd0_0.12.2-2_amd64.deb",
+        sha256: "e5a85986fa6bec3307ab1bc860736b478b331882bc45e17675a7bdf88eecb43a",
+    },
+    Package {
+        pool_path: "pool/main/d/dbus/libdbus-1-3_1.16.2-2_amd64.deb",
+        sha256: "bbcb711daff7e104b5f80f9b05475b6142674bfe65518a36a56e96a91068a3f5",
+    },
+    Package {
+        pool_path: "pool/main/libd/libdecor-0/libdecor-0-0_0.2.2-2_amd64.deb",
+        sha256: "e4f228a9d4a38af23fab00f8e20219790b567e2e1f7804b3a215a26294350f82",
+    },
+    Package {
+        pool_path: "pool/main/libd/libdrm/libdrm-amdgpu1_2.4.124-2_amd64.deb",
+        sha256: "c1d97a5e32e2bc68e833b8abeae026b6306198e87ee4396a7ffecd4779caefbf",
+    },
+    Package {
+        pool_path: "pool/main/libd/libdrm/libdrm-common_2.4.124-2_all.deb",
+        sha256: "9a8a6c65c165e9964f106fb4ac710959b5d33e0790227e3ab6b27c4742d1254a",
+    },
+    Package {
+        pool_path: "pool/main/libd/libdrm/libdrm-intel1_2.4.124-2_amd64.deb",
+        sha256: "188ab1fd74c838b3c8055d62107351e16a4bb7a25d39c30bbb9aac30ddd37238",
+    },
+    Package {
+        pool_path: "pool/main/libd/libdrm/libdrm2_2.4.124-2_amd64.deb",
+        sha256: "fe2276901c7cd7b8079de63072d37fe1cbeb4eb001a3bc1f1d662ad89aa0890e",
+    },
+    Package {
+        pool_path: "pool/main/libe/libedit/libedit2_3.1-20250104-1_amd64.deb",
+        sha256: "b002ea172b9c1e34a67bc497c523c67bb74c3f0a4e98113cb083990a1f1d3bfe",
+    },
+    Package {
+        pool_path: "pool/main/m/mesa/libegl-mesa0_25.0.7-2+deb13u1_amd64.deb",
+        sha256: "0ddebd7e91b048aac812611d6bd008343386cb140b51e5e66df74c6b6263be65",
+    },
+    Package {
+        pool_path: "pool/main/libg/libglvnd/libegl1_1.7.0-1+b2_amd64.deb",
+        sha256: "62e7bc8ccd47a60e55aad17f83d8d474310d782eb8589bbce2ab714c31712406",
+    },
+    Package {
+        pool_path: "pool/main/e/elfutils/libelf1t64_0.192-4_amd64.deb",
+        sha256: "94497b7e17b6f574a0605b380d454e20d3f01a9c63b70c2a2263f679d30053e1",
+    },
+    Package {
+        pool_path: "pool/main/libf/libffi/libffi8_3.4.8-2_amd64.deb",
+        sha256: "0ebdc340de33333639c3c63874cd4b15ac2e83dfa1ef3053b7eefaf4919f4f68",
+    },
+    Package {
+        pool_path: "pool/main/f/flac/libflac14_1.5.0+ds-2_amd64.deb",
+        sha256: "658b9f77d35638caf75dfaea4f6d5cde196104d5662f0776e23d7cc450bd4cb5",
+    },
+    Package {
+        pool_path: "pool/main/m/mesa/libgbm1_25.0.7-2+deb13u1_amd64.deb",
+        sha256: "31fb6d76b9ceaf13848fa617df53f85f62626b4fe7464a93811c720af6d5f2dd",
+    },
+    Package {
+        pool_path: "pool/main/m/mesa/libgl1-mesa-dri_25.0.7-2+deb13u1_amd64.deb",
+        sha256: "722fad9944bdfd29eb6421576331a2697f83bc4b3551d693edb7aefdde6bb198",
+    },
+    Package {
+        pool_path: "pool/main/libg/libglvnd/libgl1_1.7.0-1+b2_amd64.deb",
+        sha256: "87fa2f6e5abaed4ed385fac879c8dd735af719ee2300222d901793c66e041678",
+    },
+    Package {
+        pool_path: "pool/main/libg/libglvnd/libgles2_1.7.0-1+b2_amd64.deb",
+        sha256: "e12c18aa77939d122ee1dea520ba0440b97dc19200b7396e03dff03a3ece74c1",
+    },
+    Package {
+        pool_path: "pool/main/libg/libglvnd/libglvnd0_1.7.0-1+b2_amd64.deb",
+        sha256: "887f74008166549ce9e100c906aa937e95d6e5ce1c8d86efe8c95fd953359b9c",
+    },
+    Package {
+        pool_path: "pool/main/m/mesa/libglx-mesa0_25.0.7-2+deb13u1_amd64.deb",
+        sha256: "2e6ab57de9931e890621d3ade04213b06e7142a4ae8a72a1756c44d0271aaeb7",
+    },
+    Package {
+        pool_path: "pool/main/libg/libglvnd/libglx0_1.7.0-1+b2_amd64.deb",
+        sha256: "2721fdca0fe3bd963cb39482eabc253af52b88f4a7f6dbb69e475549daf5af3b",
+    },
+    Package {
+        pool_path: "pool/main/l/llvm-toolchain-19/libllvm19_19.1.7-3+b1_amd64.deb",
+        sha256: "db0d614d61345ca710fb73e75105f1ec6e38898fa7b3aa99fa7eb7d8b0a11d57",
+    },
+    Package {
+        pool_path: "pool/main/libm/libmd/libmd0_1.1.0-2+b1_amd64.deb",
+        sha256: "7244ec3839b61fac0c1884fe08aaa040f26e8f1f35f1f5d3482eacefd30d1b44",
+    },
+    Package {
+        pool_path: "pool/main/l/lame/libmp3lame0_3.100-6+b3_amd64.deb",
+        sha256: "3867319c9fbbc8cc25f2d1dc1d75d13548c84c37fa709c1ac9ca02ac051b63ab",
+    },
+    Package {
+        pool_path: "pool/main/m/mpg123/libmpg123-0t64_1.32.10-1+deb13u1_amd64.deb",
+        sha256: "31fa6ef638f1fdbe198faee0b6fe50d9dd468077f8247cc3dbf6b2250abb6101",
+    },
+    Package {
+        pool_path: "pool/main/libo/libogg/libogg0_1.3.5-3+b2_amd64.deb",
+        sha256: "911aec914f5bda0788164ff8068b682537378bf8d407b1d6c1b377522f96b83b",
+    },
+    Package {
+        pool_path: "pool/main/o/opus/libopus0_1.5.2-2_amd64.deb",
+        sha256: "794056db33d71b2ac4bd8b5a4eb23b627bcb8a49d123c33b6e841a996253a067",
+    },
+    Package {
+        pool_path: "pool/main/libp/libpciaccess/libpciaccess0_0.17-3+b3_amd64.deb",
+        sha256: "d9a0091071635a84e837051e4813005ac445071731becea28fba4d9806df5252",
+    },
+    Package {
+        pool_path: "pool/main/p/pulseaudio/libpulse0_17.0+dfsg1-2+b1_amd64.deb",
+        sha256: "786aca79119cb249562708fd24dcdf817604cfe75bbfcb8cda3464042e17f40e",
+    },
+    Package {
+        pool_path: "pool/main/libs/libsamplerate/libsamplerate0_0.2.2-4+b2_amd64.deb",
+        sha256: "2665417fa996c1e249dbaa65c32305ac666e5ae865fad0f109b629935ec0bd18",
+    },
+    Package {
+        pool_path: "pool/main/libs/libsdl2/libsdl2-2.0-0_2.32.4+dfsg-1_amd64.deb",
+        sha256: "c61af1033d79fa6a393c49fac987165876de8ff27ebbd6a36cf19f5fc84d7a7a",
+    },
+    Package {
+        pool_path: "pool/main/l/lm-sensors/libsensors-config_3.6.2-2_all.deb",
+        sha256: "3056da80c7d963af795dab480ab6f6f4b154ad4ac39f522dc52d17c834fea253",
+    },
+    Package {
+        pool_path: "pool/main/l/lm-sensors/libsensors5_3.6.2-2_amd64.deb",
+        sha256: "f0a994a6d7cfa695dea5343d0d1ba7eed796c0ad920c7282998b95f60049c4f6",
+    },
+    Package {
+        pool_path: "pool/main/libs/libsndfile/libsndfile1_1.2.2-2+deb13u1_amd64.deb",
+        sha256: "d92263a045554e6f39c6b1c2ee4cca44a3248d9b9339301ff195969bf84b75eb",
+    },
+    Package {
+        pool_path: "pool/main/g/gcc-14/libstdc++6_14.2.0-19_amd64.deb",
+        sha256: "ab1fa05837aa7a92aae748fd07a18a35f7d18bb4a71c4724fe2bbf0e32089de0",
+    },
+    Package {
+        pool_path: "pool/main/s/systemd/libudev1_257.13-1~deb13u1_amd64.deb",
+        sha256: "5d41c284f5a93b05bc7d648b61a02dd2bb9ff05b2261ad1a8b7d96044a0cfa88",
+    },
+    Package {
+        pool_path: "pool/main/libv/libvorbis/libvorbis0a_1.3.7-3_amd64.deb",
+        sha256: "0465f7f602f7b00965e58e7273b5876060ab7946f0452a9f95d979046932cc42",
+    },
+    Package {
+        pool_path: "pool/main/libv/libvorbis/libvorbisenc2_1.3.7-3_amd64.deb",
+        sha256: "5fbbf06a5b196235aa2753cd12bbe7f843328571d368f15b1c337578e29f73a2",
+    },
+    Package {
+        pool_path: "pool/main/v/vulkan-loader/libvulkan1_1.4.309.0-1_amd64.deb",
+        sha256: "f47da79cd140264fe21cceb08bc87a71bc7fec05819e4a421f3f518d21101a37",
+    },
+    Package {
+        pool_path: "pool/main/w/wayland/libwayland-client0_1.23.1-3_amd64.deb",
+        sha256: "d1607e1db1a7c5378a2e5c6ae7b20f64dc6acf134f953d84a7f5204b74339f33",
+    },
+    Package {
+        pool_path: "pool/main/w/wayland/libwayland-cursor0_1.23.1-3_amd64.deb",
+        sha256: "26fccae2b1228744de0cad6c688550b8d13cd4e8d4ccf0cfdae015634ece673f",
+    },
+    Package {
+        pool_path: "pool/main/w/wayland/libwayland-egl1_1.23.1-3_amd64.deb",
+        sha256: "7c5c3429028b39b9432792db08cb218c43891df439ebc648b83ebee676a80ec5",
+    },
+    Package {
+        pool_path: "pool/main/w/wayland/libwayland-server0_1.23.1-3_amd64.deb",
+        sha256: "2967212bd582e0dffca443fdc44f4c660e7368d41f7ee3a7f6314e0c3abfe9ea",
+    },
+    Package {
+        pool_path: "pool/main/libx/libx11/libx11-6_1.8.12-1_amd64.deb",
+        sha256: "b5a3fd3bf8c8fd0364bfb9bea00dcba7fc301229bd02dded084632d31f5b0fb3",
+    },
+    Package {
+        pool_path: "pool/main/libx/libx11/libx11-data_1.8.12-1_all.deb",
+        sha256: "c54f87069888f80ba4da586da6147d74c7598ccdd8b90906dbc4271fa414c738",
+    },
+    Package {
+        pool_path: "pool/main/libx/libx11/libx11-xcb1_1.8.12-1_amd64.deb",
+        sha256: "e05f94d21a932fba5b09b9b13d99df776b155d3bc792c0e294451df9ffe1ba25",
+    },
+    Package {
+        pool_path: "pool/main/libx/libxau/libxau6_1.0.11-1_amd64.deb",
+        sha256: "689a9f0e0ba3e2c65431f864871e303ee904de69dd28abfc462663fae030227f",
+    },
+    Package {
+        pool_path: "pool/main/libx/libxcb/libxcb-dri3-0_1.17.0-2+b1_amd64.deb",
+        sha256: "f446d42fb5fcebbb3e347368ba83616769fdb271d85b2f49048e337f3163d267",
+    },
+    Package {
+        pool_path: "pool/main/libx/libxcb/libxcb-glx0_1.17.0-2+b1_amd64.deb",
+        sha256: "cc59a3fa1c4ce376c3a32798179950810bd7b9be9a35bc76de1f5b5e7cc3925e",
+    },
+    Package {
+        pool_path: "pool/main/libx/libxcb/libxcb-present0_1.17.0-2+b1_amd64.deb",
+        sha256: "db95ea4630c55bd7f3281cb60ccf75b1627ef2f4399e1939f8f6161e584a92fb",
+    },
+    Package {
+        pool_path: "pool/main/libx/libxcb/libxcb-randr0_1.17.0-2+b1_amd64.deb",
+        sha256: "f5d9fe5fdf797918f81f0abf6cfd4270bd54659540cddb4da709ab7154523214",
+    },
+    Package {
+        pool_path: "pool/main/libx/libxcb/libxcb-shm0_1.17.0-2+b1_amd64.deb",
+        sha256: "d1777a813f484e89f3dcaadd1d5f2b1a13e9313b6bf70eded16d8ce743208fef",
+    },
+    Package {
+        pool_path: "pool/main/libx/libxcb/libxcb-sync1_1.17.0-2+b1_amd64.deb",
+        sha256: "0ce4770ed1505be9ddc6473045e4662d062aff2f3077ee684265f01cfb543559",
+    },
+    Package {
+        pool_path: "pool/main/libx/libxcb/libxcb-xfixes0_1.17.0-2+b1_amd64.deb",
+        sha256: "f9c1aafc18bf9e4662e34bbaf3bb00f1f4e8c2fc1dd786fdfb6cb9cb6c64fae7",
+    },
+    Package {
+        pool_path: "pool/main/libx/libxcb/libxcb1_1.17.0-2+b1_amd64.deb",
+        sha256: "5c222a72d11b866447da31693254f738430726e3e065a384e82687b2fd2f978b",
+    },
+    Package {
+        pool_path: "pool/main/libx/libxcursor/libxcursor1_1.2.3-1_amd64.deb",
+        sha256: "bb0dbf58b804faaa74ed9efdae61c4b14bb0b4855680798f63e5ca6a4954976b",
+    },
+    Package {
+        pool_path: "pool/main/libx/libxdmcp/libxdmcp6_1.1.5-1_amd64.deb",
+        sha256: "0740dc760916b2008b45417a42a8fd7dd5de370fb57d31373f15034cda8acf0b",
+    },
+    Package {
+        pool_path: "pool/main/libx/libxext/libxext6_1.3.4-1+b3_amd64.deb",
+        sha256: "fc618ec40465e5ce48622606299cb47833efc3fb235ba15543b81f850722f443",
+    },
+    Package {
+        pool_path: "pool/main/libx/libxfixes/libxfixes3_6.0.0-2+b4_amd64.deb",
+        sha256: "3fdd95d86d8e9d63e11f52070935c8f9f912c36aa3b17338d969f7685f3ed4fb",
+    },
+    Package {
+        pool_path: "pool/main/libx/libxi/libxi6_1.8.2-1_amd64.deb",
+        sha256: "093d0903f35bb7a9f6815180ee040e6951fecf9b66c128cd72f064710210606e",
+    },
+    Package {
+        pool_path: "pool/main/libx/libxinerama/libxinerama1_1.1.4-3+b4_amd64.deb",
+        sha256: "49d4e1628960407b8be2880a42428e7629801715a8a5697d42c0b0ca0a479911",
+    },
+    Package {
+        pool_path: "pool/main/libx/libxkbcommon/libxkbcommon0_1.7.0-2_amd64.deb",
+        sha256: "f75ee544f55acc6a271debfab3ea4ae0458afc89d81cfe1a71137e07d4895b86",
+    },
+    Package {
+        pool_path: "pool/main/libx/libxml2/libxml2_2.12.7+dfsg+really2.9.14-2.1+deb13u3_amd64.deb",
+        sha256: "e0c6b63ce4602a036a526f60fe5e6c1586710688058d98fc1001b9b3147b7efd",
+    },
+    Package {
+        pool_path: "pool/main/libx/libxrandr/libxrandr2_1.5.4-1+b3_amd64.deb",
+        sha256: "11e3490de93a8bbee3daba719cb8e1325a26fb3c125525c34bdcb7deb05eb9b2",
+    },
+    Package {
+        pool_path: "pool/main/libx/libxrender/libxrender1_0.9.12-1_amd64.deb",
+        sha256: "9d042dfd5e613be1e02e6ddd0c5c4adef19c5eb08f6db838c2eba672c496dca4",
+    },
+    Package {
+        pool_path: "pool/main/libx/libxshmfence/libxshmfence1_1.3.3-1_amd64.deb",
+        sha256: "7b339e9e5b2349723d35af4df89bcc7aa456bbdf8ba1754358f9b44c3fe1f964",
+    },
+    Package {
+        pool_path: "pool/main/libx/libxss/libxss1_1.2.3-1+b3_amd64.deb",
+        sha256: "302d4a97800429fa0d67ae2e0e8e3adc1228b12d25d3d3cca6c9d24eeff40a6c",
+    },
+    Package {
+        pool_path: "pool/main/libx/libxxf86vm/libxxf86vm1_1.1.4-1+b4_amd64.deb",
+        sha256: "f9f8487e536293e7ecf91fe7feb14e97e02a3aa652e207c661442dce775d3b14",
+    },
+    Package {
+        pool_path: "pool/main/z/z3/libz3-4_4.13.3-1_amd64.deb",
+        sha256: "71383373523ef62d47eccf660cf6535c3febcbb3f88e54cb7a43124014b57359",
+    },
+    Package {
+        pool_path: "pool/main/l/lsb/lsb-base_11.6_all.deb",
+        sha256: "f8bedd167280e76636df3a1bc023cd2906d458916c1af4c1d7912c5b971fc642",
+    },
+    Package {
+        pool_path: "pool/main/m/mesa/mesa-libgallium_25.0.7-2+deb13u1_amd64.deb",
+        sha256: "3e610f29321cdcc61337c86e6b4031ff60f0c9915fe19e6a862ac06480620ff4",
+    },
+    Package {
+        pool_path: "pool/main/m/mesa/mesa-vulkan-drivers_25.0.7-2+deb13u1_amd64.deb",
+        sha256: "caf2f7d296b7522efe74e40a74bce762a3ce84c33b53b5e54e1248ac2e0a13a5",
+    },
+    Package {
+        pool_path: "pool/main/s/sysvinit/sysvinit-utils_3.14-4_amd64.deb",
+        sha256: "c7e957360dff89675b491e501b00047cf750695178cabab167c92fc260d358ec",
+    },
+    Package {
+        pool_path: "pool/main/x/xorg/x11-common_7.7+24+deb13u1_all.deb",
+        sha256: "57a981938506b26dc552f19cafeaa8c04e9b59dc7508509151f8507a9d4e5f24",
+    },
+    Package {
+        pool_path: "pool/main/x/xkeyboard-config/xkb-data_2.42-1_all.deb",
+        sha256: "196ff18533382f64e057ea49df2bb486bd4275a4cc0917361edb560b8756dada",
+    },
+    Package {
+        pool_path: "pool/main/libx/libxmu/libxmu6_1.1.3-3+b4_amd64.deb",
+        sha256: "cfdf1dee8f9abd87f503222fc8b04a30ce820fb1255247b7c3a28ff9c244431a",
+    },
+    Package {
+        pool_path: "pool/main/libg/libglu/libglu1-mesa_9.0.2-1.1+b3_amd64.deb",
+        sha256: "a834280c698c17ddaf5ad69ed699dd47e337f034a97a6a08285025d85743306b",
+    },
+    Package {
+        pool_path: "pool/main/libx/libxt/libxt6t64_1.2.1-1.2+b2_amd64.deb",
+        sha256: "a1f4557c03113681ee24863495adc244cecec95fe3ab7256ce76e87320157300",
+    },
+    Package {
+        pool_path: "pool/main/libs/libsm/libsm6_1.2.6-1_amd64.deb",
+        sha256: "03038b3002e6f44322554e335d60d8ff87acfcf2e21c904b6866610a9913ee00",
+    },
+    Package {
+        pool_path: "pool/main/libi/libice/libice6_1.1.1-1_amd64.deb",
+        sha256: "38185997162793b5dfb768644badc57852879784a2f9d83c6c4e47efa5e36698",
+    },
+    Package {
+        pool_path: "pool/main/libg/libglvnd/libopengl0_1.7.0-1+b2_amd64.deb",
+        sha256: "50ea65a1141cbf6b02e41492963656ad0ba71d257cc4066ee9756bca7a6c1ac3",
+    },
+    Package {
+        pool_path: "pool/main/u/util-linux/libuuid1_2.41.5-0+deb13u1_amd64.deb",
+        sha256: "c1bf4c4c3ff48c57fabf93307dfb56996b60cfa33927afc4158b5db36fb2721e",
+    },
+];
+
 /// A guest root of `fetch-rootfs`: x86-64, or i386 (`--i386`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Arch {
     Amd64,
     I386,
+    /// x86-64, with the libraries of games (`PACKAGES_GAMES`).
+    Games,
 }
 
 impl Arch {
-    fn packages(self) -> &'static [Package] {
+    fn packages(self) -> Vec<&'static Package> {
         match self {
-            Arch::Amd64 => PACKAGES,
-            Arch::I386 => PACKAGES_I386,
+            Arch::Amd64 => PACKAGES.iter().collect(),
+            Arch::I386 => PACKAGES_I386.iter().collect(),
+            Arch::Games => PACKAGES.iter().chain(PACKAGES_GAMES).collect(),
         }
     }
 
@@ -283,6 +640,7 @@ impl Arch {
         match self {
             Arch::Amd64 => "rootfs",
             Arch::I386 => "rootfs-i386",
+            Arch::Games => "rootfs-games",
         }
     }
 }

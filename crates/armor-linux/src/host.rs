@@ -16,7 +16,7 @@ use std::collections::HashMap;
 use std::ffi::{CStr, c_void};
 use std::sync::{Mutex, OnceLock};
 
-use armor_mem::GuestMemory;
+use armor_mem::{AddressSpace, GuestMemory, Prot};
 
 /// The syscall number of a host call: outside Linux's x86_64 numbers (and
 /// below the x32 range at 0x4000_0000).
@@ -51,7 +51,45 @@ pub const FUNCTIONS: &[HostFunction] = &[HostFunction {
     signature: Signature::F64I32ToF64,
 }];
 
-/// The host addresses of the functions found so far, by id (0: missing).
+mod gl_table;
+mod glx;
+
+/// The id of the probe the OpenGL stubs make when they load: 0 when armor
+/// runs the guest with the host's OpenGL (`--host-gl`), else `ENOSYS`.
+const GL_PROBE: &str = "armorHostGL";
+
+/// A function's id: FNV-1a (64 bits) of its name, as `cargo xtask gl-gen`
+/// computes it for the stubs.
+pub fn function_id(name: &str) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in name.bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
+/// The host address of `symbol` in host library `library` (loaded once,
+/// never unloaded), or `None`.
+pub(crate) fn host_symbol(library: &CStr, symbol: &CStr) -> Option<usize> {
+    static LIBRARIES: OnceLock<Mutex<HashMap<Vec<u8>, usize>>> = OnceLock::new();
+    let mut libraries = LIBRARIES
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .expect("host libraries lock");
+    let handle = *libraries
+        .entry(library.to_bytes().to_vec())
+        // SAFETY: a NUL-terminated name; the library stays loaded.
+        .or_insert_with(|| unsafe { libc::dlopen(library.as_ptr(), libc::RTLD_NOW) } as usize);
+    if handle == 0 {
+        return None;
+    }
+    // SAFETY: a valid handle and a NUL-terminated name.
+    let address = unsafe { libc::dlsym(handle as *mut c_void, symbol.as_ptr()) } as usize;
+    (address != 0).then_some(address)
+}
+
+/// The host address of a function by id (0: missing), found once.
 fn resolved() -> &'static Mutex<HashMap<u64, usize>> {
     static RESOLVED: OnceLock<Mutex<HashMap<u64, usize>>> = OnceLock::new();
     RESOLVED.get_or_init(|| Mutex::new(HashMap::new()))
@@ -61,18 +99,64 @@ fn resolved() -> &'static Mutex<HashMap<u64, usize>> {
 /// missing on this host.
 fn address(function: &HostFunction) -> Option<usize> {
     let mut resolved = resolved().lock().expect("host functions lock");
-    let address = *resolved.entry(function.id).or_insert_with(|| {
-        // SAFETY: dlopen and dlsym take NUL-terminated strings; a library
-        // stays loaded for the life of the process (no dlclose).
-        unsafe {
-            let library = libc::dlopen(function.library.as_ptr(), libc::RTLD_NOW);
-            if library.is_null() {
-                return 0;
-            }
-            libc::dlsym(library, function.symbol.as_ptr()) as usize
-        }
+    let address = *resolved
+        .entry(function.id)
+        .or_insert_with(|| host_symbol(function.library, function.symbol).unwrap_or(0));
+    (address != 0).then_some(address)
+}
+
+/// The host address of OpenGL function `name`: exported by the host's
+/// `libGL.so.1`, else from `glXGetProcAddressARB` (extensions).
+fn gl_address(id: u64, name: &CStr) -> Option<usize> {
+    let mut resolved = resolved().lock().expect("host functions lock");
+    let address = *resolved.entry(id).or_insert_with(|| {
+        host_symbol(c"libGL.so.1", name)
+            .or_else(|| {
+                let get = host_symbol(c"libGL.so.1", c"glXGetProcAddressARB")?;
+                // SAFETY: `void (*glXGetProcAddressARB(const GLubyte *))(void)`.
+                let get: unsafe extern "C" fn(*const u8) -> usize =
+                    unsafe { std::mem::transmute(get) };
+                // SAFETY: a NUL-terminated name.
+                let address = unsafe { get(name.as_ptr().cast()) };
+                (address != 0).then_some(address)
+            })
+            .unwrap_or(0)
     });
     (address != 0).then_some(address)
+}
+
+/// Strings the host returned, copied into guest memory once each.
+#[derive(Default)]
+pub(crate) struct GuestStrings {
+    copied: Mutex<HashMap<Vec<u8>, u64>>,
+}
+
+impl GuestStrings {
+    /// The guest address of a copy of host string `text` (0 for null).
+    pub(crate) fn copy(&self, mem: &AddressSpace, text: *const std::ffi::c_char) -> u64 {
+        if text.is_null() {
+            return 0;
+        }
+        // SAFETY: the host function returned a NUL-terminated string.
+        let bytes = unsafe { CStr::from_ptr(text) }.to_bytes_with_nul().to_vec();
+        let mut copied = self.copied.lock().expect("guest strings lock");
+        if let Some(address) = copied.get(&bytes) {
+            return *address;
+        }
+        let Ok(address) = mem.map_anywhere(bytes.len() as u64, Prot::READ | Prot::WRITE) else {
+            return 0;
+        };
+        if mem.write(address, &bytes).is_err() {
+            return 0;
+        }
+        copied.insert(bytes, address);
+        address
+    }
+}
+
+fn strings() -> &'static GuestStrings {
+    static STRINGS: OnceLock<GuestStrings> = OnceLock::new();
+    STRINGS.get_or_init(GuestStrings::default)
 }
 
 /// Calls `address`, a host function of `signature`, with the arguments in
@@ -93,28 +177,53 @@ unsafe fn call_host(address: usize, signature: Signature, slots: &mut [u64; SLOT
 }
 
 /// Syscall [`HOST_CALL`]: function `id`, its slots at guest address
-/// `slots_address`.
-pub(crate) fn host_call<M: GuestMemory + ?Sized>(
-    mem: &M,
+/// `slots_address`; OpenGL and GLX only with `host_gl` (`--host-gl`).
+pub(crate) fn host_call(
+    mem: &AddressSpace,
+    host_gl: bool,
     id: u64,
     slots_address: u64,
 ) -> crate::syscall::SysResult {
     use crate::syscall::err;
-    let Some(function) = FUNCTIONS.iter().find(|f| f.id == id) else {
-        return Err(err(libc::ENOSYS));
-    };
-    let Some(address) = address(function) else {
-        return Err(err(libc::ENOSYS));
-    };
     let mut bytes = [0u8; SLOTS * 8];
-    mem.read(slots_address, &mut bytes)
-        .map_err(|_| err(libc::EFAULT))?;
+    let read = |bytes: &mut [u8; SLOTS * 8]| {
+        mem.read(slots_address, bytes)
+            .map_err(|_| err(libc::EFAULT))
+    };
     let mut slots = [0u64; SLOTS];
-    for (slot, chunk) in slots.iter_mut().zip(bytes.as_chunks::<8>().0) {
-        *slot = u64::from_le_bytes(*chunk);
+    let load = |bytes: &[u8; SLOTS * 8], slots: &mut [u64; SLOTS]| {
+        for (slot, chunk) in slots.iter_mut().zip(bytes.as_chunks::<8>().0) {
+            *slot = u64::from_le_bytes(*chunk);
+        }
+    };
+    if let Some(function) = FUNCTIONS.iter().find(|f| f.id == id) {
+        let address = address(function).ok_or(err(libc::ENOSYS))?;
+        read(&mut bytes)?;
+        load(&bytes, &mut slots);
+        // SAFETY: the table gives each function its exact C signature.
+        unsafe { call_host(address, function.signature, &mut slots) };
+    } else if !host_gl || host_symbol(c"libGL.so.1", c"glGetString").is_none() {
+        return Err(err(libc::ENOSYS));
+    } else if id == function_id(GL_PROBE) {
+        return Ok(0);
+    } else if let Some(name) = glx::name_of(id) {
+        read(&mut bytes)?;
+        load(&bytes, &mut slots);
+        glx::call(name, &mut slots, mem, strings()).ok_or(err(libc::ENOSYS))?;
+    } else {
+        let index = gl_table::GL_FUNCTIONS
+            .binary_search_by_key(&id, |(id, _, _)| *id)
+            .map_err(|_| err(libc::ENOSYS))?;
+        let (_, name, signature) = gl_table::GL_FUNCTIONS[index];
+        let address = gl_address(id, name).ok_or(err(libc::ENOSYS))?;
+        read(&mut bytes)?;
+        load(&bytes, &mut slots);
+        // SAFETY: the generated table gives each function its signature.
+        unsafe { gl_table::call(signature, address, &mut slots) };
+        if name == c"glGetString" || name == c"glGetStringi" {
+            slots[0] = strings().copy(mem, slots[0] as *const std::ffi::c_char);
+        }
     }
-    // SAFETY: the table gives each function its exact C signature.
-    unsafe { call_host(address, function.signature, &mut slots) };
     mem.write(slots_address, &slots[0].to_le_bytes())
         .map_err(|_| err(libc::EFAULT))?;
     Ok(0)

@@ -28,3 +28,9 @@ Measured on Doki Doki Literature Club (Ren'Py, 2026-10-15): SDL2 creates the win
 - \+ The same path serves every ARM64 GPU with a Mesa driver (M9).
 - − A generated layer of a few thousand functions to keep correct; callbacks into guest code are not covered at first.
 - − Vulkan (DXVK in Proton is not concerned: Proton is native) and EGL are later steps, on the same mechanism.
+
+## Implementation (2026-10-15)
+- Increment 1: syscall 0x410000 and one host function (`ldexp`), test `host_call` (`tech/syscalls.md`).
+- Increments 2–3: `cargo xtask gl-gen` generates the table (`crates/armor-linux/src/host/gl_table.rs`) and the stubs (`guest/libgl/gl_stubs.c`) from `gl.xml` (Khronos commit `6af574a`, `third_party/khronos/`): 2965 functions, all of the registry's desktop OpenGL functions rather than only those of v3d (the host's `dlsym` or `glXGetProcAddressARB` decides at call time whether one exists), with 98 C signatures. 20 are left out and listed by the generator: 11 return a pointer (driver memory, as `glMapBuffer` and `glMapBufferRange` do: point 3's registration is not built yet; or a Vulkan function), 3 take callbacks, 3 have more than 16 parameters, 3 are not defined by the registry. The GLX functions are written by hand (`guest/libgl/glx.c`, `crates/armor-linux/src/host/glx.rs`; 31 functions, among them those of `GLX_ARB_create_context` and the swap-interval extensions).
+- `armor --host-gl`, `host-gl = yes` in a profile or in an application's `app.conf`, as point 6 says; the package installs the stubs as `/usr/lib/armor/x86_64-linux-gnu/libGL.so.1`. `--host-gl` with `--sandbox` is refused (`tech/security.md`).
+- Verification, as point 5 says: `cargo xtask gl-check` (`testing.md`): `gl_rects` and `gl_shader` give the same pixels under qemu, armor and `armor --host-gl` (V3D 7.1); `gl-gen --check` in the verification chain; Doki Doki Literature Club draws on V3D, with its sound, and is playable through its first scene (`tech/steam.md`).

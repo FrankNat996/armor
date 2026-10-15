@@ -828,7 +828,9 @@ pub fn dispatch(
         cpu.regs[R9],
     ];
     let result: SysResult = match number {
-        crate::host::HOST_CALL => crate::host::host_call(mem, a[0], a[1]),
+        crate::host::HOST_CALL => {
+            crate::host::host_call(mem, process.root.host_gl().is_some(), a[0], a[1])
+        }
         nr::READ => read(mem, a[0], a[1], a[2]),
         nr::PREAD64 => pread64(mem, a[0], a[1], a[2], a[3]),
         nr::PWRITE64 => pwrite64(mem, a[0], a[1], a[2], a[3]),

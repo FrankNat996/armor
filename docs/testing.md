@@ -12,7 +12,7 @@ Not implemented yet: golden files, random instruction sequences compared with qe
 ## Verification chain
 It runs in full before every commit, and every step must end with result 0:
 ```bash
-cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace && cargo xtask difftest && cargo xtask decoder-check target/guest/c/* target/guest/busybox/busybox target/guest/rootfs/usr/bin/ls target/guest/rootfs/usr/lib/x86_64-linux-gnu/libm.so.6 target/guest/rootfs/usr/lib/x86_64-linux-gnu/libcrypto.so.3 /usr/i686-linux-gnu/lib/libc.so.6 /usr/i686-linux-gnu/lib/libm.so.6 && cargo xtask encoder-check && cargo xtask progress --check && cargo xtask coverage --check && cargo xtask sandbox-check && (cd gui && cargo fmt --check && cargo clippy --target-dir ../target/gui --all-targets -- -D warnings && cargo test --target-dir ../target/gui)
+cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace && cargo xtask difftest && cargo xtask decoder-check target/guest/c/* target/guest/busybox/busybox target/guest/rootfs/usr/bin/ls target/guest/rootfs/usr/lib/x86_64-linux-gnu/libm.so.6 target/guest/rootfs/usr/lib/x86_64-linux-gnu/libcrypto.so.3 /usr/i686-linux-gnu/lib/libc.so.6 /usr/i686-linux-gnu/lib/libm.so.6 && cargo xtask encoder-check && cargo xtask gl-gen --check && cargo xtask progress --check && cargo xtask coverage --check && cargo xtask sandbox-check && (cd gui && cargo fmt --check && cargo clippy --target-dir ../target/gui --all-targets -- -D warnings && cargo test --target-dir ../target/gui)
 ```
 When the hardware oracle is available, `cargo xtask difftest --oracle` is added (ADR-0025).
 
@@ -154,6 +154,15 @@ To check that the tests do not pass by chance, a bug is deliberately introduced 
 - If the assembler emits a different number of words (an expanded alias), the command assembles the samples one by one to find the one responsible.
 - It is in the verification chain (above).
 
+## OpenGL through the host (ADR-0041, since 2026-10-15)
+- `cargo xtask gl-gen --check` (`xtask/src/glgen.rs`, in the verification chain): the generated OpenGL table (`crates/armor-linux/src/host/gl_table.rs`) and stubs (`guest/libgl/gl_stubs.c`) must equal what Khronos' `gl.xml` (`third_party/khronos/`) gives; it also lists the functions left out and why.
+- `cargo xtask gl-check` (`xtask/src/gl.rs`): builds armor's x86-64 `libGL.so.1` and the programs of `tests/guest/gl/`, and runs each one three times in the games root (`cargo xtask fetch-rootfs --games`): under `qemu-x86_64` and under armor with the guest's software Mesa (llvmpipe), and under `armor --host-gl` with the host's OpenGL. The programs draw only what every conforming renderer draws the same way (pixel-aligned rectangles and quads, flat colours, colour factors 0 and 1, `GL_NEAREST` textures with no pixel centre on a texel edge) and print a checksum of the pixels read back with `glReadPixels`: the three outputs must be equal. It needs an X display (`DISPLAY`), so it is not in `difftest` nor in the chain; it runs after every change to the OpenGL path. ✅ 2026-10-15, Pi 5 (renderer of `--host-gl`: "V3D 7.1.7.0"): `gl_rects` and `gl_shader` equal.
+
+| Program | What it covers |
+|---|---|
+| `gl_rects` | GLX visual, context and window from the program's own `libX11`; `glClear` with scissors; `glReadPixels` into the program's memory |
+| `gl_shader` | OpenGL 2 the way games use it: functions from `glXGetProcAddressARB`, GLSL compiled and linked, vertex attributes read from the program's memory, uniforms, a texture uploaded with `glTexImage2D` |
+
 ## Fuzzing (M3)
 In-tree fuzzing tests, without dependencies (since 2026-10-13), on the components that read guest input. They are normal tests: `cargo test` runs them briefly with a fixed seed; `cargo xtask fuzz` (`xtask/src/fuzz.rs`) runs them in release with 1 million iterations each (`--iterations`) and a new seed, which it prints so that the run can be repeated (`--seed`). Generator: xorshift64, like the JIT's random tests.
 
@@ -255,9 +264,12 @@ ARMOR_ORACLE=root@host ARMOR_ORACLE_KEY=~/.ssh/key cargo xtask difftest --oracle
 cargo xtask run --lockstep c/hello         # the JIT checked instruction by instruction by the interpreter
 cargo xtask decoder-check target/guest/c/hello   # decoder against objdump on a real binary
 cargo xtask encoder-check                  # AArch64 encoder of the JIT against the host's GNU assembler
+cargo xtask gl-gen [--check]               # OpenGL table and stubs from Khronos' gl.xml (ADR-0041)
+cargo xtask gl-check                       # OpenGL under qemu, armor and armor --host-gl: same pixels (needs DISPLAY)
 cargo xtask fetch-busybox                  # once: Debian's busybox for difftest
 cargo xtask fetch-rootfs                   # once: x86-64 root with coreutils and the other Debian programs
 cargo xtask fetch-rootfs --i386            # once: i386 root with coreutils (ADR-0029)
+cargo xtask fetch-rootfs --games           # once: x86-64 root with Mesa, X11, SDL2, sound, libstdc++ (games, gl-check)
 cargo xtask progress                       # roadmap percentages in the README
 cargo xtask package                        # target/package/armor_<version>_arm64.deb (M7)
 cargo xtask coverage                       # coverage badges in the README (conventions.md)
@@ -283,6 +295,8 @@ tests/guest/c32/<name>.c            # i386-only C programs; the names are "c32/<
 target/guest/asm/<group>/<name>     # compiled executables (ignored by git)
 target/guest/c/<name>, target/guest/c-pie/<name>, target/guest/c-dyn/<name>
 target/guest/i386/…, target/guest/c32/<name>, target/guest/c32-pie/<name>, target/guest/c32-dyn/<name>
+tests/guest/gl/<name>.c             # OpenGL programs for gl-check (dynamic, run in the games root)
+guest/libgl/                        # armor's x86-64 libGL.so.1 (gl_stubs.c generated, glx.c), built into target/guest/libgl/
 ```
 
 | Group | Programs | What they cover |
@@ -316,6 +330,7 @@ target/guest/i386/…, target/guest/c32/<name>, target/guest/c32-pie/<name>, tar
 - **Root:** `cargo xtask fetch-rootfs` builds `target/guest/rootfs` from 39 pinned Debian trixie amd64 packages (`coreutils` 9.7-3, `grep` 3.11-4, `sed` 4.9-2+deb13u1, `gawk` 1:5.2.1-2+b1, `findutils` 4.10.0-3, `perl-base` 5.40.1-6+deb13u1, `python3.13-minimal` 3.13.5-2+deb13u5, and since 2026-10-13 `gzip`, `xz-utils`, `bzip2`, `tar`, `diffutils`, `make`, `dash`, with their dependencies, including `libc6` 2.41-12+deb13u4; ADR-0014). It is not in the repository. `difftest` fails with a hint if it is missing.
 - **Cases:** `tests/guest/coreutils.txt`, `tests/guest/tools.txt` (grep, sed, gawk, findutils, compression, archives, diff, make, dash) and `tests/guest/interpreters.txt` (perl, python), same format as `busybox.txt`; the first argument is the program in the root's `/usr/bin`. The names in `difftest` are `coreutils/<name>`, `tools/<name>` and `interpreters/<name>`.
 - **i386** (since 2026-10-14): `cargo xtask fetch-rootfs --i386` builds `target/guest/rootfs-i386` from 15 Debian trixie i386 packages (coreutils 9.7-3 and its closure, the same packages and versions as amd64, `PACKAGES_I386` in `rootfs.rs`, hashes from the `Packages` index of 2026-10-14 verified against `Release`). The same cases of `coreutils.txt` run there as `coreutils32/…`, with `qemu-i386` as the oracle: 50 out of 50 identical; `coreutils32/uname` only with `--oracle`, which however does not run it (root), because qemu-i386 answers `i686` and a 64-bit kernel `x86_64` (`c32/uname_machine` verifies it on the Xeon).
+- **Games root** (since 2026-10-15): `cargo xtask fetch-rootfs --games` builds `target/guest/rootfs-games` from the packages of `target/guest/rootfs` plus 84 more (`PACKAGES_GAMES` in `rootfs.rs`: the closure of Mesa's OpenGL, EGL and Vulkan libraries, X11, SDL2, ALSA, PulseAudio and `libstdc++6`, Debian trixie amd64, hashes from the `Packages` index of 2026-10-14 verified against `Release`). It is the root of `gl-check` and of the games tried by hand (`tech/steam.md`); no `difftest` case uses it.
 - **Environment:** as for busybox (`tests/guest/data/`, `fruits.txt` as stdin), but with the `fetch-rootfs` root for qemu (`-L`) and for armor (`ARMOR_ROOT`). Locale, `/etc/passwd` and time zones come from the host, the same for both.
 - **Decoder:** `decoder-check` on Debian's `ls`, `sort`, `sha512sum` and `libc.so.6`: 0 lengths different from objdump (2026-10-12).
 

@@ -247,6 +247,9 @@ fn exec_armor(
         b"--interpreter".to_vec()
     });
     args.extend(process.diagnose.iter().cloned());
+    if process.root.host_gl().is_some() {
+        args.push(b"--host-gl".to_vec());
+    }
     args.extend([
         b"--root".to_vec(),
         root,

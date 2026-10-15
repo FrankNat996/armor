@@ -20,6 +20,7 @@ It is assumed that it can exploit a bug in armor (decoder, JIT, syscall translat
 ## Boundaries
 - **Without `--sandbox`** (the default, ADR-0027): **no boundary** beyond the user's permissions, as for a native program or for qemu-user. The permission table prevents the guest from touching armor's memory *through the interpreter and the JIT*, but that is correctness, not security: one bug is enough to get around it.
 - **With `--sandbox`**: the boundary is the **kernel**, around the whole armor process (namespaces, seccomp, rlimit). It holds even with armor compromised, as long as the kernel is correct.
+- **`--host-gl`** (ADR-0041, since 2026-10-15): the guest calls the host's libGL and GLX through armor's syscall 0x410000, with pointers the host library reads and writes directly, outside the permission table. Without `--sandbox` that changes nothing above (there is no boundary to cross); armor refuses `--host-gl` together with `--sandbox` (✅ by hand, 2026-10-15: "--host-gl and --sandbox do not go together"), because the sandbox has no X server and no GPU device, so the host's driver never runs inside the boundary.
 
 ## Outside the model
 - Kernel bugs (user namespaces expose an additional part of them: it is the price of not asking for privileges).

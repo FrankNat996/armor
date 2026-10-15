@@ -35,6 +35,8 @@ pub struct Profile {
     pub allow_net: Option<bool>,
     /// `limit-*` keys, as the `--limit-*` options (name without `--`).
     pub limits: Vec<(String, String)>,
+    /// `--host-gl`: OpenGL through the host's libGL (ADR-0041).
+    pub host_gl: Option<bool>,
 }
 
 fn yes_no(value: &str) -> Option<bool> {
@@ -150,13 +152,13 @@ pub fn parse(name: &str, text: &str) -> Result<Profile, String> {
                 }
                 profile.unset.push(value.to_string());
             }
-            "sandbox" | "allow-net" => {
+            "sandbox" | "allow-net" | "host-gl" => {
                 let flag =
                     yes_no(value).ok_or_else(|| at(format!("{key} {value:?}: yes or no")))?;
-                if key == "sandbox" {
-                    profile.sandbox = Some(flag);
-                } else {
-                    profile.allow_net = Some(flag);
+                match key {
+                    "sandbox" => profile.sandbox = Some(flag),
+                    "allow-net" => profile.allow_net = Some(flag),
+                    _ => profile.host_gl = Some(flag),
                 }
             }
             "limit-files" | "limit-processes" | "limit-file-size" | "limit-cpu"
@@ -219,7 +221,8 @@ mod tests {
              sandbox = yes\n\
              allow = /data\n\
              allow-ro = /opt/models\n\
-             allow-net = no\n",
+             allow-net = no\n\
+             host-gl = yes\n",
         )
         .unwrap();
         assert_eq!(profile.engine, Some(Engine::Interpreter));
@@ -238,6 +241,7 @@ mod tests {
         assert_eq!(profile.allow, ["/data"]);
         assert_eq!(profile.allow_ro, ["/opt/models"]);
         assert_eq!(profile.allow_net, Some(false));
+        assert_eq!(profile.host_gl, Some(true));
     }
 
     #[test]
@@ -249,6 +253,7 @@ mod tests {
             ("env = NOVALUE", "NAME=VALUE"),
             ("unset = A=1", "a variable name"),
             ("sandbox = maybe", "yes or no"),
+            ("host-gl = 1", "yes or no"),
             ("allow = relative/path", "an absolute path"),
         ] {
             let e = parse("p", text).unwrap_err();

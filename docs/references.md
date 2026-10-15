@@ -12,6 +12,12 @@
 | System V AMD64 psABI | Calling conventions, initial stack, auxv | https://gitlab.com/x86-psABIs/x86-64-ABI |
 | Arm Architecture Reference Manual (A-profile) | AArch64 semantics, memory model | https://developer.arm.com/documentation/ddi0487/latest |
 
+## Graphics
+| Resource | Use |
+|---|---|
+| Khronos OpenGL registry, `xml/gl.xml` and `xml/glx.xml` — https://github.com/KhronosGroup/OpenGL-Registry | Apache-2.0 (✅ SPDX line in each file's header, 2026-10-15). Copied unchanged into `third_party/khronos/` (commit and SHA-256 in its `README.md`); `cargo xtask gl-gen` generates from them armor's OpenGL table and the x86-64 `libGL.so.1` stubs (ADR-0041), which the package ships with this notice in its `copyright` file |
+| OpenGL and GLX specifications — https://registry.khronos.org/OpenGL/ | Semantics of the functions armor passes to the host (which pointers they read or write, what they return) |
+
 ## Linux kernel
 | Resource | Use |
 |---|---|

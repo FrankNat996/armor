@@ -47,7 +47,7 @@ sudo apt install gcc-i686-linux-gnu libc6-dev-i386-cross
 |---|---|---|
 | `rustc` / `cargo` | 1.99.0 (stable, via rustup) | `/usr/bin/cargo` and `/usr/bin/rustc` are rustup proxies (Debian package `rustup` 1.27.1). Toolchain `stable-aarch64-unknown-linux-gnu`. |
 | `clippy` / `rustfmt` | 0.1.99 / 1.10.0 | Included in rustup's default profile; also required by `rust-toolchain.toml` |
-| `x86_64-linux-gnu-gcc` | 14.2.0 | Cross-compiler for the test programs |
+| `x86_64-linux-gnu-gcc` | 14.2.0 | Cross-compiler for the test programs and for armor's x86-64 `libGL.so.1` (ADR-0041; also needed by `cargo xtask package`, which ships it) |
 | x86_64 glibc (`libc6-dev-amd64-cross`) | 2.41 | Sysroot in `/usr/x86_64-linux-gnu/` |
 | x86_64 kernel headers | — | `/usr/x86_64-linux-gnu/include/asm/unistd_64.h`, `/usr/x86_64-linux-gnu/include/asm/stat.h` |
 | `x86_64-linux-gnu-objdump` | binutils 2.44 | Decoder oracle |

@@ -231,6 +231,7 @@ fn main() -> ExitCode {
     let (mut root_arg, mut argv0, mut engine) = (None, None, None);
     let (mut diagnose_arg, mut profile_name) = (None, None);
     let (mut sandbox, mut allow_net) = (None, None);
+    let mut host_gl = false;
     let (mut allow, mut allow_ro): (Vec<OsString>, Vec<OsString>) = (Vec::new(), Vec::new());
     let mut limit_args: Vec<(String, String)> = Vec::new();
     loop {
@@ -249,6 +250,10 @@ fn main() -> ExitCode {
             }
             [flag, tail @ ..] if flag == "--lockstep" => {
                 engine = Some(profile::Engine::Lockstep);
+                rest = tail;
+            }
+            [flag, tail @ ..] if flag == "--host-gl" => {
+                host_gl = true;
                 rest = tail;
             }
             [flag, tail @ ..] if flag == "--sandbox" => {
@@ -295,7 +300,7 @@ fn main() -> ExitCode {
     let Some((program, guest_args)) = rest.split_first() else {
         eprintln!(
             "usage: armor [--jit|--interpreter|--lockstep] [--root DIR] [--argv0 NAME] \
-             [--profile NAME] [--diagnose[=FILE]] [--sandbox [--allow PATH] [--allow-ro PATH] \
+             [--profile NAME] [--diagnose[=FILE]] [--host-gl] [--sandbox [--allow PATH] [--allow-ro PATH] \
              [--allow-net]] [--limit-files N] [--limit-processes N] [--limit-file-size SIZE] \
              [--limit-cpu SECONDS] [--limit-memory SIZE] <program> [args...]"
         );
@@ -320,6 +325,7 @@ fn main() -> ExitCode {
         argv0 = argv0.or_else(|| p.argv0.clone().map(OsString::from));
         sandbox = sandbox.or(p.sandbox);
         allow_net = allow_net.or(p.allow_net);
+        host_gl = host_gl || p.host_gl == Some(true);
         allow.extend(p.allow.iter().map(OsString::from));
         for (option, value) in &p.limits {
             if !limit_args.iter().any(|(o, _)| o == option) {
@@ -344,6 +350,27 @@ fn main() -> ExitCode {
         Some(dir) if dir.is_empty() => GuestRoot::none(),
         Some(dir) => GuestRoot::new(dir),
         None => GuestRoot::from_env(env::var_os(ROOT_VARIABLE)),
+    };
+    // `--host-gl` (ADR-0041): the guest's libGL.so.1 is armor's stubs. The
+    // sandbox has neither the X server's socket nor the GPU's devices.
+    if host_gl && sandbox == Some(true) {
+        return armor_error(format_args!(
+            "--host-gl and --sandbox do not go together: the sandbox has no X server \
+             and no GPU to draw on"
+        ));
+    }
+    let root = if host_gl {
+        match host_gl_stubs() {
+            Some(stubs) => root.with_host_gl(stubs),
+            None => {
+                return armor_error(format_args!(
+                    "--host-gl: armor's x86-64 OpenGL stubs (libGL.so.1) are not installed \
+                     (ARMOR_HOST_GL_STUBS, or lib/armor/x86_64-linux-gnu next to armor)"
+                ));
+            }
+        }
+    } else {
+        root
     };
     let mut resource_limits = Vec::new();
     for (option, value) in &limit_args {
@@ -755,6 +782,23 @@ impl Turns {
         self.0 = x;
         SIGNAL_CHECK_INTERVAL / 2 + x % (SIGNAL_CHECK_INTERVAL / 2 + 1)
     }
+}
+
+/// armor's x86-64 OpenGL stubs (`--host-gl`, ADR-0041): `ARMOR_HOST_GL_STUBS`,
+/// else `../lib/armor/x86_64-linux-gnu/libGL.so.1` from armor's directory
+/// (the package), else `../guest/libgl/libGL.so.1` (a build in `target/`).
+fn host_gl_stubs() -> Option<std::path::PathBuf> {
+    if let Some(path) = env::var_os("ARMOR_HOST_GL_STUBS").filter(|v| !v.is_empty()) {
+        return Some(std::path::PathBuf::from(path));
+    }
+    let exe = env::current_exe().ok()?;
+    let dir = exe.parent()?;
+    [
+        dir.join("../lib/armor/x86_64-linux-gnu/libGL.so.1"),
+        dir.join("../guest/libgl/libGL.so.1"),
+    ]
+    .into_iter()
+    .find(|p| p.is_file())
 }
 
 /// `armor inspect <file>`: exit 0 once the file was read, whatever the verdict.
