@@ -276,6 +276,8 @@ What these hosts found in armor, fixed on 2026-10-15: shared mappings smaller th
 
 ✅ 2026-10-15, run 38756588654: Neoverse-N2 (ARMv9.0 with SVE2, LSE2, BF16; 4 cores), 4K pages, kernel `6.17.0-1022-azure`: 268 Rust tests, `difftest` 467/467 with every engine and on the ARMv8.0 paths, `encoder-check` 0 mismatches, `sandbox-check` 0 failed, in 12 minutes.
 
+Since ADR-0045 the runner's chain records its `difftest` results with `--report` and the workflow publishes the results file as the `results` artifact, downloaded with `gh run download <run> -n results` and committed by hand (CI never pushes). ✅ 2026-10-15, run 38798303497 (commit 49c201c): 470/470 with the interpreter and the JIT, in lockstep and on the ARMv8.0 paths, 3/3 against the native builds; the file is `docs/results/neoverse-n2-4k-debian-gnu-linux-13-container.tsv`.
+
 ## Other distributions (ADR-0043, since 2026-10-15)
 **`cargo xtask distro-check`** builds the package and its archive (`cargo xtask package`) and, in podman containers on this machine, installs the archive with its `install.sh` and uses armor as a user would: Debian's Python (x86-64) and coreutils' `sort` (i386) must print what they print here, `armor install` of Debian's `hello` `.deb` (pinned SHA-256) takes its libraries from Debian's archive with the keyring armor carries, and `armor engine fetch` downloads the Windows engine, whose Wine runs `cmd /c ver`. Fedora 42 comes from Fedora's registry; Arch Linux ARM from its official root archive, checked against its build key's fingerprint before `podman import`. 2026-10-15: every check passes on both.
 

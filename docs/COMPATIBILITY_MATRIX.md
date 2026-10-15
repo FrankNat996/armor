@@ -107,6 +107,16 @@ Kernel `6.8.0-147-generic-64k`.
 | suite | difftest | armor interpreter, jit, ARMv8.0 paths | qemu-x86_64's results saved on a 4K host | 457/457 | 2026-10-15 | 97f001d | `ARMOR_HOST_FEATURES=baseline cargo xtask difftest --expected /mnt/repo/target/difftest-reference` |
 | suite | difftest | armor lockstep | qemu-x86_64's results saved on a 4K host | 457/457 | 2026-10-15 | 97f001d | `cargo xtask difftest --expected /mnt/repo/target/difftest-reference --lockstep` |
 
+### Neoverse-N2, 4K pages, Debian GNU/Linux 13 (container)
+Kernel `6.17.0-1022-azure`.
+
+| Kind | What | Engine | Reference | Result | Date | Commit | Command |
+|---|---|---|---|---|---|---|---|
+| suite | difftest | armor interpreter, jit | qemu-x86_64 10.0.13 | 470/470 | 2026-10-15 | 49c201c | `cargo xtask difftest` |
+| suite | difftest | armor interpreter, jit | the same source built for AArch64, run natively | 3/3 | 2026-10-15 | 49c201c | `cargo xtask difftest --native` |
+| suite | difftest | armor interpreter, jit, ARMv8.0 paths | qemu-x86_64 10.0.13 | 470/470 | 2026-10-15 | 49c201c | `ARMOR_HOST_FEATURES=baseline cargo xtask difftest` |
+| suite | difftest | armor lockstep | qemu-x86_64 10.0.13 | 470/470 | 2026-10-15 | 49c201c | `cargo xtask difftest --lockstep` |
+
 ### Checked by hand
 What cannot run unattended (a store account, a sign-in): each entry says how it was checked and when.
 

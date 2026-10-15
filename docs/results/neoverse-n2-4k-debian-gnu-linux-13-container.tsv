@@ -1,0 +1,10 @@
+# armor's measurements on one machine (ADR-0045): written by the cargo xtask commands run with --report.
+#cpu	Neoverse-N2
+#pages	4096
+#system	Debian GNU/Linux 13 (trixie)
+#place	container
+#kernel	6.17.0-1022-azure
+suite	difftest	armor interpreter, jit	qemu-x86_64 10.0.13	470/470	2026-10-15	49c201c	cargo xtask difftest
+suite	difftest	armor interpreter, jit	the same source built for AArch64, run natively	3/3	2026-10-15	49c201c	cargo xtask difftest --native
+suite	difftest	armor interpreter, jit, ARMv8.0 paths	qemu-x86_64 10.0.13	470/470	2026-10-15	49c201c	ARMOR_HOST_FEATURES=baseline cargo xtask difftest
+suite	difftest	armor lockstep	qemu-x86_64 10.0.13	470/470	2026-10-15	49c201c	cargo xtask difftest --lockstep
