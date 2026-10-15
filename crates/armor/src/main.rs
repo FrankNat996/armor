@@ -170,6 +170,9 @@ fn choose_path(
         })
     };
     if let Some((interpreter, optional)) = process::script_interpreter(&file) {
+        if process::is_host_system_script(program.as_bytes(), &root.resolve(program.as_bytes())) {
+            return native("is a script of the host system");
+        }
         let host = root.resolve(&interpreter);
         let interpreter_file = fs::read(OsStr::from_bytes(&host)).unwrap_or_default();
         if !process::is_guest_elf(&interpreter_file) {

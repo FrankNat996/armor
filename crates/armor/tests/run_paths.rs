@@ -140,6 +140,80 @@ fn native_programs_and_scripts_run_directly() {
     assert!(stderr.contains("interpreter is not an x86-64"), "{stderr}");
 }
 
+/// A static x86-64 executable that runs `execve(path, [path, arg], NULL)`
+/// and exits with 99 if it returns.
+fn x86_64_execve(path: &str, arg: &str) -> Vec<u8> {
+    let mut f = x86_64_exit_7();
+    let base = 0x40_0000u64;
+    let code_offset = 64 + 56u64;
+    // mov rdi, path; mov rsi, argv; xor edx, edx; mov eax, 59; syscall;
+    // mov edi, 99; mov eax, 60; syscall
+    let code_len = 10 + 10 + 2 + 5 + 2 + 5 + 5 + 2;
+    let data = base + code_offset + code_len;
+    let path_at = data + 24;
+    let arg_at = path_at + path.len() as u64 + 1;
+    let mut code = vec![0x48, 0xbf];
+    code.extend(path_at.to_le_bytes());
+    code.extend([0x48, 0xbe]);
+    code.extend(data.to_le_bytes());
+    code.extend([0x31, 0xd2, 0xb8, 59, 0, 0, 0, 0x0f, 0x05]);
+    code.extend([0xbf, 99, 0, 0, 0, 0xb8, 60, 0, 0, 0, 0x0f, 0x05]);
+    assert_eq!(code.len() as u64, code_len);
+    code.extend(path_at.to_le_bytes());
+    code.extend(arg_at.to_le_bytes());
+    code.extend(0u64.to_le_bytes());
+    code.extend(path.as_bytes());
+    code.push(0);
+    code.extend(arg.as_bytes());
+    code.push(0);
+    f.truncate(code_offset as usize);
+    f.extend(&code);
+    let size = (code_offset as usize + code.len()) as u64;
+    // filesz and memsz of the single PT_LOAD.
+    f[64 + 32..64 + 40].copy_from_slice(&size.to_le_bytes());
+    f[64 + 40..64 + 48].copy_from_slice(&size.to_le_bytes());
+    f
+}
+
+#[test]
+fn host_system_scripts_use_the_host_interpreter() {
+    // A guest root whose /bin/sh is an x86-64 program (exit 7): a script
+    // of its own, or one outside the system directories, runs under it;
+    // a script of the host system (/usr/bin/which, `#! /bin/sh`) runs
+    // with the host's /bin/sh.
+    let root = std::env::temp_dir().join(format!("armor-run-paths-root-{}", std::process::id()));
+    fs::create_dir_all(root.join("bin")).unwrap();
+    let sh = root.join("bin/sh");
+    fs::write(&sh, x86_64_exit_7()).unwrap();
+    fs::set_permissions(&sh, fs::Permissions::from_mode(0o755)).unwrap();
+    let root = root.to_str().unwrap();
+
+    let out = armor(&["--root", root, "/usr/bin/which", "sh"]);
+    assert!(out.status.success(), "{out:?}");
+    assert!(
+        String::from_utf8_lossy(&out.stdout).ends_with("/sh\n"),
+        "{out:?}"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("script of the host system"), "{stderr}");
+
+    let script = temp_file("own.sh", b"#!/bin/sh\necho host\n");
+    let out = armor(&["--root", root, script.to_str().unwrap()]);
+    assert_eq!(out.status.code(), Some(7), "{out:?}");
+
+    // The same from a guest's execve.
+    let exec = temp_file("exec-which", &x86_64_execve("/usr/bin/which", "sh"));
+    let out = armor(&["--root", root, exec.to_str().unwrap()]);
+    assert!(out.status.success(), "{out:?}");
+    assert!(
+        String::from_utf8_lossy(&out.stdout).ends_with("/sh\n"),
+        "{out:?}"
+    );
+    let exec = temp_file("exec-own", &x86_64_execve(script.to_str().unwrap(), "x"));
+    let out = armor(&["--root", root, exec.to_str().unwrap()]);
+    assert_eq!(out.status.code(), Some(7), "{out:?}");
+}
+
 #[test]
 fn other_files_are_refused_with_a_suggestion() {
     let data = temp_file("data.txt", b"hello\n");

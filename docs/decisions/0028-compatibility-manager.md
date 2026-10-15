@@ -37,6 +37,9 @@ The guiding document (§5) asks that armor choose the execution path by itself, 
   The report contains no arguments, environment variables, file contents or guest data: only syscall names, mnemonics and numbers.
 - **Suggestions even without `--diagnose`**, when armor stops: for every known cause (unsupported instruction, undeclared extension, library missing from the guest root, non-executable format) a "suggestion:" line with a concrete action.
 
+## Update of 2026-10-15: scripts of the host system
+A `#!` script in a system directory of the host (`/usr`, `/bin`, `/sbin`, `/lib`, `/lib64`, `/etc`) that the guest root does not override is the host's own program, written for the host's tools: it runs on the host with the host's interpreter, both as `armor <script>` and from a guest's `execve` (`process::is_host_system_script`). Before, its interpreter was resolved in the guest root: a game run with a root holding x86-64 `dash` and coreutils opened a web page through Debian's `/usr/bin/chromium` launcher, whose `uname -m` then said `x86_64`, and the launcher looked for SSE3 in the host's `/proc/cpuinfo` and refused to start Chromium. Scripts anywhere else (a game's launcher next to its files, a test) and those the root provides keep the root's interpreter. Test: `host_system_scripts_use_the_host_interpreter` (`crates/armor/tests/run_paths.rs`, fails without the rule). Not a `difftest` case: `qemu-x86_64 -L` resolves the interpreter in the root.
+
 ## Alternatives considered
 - **Interpreter by default**: more conservative, but the JIT is as verified as the interpreter and much faster: for example the python traceback 0.41 s against 3.76 s, `bench float` 0.27 s against 11.4 s (`tech/performance.md`).
 - **TOML with a dependency:** more expressive; the `key = value` format is enough for the planned keys, without new dependencies.

@@ -183,8 +183,30 @@ fn close_pair(pipe: [i32; 2]) {
     }
 }
 
+/// Directories of the host's own programs and configuration.
+const HOST_SYSTEM_DIRS: [&[u8]; 6] = [
+    b"/usr/", b"/bin/", b"/sbin/", b"/lib/", b"/lib64/", b"/etc/",
+];
+
+/// Whether the script at guest path `guest_path` (`host_path` once
+/// resolved in the guest root) is one of the host system's: in a system
+/// directory and not overridden by the root. Such a script is the host's
+/// program (Debian's `/usr/bin/chromium` launcher, `xdg-open`), written for
+/// the host's tools, so it runs with the host's interpreter (ADR-0028):
+/// under the root's x86-64 `sh`, `uname -m` said `x86_64` and the
+/// launcher looked for SSE3 in the host's `/proc/cpuinfo`, then refused
+/// to start. Scripts anywhere else (a game's launcher next to its files)
+/// and those the root provides keep the root's interpreter.
+pub fn is_host_system_script(guest_path: &[u8], host_path: &[u8]) -> bool {
+    guest_path == host_path
+        && HOST_SYSTEM_DIRS
+            .iter()
+            .any(|dir| guest_path.starts_with(dir))
+}
+
 /// execve(2). x86_64 programs (directly or as a script's interpreter) run
-/// under a new armor; anything else goes to the host kernel. Returns only
+/// under a new armor; anything else, and the host system's scripts
+/// (`is_host_system_script`), goes to the host kernel. Returns only
 /// on failure. `word` is the size of the guest's pointers in argv and
 /// envp: 8, or 4 for an i386 guest.
 pub fn execve(
@@ -210,7 +232,9 @@ pub fn execve(
         let rest = args.get(1..).unwrap_or(&[]).to_vec();
         return exec_armor(process, &argv0, &host_path, &rest, &env);
     }
-    if let Some((interpreter, optional)) = script_interpreter(&header) {
+    if let Some((interpreter, optional)) = script_interpreter(&header)
+        && !is_host_system_script(&guest_path, &host_path)
+    {
         let interpreter_host = process.root.resolve(&interpreter);
         if read_header(&interpreter_host).is_ok_and(|h| is_guest_elf(&h)) {
             // The kernel's arguments for a script: interpreter, its
@@ -440,6 +464,31 @@ mod tests {
         );
         assert_eq!(script_interpreter(b"#!\n"), None);
         assert_eq!(script_interpreter(b"\x7fELF"), None);
+    }
+
+    #[test]
+    fn host_system_scripts_are_those_the_root_does_not_override() {
+        assert!(is_host_system_script(
+            b"/usr/bin/chromium",
+            b"/usr/bin/chromium"
+        ));
+        assert!(is_host_system_script(b"/etc/init.d/x", b"/etc/init.d/x"));
+        // Provided by the root: its own script.
+        assert!(!is_host_system_script(
+            b"/usr/bin/xdg-open",
+            b"/apps/x/root/usr/bin/xdg-open"
+        ));
+        // Outside the system directories: a game's launcher, a test.
+        assert!(!is_host_system_script(
+            b"/home/u/game/start.sh",
+            b"/home/u/game/start.sh"
+        ));
+        assert!(!is_host_system_script(
+            b"/opt/game/run.sh",
+            b"/opt/game/run.sh"
+        ));
+        assert!(!is_host_system_script(b"./run.sh", b"./run.sh"));
+        assert!(!is_host_system_script(b"/usrx/run.sh", b"/usrx/run.sh"));
     }
 
     #[test]
