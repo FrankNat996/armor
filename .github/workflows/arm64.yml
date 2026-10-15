@@ -1,0 +1,69 @@
+# armor's verification chain on GitHub's ARM64 Linux runner: a second real
+# CPU for the compatibility matrix (roadmap M9, docs/testing.md). The same
+# test cases as on the development machine; the CPU, kernel and page size
+# are printed first so every run says where it ran.
+name: arm64
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  chain:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Machine
+        run: |
+          uname -a
+          getconf PAGESIZE
+          lscpu
+          grep -m1 Features /proc/cpuinfo
+          grep -m1 'CPU part' /proc/cpuinfo
+          cat /etc/os-release
+
+      - name: Tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-x86-64-linux-gnu libc6-dev-amd64-cross binutils-x86-64-linux-gnu \
+            gcc-i686-linux-gnu libc6-dev-i386-cross nasm qemu-user
+          qemu-x86_64 --version
+          x86_64-linux-gnu-gcc --version | head -1
+          command -v rustup || curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Rust tests
+        run: |
+          cargo --version
+          cargo fmt --all --check
+          cargo clippy --workspace --all-targets -- -D warnings
+          cargo test --workspace
+
+      - name: Guest programs and roots
+        run: |
+          cargo xtask fetch-busybox
+          cargo xtask fetch-rootfs
+          cargo xtask fetch-rootfs --i386
+          cargo xtask build-guest
+
+      - name: difftest
+        run: cargo xtask difftest
+
+      - name: difftest in lockstep
+        run: cargo xtask difftest --lockstep
+
+      - name: difftest with the ARMv8.0 paths of the JIT
+        run: ARMOR_HOST_FEATURES=baseline cargo xtask difftest
+
+      - name: Encoder against the GNU assembler
+        run: cargo xtask encoder-check
+
+      - name: Sandbox
+        run: |
+          # Ubuntu restricts unprivileged user namespaces, which --sandbox
+          # needs (docs/tech/security.md).
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+          cargo xtask sandbox-check
