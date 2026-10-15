@@ -1,0 +1,68 @@
+# armor's measurements on one machine (ADR-0045): written by the cargo xtask commands run with --report.
+#cpu	Cortex-A76
+#pages	4096
+#system	Debian GNU/Linux 13 (trixie)
+#place	native
+#kernel	6.18.50+rpt-rpi-v8
+application	7-Zip 26.04 for Linux x86-64 (7zz)	armor (JIT)	7-Zip 26.04 for Linux ARM64, run natively	level 3: archive of tests/guest identical to the native ARM64 7zz's (SHA-256 b7f32abea7665d92…)	2026-10-15	97f001d	cargo xtask app-check 7zip-linux
+application	7-Zip 26.04 for Windows x64 (7z2604-x64.exe)	Hangover 11.16 (FEX ARM64EC)	7-Zip 26.04 for Windows ARM64, run the same way	level 3: archive of tests/guest identical to the ARM64 build's (SHA-256 c3f315b107e7311f…)	2026-10-15	97f001d	cargo xtask app-check 7zip-x64
+application	7-Zip 26.04 for Windows x86 (7z2604.exe)	Hangover 11.16 (FEX WoW64)	7-Zip 26.04 for Windows ARM64, run the same way	level 3: archive of tests/guest identical to the ARM64 build's (SHA-256 c3f315b107e7311f…)	2026-10-15	97f001d	cargo xtask app-check 7zip-x86
+application	Friday Night Funkin' 0.8.6 for Windows x64 (itch.io zip)	Hangover 11.16 (FEX ARM64EC)	a window on an X display (Xvfb)	level 1: its window (Friday Night Funkin) appeared 4 s after armor run	2026-10-15	97f001d	cargo xtask app-check funkin
+application	KeePass 2.61.1 for Windows (.NET)	Hangover 11.16 with Wine Mono	a window on an X display (Xvfb)	level 1: its window (KeePass) appeared 20 s after armor run	2026-10-15	97f001d	cargo xtask app-check keepass2
+application	KeePassXC 2.7.12 (AppImage, x86-64)	armor (JIT), Debian's x86-64 libraries	a window on an X display (Xvfb)	level 1: its window (KeePassXC) appeared 5 s after armor run	2026-10-15	97f001d	cargo xtask app-check keepassxc
+application	Notepad++ 8.9.8.1 for Windows x64	Hangover 11.16 (FEX ARM64EC)	a window on an X display (Xvfb)	level 1: its window (Notepad++) appeared 2 s after armor run	2026-10-15	97f001d	cargo xtask app-check notepad-plus-plus
+application	Spotify 1.3.4.258 (.deb, x86-64, Chromium)	armor (JIT), Debian's x86-64 libraries	a window on an X display (Xvfb)	level 1: its window (Spotify) appeared 20 s after armor run	2026-10-15	97f001d	cargo xtask app-check spotify
+application	XnView MP 1.12.2 (.deb, x86-64)	armor (JIT), Debian's x86-64 libraries	a window on an X display (Xvfb)	level 1: its window (XnView) appeared 1 s after armor run	2026-10-15	97f001d	cargo xtask app-check xnviewmp
+performance	7zip	FEX	the native AArch64 build, same machine	8.485 s, 1.39× the native time (median of 5)	2026-10-15	97f001d	cargo xtask bench --box64 --fex
+performance	7zip	armor --jit	the native AArch64 build, same machine	16.542 s, 2.71× the native time (median of 5)	2026-10-15	97f001d	cargo xtask bench --box64 --fex
+performance	7zip	box64	the native AArch64 build, same machine	6.823 s, 1.12× the native time (median of 5)	2026-10-15	97f001d	cargo xtask bench --box64 --fex
+performance	7zip	qemu-x86_64	the native AArch64 build, same machine	28.682 s, 4.71× the native time (median of 5)	2026-10-15	97f001d	cargo xtask bench --box64 --fex
+performance	float	FEX	the native AArch64 build, same machine	1.132 s, 22.17× the native time (median of 5)	2026-10-15	97f001d	cargo xtask bench --box64 --fex
+performance	float	armor --jit	the native AArch64 build, same machine	0.265 s, 5.19× the native time (median of 5)	2026-10-15	97f001d	cargo xtask bench --box64 --fex
+performance	float	box64	the native AArch64 build, same machine	0.136 s, 2.65× the native time (median of 5)	2026-10-15	97f001d	cargo xtask bench --box64 --fex
+performance	float	qemu-x86_64	the native AArch64 build, same machine	0.719 s, 14.07× the native time (median of 5)	2026-10-15	97f001d	cargo xtask bench --box64 --fex
+performance	integer	FEX	the native AArch64 build, same machine	1.193 s, 10.21× the native time (median of 5)	2026-10-15	97f001d	cargo xtask bench --box64 --fex
+performance	integer	armor --jit	the native AArch64 build, same machine	0.225 s, 1.92× the native time (median of 5)	2026-10-15	97f001d	cargo xtask bench --box64 --fex
+performance	integer	box64	the native AArch64 build, same machine	0.165 s, 1.41× the native time (median of 5)	2026-10-15	97f001d	cargo xtask bench --box64 --fex
+performance	integer	qemu-x86_64	the native AArch64 build, same machine	0.334 s, 2.85× the native time (median of 5)	2026-10-15	97f001d	cargo xtask bench --box64 --fex
+performance	memory	FEX	the native AArch64 build, same machine	1.209 s, 8.07× the native time (median of 5)	2026-10-15	97f001d	cargo xtask bench --box64 --fex
+performance	memory	armor --jit	the native AArch64 build, same machine	0.268 s, 1.79× the native time (median of 5)	2026-10-15	97f001d	cargo xtask bench --box64 --fex
+performance	memory	box64	the native AArch64 build, same machine	0.238 s, 1.59× the native time (median of 5)	2026-10-15	97f001d	cargo xtask bench --box64 --fex
+performance	memory	qemu-x86_64	the native AArch64 build, same machine	0.402 s, 2.68× the native time (median of 5)	2026-10-15	97f001d	cargo xtask bench --box64 --fex
+performance	python-float	FEX	the native AArch64 build, same machine	1.680 s, 9.20× the native time (median of 5)	2026-10-15	97f001d	cargo xtask bench --box64 --fex
+performance	python-float	armor --jit	the native AArch64 build, same machine	1.146 s, 6.28× the native time (median of 5)	2026-10-15	97f001d	cargo xtask bench --box64 --fex
+performance	python-float	box64	the native AArch64 build, same machine	0.432 s, 2.37× the native time (median of 5)	2026-10-15	97f001d	cargo xtask bench --box64 --fex
+performance	python-float	qemu-x86_64	the native AArch64 build, same machine	4.383 s, 24.00× the native time (median of 5)	2026-10-15	97f001d	cargo xtask bench --box64 --fex
+performance	python-int	FEX	the native AArch64 build, same machine	1.754 s, 7.72× the native time (median of 5)	2026-10-15	97f001d	cargo xtask bench --box64 --fex
+performance	python-int	armor --jit	the native AArch64 build, same machine	1.369 s, 6.03× the native time (median of 5)	2026-10-15	97f001d	cargo xtask bench --box64 --fex
+performance	python-int	box64	the native AArch64 build, same machine	0.493 s, 2.17× the native time (median of 5)	2026-10-15	97f001d	cargo xtask bench --box64 --fex
+performance	python-int	qemu-x86_64	the native AArch64 build, same machine	5.058 s, 22.27× the native time (median of 5)	2026-10-15	97f001d	cargo xtask bench --box64 --fex
+performance	python-start	FEX	the native AArch64 build, same machine	1.347 s, 90.30× the native time (median of 5)	2026-10-15	97f001d	cargo xtask bench --box64 --fex
+performance	python-start	armor --jit	the native AArch64 build, same machine	0.243 s, 16.30× the native time (median of 5)	2026-10-15	97f001d	cargo xtask bench --box64 --fex
+performance	python-start	box64	the native AArch64 build, same machine	0.088 s, 5.91× the native time (median of 5)	2026-10-15	97f001d	cargo xtask bench --box64 --fex
+performance	python-start	qemu-x86_64	the native AArch64 build, same machine	0.491 s, 32.88× the native time (median of 5)	2026-10-15	97f001d	cargo xtask bench --box64 --fex
+performance	simd	FEX	the native AArch64 build, same machine	1.074 s, 32.80× the native time (median of 5)	2026-10-15	97f001d	cargo xtask bench --box64 --fex
+performance	simd	armor --jit	the native AArch64 build, same machine	0.211 s, 6.46× the native time (median of 5)	2026-10-15	97f001d	cargo xtask bench --box64 --fex
+performance	simd	box64	the native AArch64 build, same machine	0.092 s, 2.80× the native time (median of 5)	2026-10-15	97f001d	cargo xtask bench --box64 --fex
+performance	simd	qemu-x86_64	the native AArch64 build, same machine	0.362 s, 11.05× the native time (median of 5)	2026-10-15	97f001d	cargo xtask bench --box64 --fex
+performance	start-dynamic	FEX	the native AArch64 build, same machine	1.058 s, 1732.96× the native time (median of 5)	2026-10-15	97f001d	cargo xtask bench --box64 --fex
+performance	start-dynamic	armor --jit	the native AArch64 build, same machine	0.019 s, 30.90× the native time (median of 5)	2026-10-15	97f001d	cargo xtask bench --box64 --fex
+performance	start-dynamic	box64	the native AArch64 build, same machine	0.013 s, 20.74× the native time (median of 5)	2026-10-15	97f001d	cargo xtask bench --box64 --fex
+performance	start-dynamic	qemu-x86_64	the native AArch64 build, same machine	0.032 s, 52.00× the native time (median of 5)	2026-10-15	97f001d	cargo xtask bench --box64 --fex
+performance	start-static	FEX	the native AArch64 build, same machine	1.034 s, 2603.58× the native time (median of 5)	2026-10-15	97f001d	cargo xtask bench --box64 --fex
+performance	start-static	armor --jit	the native AArch64 build, same machine	0.010 s, 24.45× the native time (median of 5)	2026-10-15	97f001d	cargo xtask bench --box64 --fex
+performance	start-static	box64	the native AArch64 build, same machine	0.028 s, 69.31× the native time (median of 5)	2026-10-15	97f001d	cargo xtask bench --box64 --fex
+performance	start-static	qemu-x86_64	the native AArch64 build, same machine	0.020 s, 49.34× the native time (median of 5)	2026-10-15	97f001d	cargo xtask bench --box64 --fex
+performance	syscall	FEX	the native AArch64 build, same machine	1.212 s, 10.46× the native time (median of 5)	2026-10-15	97f001d	cargo xtask bench --box64 --fex
+performance	syscall	armor --jit	the native AArch64 build, same machine	0.213 s, 1.84× the native time (median of 5)	2026-10-15	97f001d	cargo xtask bench --box64 --fex
+performance	syscall	box64	the native AArch64 build, same machine	0.168 s, 1.45× the native time (median of 5)	2026-10-15	97f001d	cargo xtask bench --box64 --fex
+performance	syscall	qemu-x86_64	the native AArch64 build, same machine	0.340 s, 2.94× the native time (median of 5)	2026-10-15	97f001d	cargo xtask bench --box64 --fex
+performance	threads	FEX	the native AArch64 build, same machine	1.145 s, 12.65× the native time (median of 5)	2026-10-15	97f001d	cargo xtask bench --box64 --fex
+performance	threads	armor --jit	the native AArch64 build, same machine	0.158 s, 1.74× the native time (median of 5)	2026-10-15	97f001d	cargo xtask bench --box64 --fex
+performance	threads	box64	the native AArch64 build, same machine	fails (signal: 11 (SIGSEGV))	2026-10-15	97f001d	cargo xtask bench --box64 --fex
+performance	threads	qemu-x86_64	the native AArch64 build, same machine	0.292 s, 3.22× the native time (median of 5)	2026-10-15	97f001d	cargo xtask bench --box64 --fex
+suite	difftest	armor interpreter, jit	qemu-x86_64 10.0.13	470/470	2026-10-15	97f001d	cargo xtask difftest
+suite	difftest	armor interpreter, jit	the same source built for AArch64, run natively	3/3	2026-10-15	97f001d	cargo xtask difftest --native
+suite	difftest	armor interpreter, jit	x86-64 hardware: Intel(R) Xeon(R) CPU           X5675  @ 3.07GHz, Linux 7.0.2-6-pve	281/281	2026-10-15	97f001d	cargo xtask difftest --oracle
+suite	difftest	armor interpreter, jit, ARMv8.0 paths	qemu-x86_64 10.0.13	470/470	2026-10-15	97f001d	ARMOR_HOST_FEATURES=baseline cargo xtask difftest
+suite	difftest	armor lockstep	qemu-x86_64 10.0.13	470/470	2026-10-15	97f001d	cargo xtask difftest --lockstep

@@ -163,7 +163,7 @@ Whoever develops or uses software on ARM finds on the project page, for an appli
 
 **Criterion:** for each application and CPU of the matrix there is the result, the engine, the date and the command to reproduce it.
 
-**Completed on 2026-10-15.** Every entry of the generated matrix comes from a results file with its machine, engine, date, commit and command: the Pi 5 (Cortex-A76, 4K pages), its 16K and 64K virtual machines and GitHub's runner (Neoverse-N2), plus the entries checked by hand with how and when. The milestone stays "always active": each new measurement adds or replaces its line. armor's engine is still well behind FEX and box64 on compute-heavy programs; the next steps are measured in `tech/performance.md`.
+**Completed on 2026-10-15.** Every entry of the generated matrix comes from a results file with its machine, engine, date, commit and command: the Pi 5 (Cortex-A76, 4K pages), its 16K and 64K virtual machines, GitHub's runner (Neoverse-N2; its results file comes from the CI run's artifact, committed by hand) and Fedora and Arch Linux ARM in containers, plus the entries checked by hand with how and when. The milestone stays "always active": each new measurement adds or replaces its line. armor's engine is still well behind FEX and box64 on compute-heavy programs; the next steps are measured in `tech/performance.md`.
 
 ## Open items of closed milestones
 Items that did not block their milestone's criterion and are still to do. They are not counted in the percentages.

@@ -486,7 +486,26 @@ The `7zip` workload of `cargo xtask bench` (7-Zip 26.04's Linux `7zz` compressin
 2. **Side exits:** a conditional jump inside a block leaves it only when taken, out of line, and the block goes on (`ends_block` no longer stops at `jcc`), with its registers and the pending flags known: 18.6 → 16.8 s.
 3. `movzx`/`movsx` load straight into a mapped destination: 16.8 → 16.6 s.
 
-Together 19.5 → **16.6 s**, from 3.2× to 2.7× native; the output is identical throughout. The `bench` table after the changes is recorded in `docs/results/` and shown in `COMPATIBILITY_MATRIX.md`.
+Together 19.5 → **16.6 s**, from 3.2× to 2.7× native; the output is identical throughout.
+
+✅ `cargo xtask bench --box64 --fex --report`, median of 5, Pi 5 with 4K pages, before (the commit before the changes, with the 7-Zip workload added) and after (97f001d); the other engines did not change between the two runs:
+
+| Benchmark | armor before | armor after | change | native | box64 | FEX |
+|---|---|---|---|---|---|---|
+| start-static | 8.9 ms | 9.7 ms | +9% | 0.4 ms | 27.5 ms | 1034 ms |
+| start-dynamic | 18.5 ms | 18.9 ms | +2% | 0.6 ms | 12.7 ms | 1058 ms |
+| integer | 306 ms | 225 ms | −26% | 117 ms | 165 ms | 1193 ms |
+| float | 271 ms | 265 ms | −2% | 51.1 ms | 136 ms | 1132 ms |
+| simd | 223 ms | 211 ms | −5% | 32.7 ms | 91.7 ms | 1074 ms |
+| syscall | 217 ms | 213 ms | −2% | 116 ms | 168 ms | 1212 ms |
+| memory | 305 ms | 268 ms | −12% | 150 ms | 238 ms | 1209 ms |
+| threads | 180 ms | 158 ms | −12% | 90.5 ms | fails (SIGSEGV) | 1145 ms |
+| 7zip | 19506 ms | 16542 ms | −15% | 6095 ms | 6823 ms | 8485 ms |
+| python-start | 257 ms | 243 ms | −5% | 14.9 ms | 88.2 ms | 1347 ms |
+| python-int | 1682 ms | 1369 ms | −19% | 227 ms | 493 ms | 1754 ms |
+| python-float | 1384 ms | 1146 ms | −17% | 183 ms | 432 ms | 1680 ms |
+
+Longer blocks cost translation time: python's startup translates for 124 ms instead of 108, the static hello world for 4.8 ms instead of 4.0, which is why the two startups got slower. FEX's column includes about a second of its own startup in every run (`start-static`); without it, 7-Zip under FEX is about 1.2 times native. The full table, with qemu and the ranges, is in this machine's results file (`docs/results/`, rendered in `COMPATIBILITY_MATRIX.md`).
 
 **What is left**, measured on the same run:
 - the software permission check (`tech/memory.md`) costs **9%**: the same build without it took 16.9 s instead of 18.6 s (an experiment, not a mode of armor). On 4K hosts the host's MMU could check instead, as FEX does; it is a change of ADR-0009's design, not yet proposed;

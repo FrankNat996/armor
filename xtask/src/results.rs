@@ -272,6 +272,66 @@ fn cell(s: &str) -> String {
         .replace('|', "\\|")
 }
 
+/// A machine's `bench` results as a table of workloads × engines.
+fn performance(sheet: &Sheet) -> String {
+    let rows: Vec<&Record> = sheet
+        .records
+        .iter()
+        .filter(|r| r.kind == "performance")
+        .collect();
+    if rows.is_empty() {
+        return String::new();
+    }
+    let mut engines: Vec<&str> = Vec::new();
+    let mut workloads: Vec<&str> = Vec::new();
+    let mut runs: Vec<String> = Vec::new();
+    for r in &rows {
+        if !engines.contains(&r.engine.as_str()) {
+            engines.push(&r.engine);
+        }
+        if !workloads.contains(&r.name.as_str()) {
+            workloads.push(&r.name);
+        }
+        let run = format!("`{}`, {}, {}", cell(&r.command), r.date, r.commit);
+        if !runs.contains(&run) {
+            runs.push(run);
+        }
+    }
+    let mut table = format!(
+        "\nPerformance against {} ({}): time, and the multiple of the native time{}.\n\n| Workload |",
+        cell(&rows[0].reference),
+        runs.join("; "),
+        // "(median of 5)", from the results.
+        rows[0]
+            .result
+            .split_once(" (")
+            .map(|(_, rest)| format!(", {}", rest.trim_end_matches(')')))
+            .unwrap_or_default()
+    );
+    for engine in &engines {
+        table.push_str(&format!(" {} |", cell(engine)));
+    }
+    table.push_str("\n|---|");
+    table.push_str(&"---|".repeat(engines.len()));
+    table.push('\n');
+    for workload in workloads {
+        table.push_str(&format!("| {} |", cell(workload)));
+        for engine in &engines {
+            let result = rows
+                .iter()
+                .find(|r| r.name == workload && r.engine == *engine)
+                .map(|r| {
+                    let result = r.result.split(" (median").next().unwrap_or_default();
+                    cell(&result.replace("× the native time", "×"))
+                })
+                .unwrap_or_else(|| "—".to_string());
+            table.push_str(&format!(" {result} |"));
+        }
+        table.push('\n');
+    }
+    table
+}
+
 /// The applications × machines table: each application's result and
 /// engine on every machine that recorded it.
 fn applications(sheets: &[(String, Sheet)], label: impl Fn(&Sheet) -> String) -> String {
@@ -352,7 +412,10 @@ fn render(root: &Path) -> Result<(String, String), String> {
             fact("cpu"),
             pages,
             system,
-            fact("place")
+            match fact("place").as_str() {
+                "kvm" => "KVM virtual machine".to_string(),
+                place => place.to_string(),
+            }
         )
     };
     let mut matrix = String::from(
@@ -371,7 +434,7 @@ fn render(root: &Path) -> Result<(String, String), String> {
             cell(&title),
             sheet.facts.get("kernel").cloned().unwrap_or_default()
         ));
-        for r in &sheet.records {
+        for r in sheet.records.iter().filter(|r| r.kind != "performance") {
             matrix.push_str(&format!(
                 "| {} | {} | {} | {} | {} | {} | {} | `{}` |\n",
                 r.kind,
@@ -384,6 +447,7 @@ fn render(root: &Path) -> Result<(String, String), String> {
                 cell(&r.command)
             ));
         }
+        matrix.push_str(&performance(sheet));
         let suites: Vec<String> = sheet
             .records
             .iter()

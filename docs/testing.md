@@ -265,6 +265,8 @@ On those hosts qemu-user itself is not a reliable reference: on 16K `qemu-i386` 
 | Debian 13, 16K | 267 | 454/454 against the saved results (13 machine-dependent cases skipped) | 454/454 | 454/454 | ✅ |
 | Ubuntu 24.04, 64K | 267 | 454/454 against the saved results | 454/454 | 454/454 | ✅ after lifting Ubuntu's AppArmor restriction on user namespaces (`tech/security.md`) |
 
+Since ADR-0045 each virtual machine records its runs: inside it, `cargo xtask difftest --expected DIR --report`, the same with `--lockstep` and with `ARMOR_HOST_FEATURES=baseline`, on a copy of the repository with its `.git` (the commit goes into every line); its results file is then copied into `docs/results/` and rendered in the compatibility matrix (✅ 2026-10-15, commit 97f001d: 457/457 in the three modes on 16K and on 64K, with 470 cases of which 13 depend on the machine).
+
 Against qemu run on the same host, before the saved results existed: on 16K 461/467, the other 6 being qemu-i386's own failures (armor's output there equals the 4K run's in all three engines); on 64K 400/467, almost all qemu-x86_64 8.2 crashing.
 
 What these hosts found in armor, fixed on 2026-10-15: shared mappings smaller than a host page could not grow (`mremap`, `tech/memory.md`); on the 48-bit host armor placed memory above 2^47 and then the guest stack in the last page below it (`tech/memory.md`, "Address space"). Three tests laid shared and private pages out in 4K or 16K steps, which on bigger host pages share a host page, the case ADR-0022 leaves unsupported; `mremap_shared`, `shared_memory` and `sysv_shm` now use 64 KiB blocks for those cases.

@@ -1,0 +1,7 @@
+# armor's measurements on one machine (ADR-0045): written by the cargo xtask commands run with --report.
+#cpu	Cortex-A76
+#pages	4096
+#system	Arch Linux ARM
+#place	container
+#kernel	6.18.50+rpt-rpi-v8
+suite	distro-check	armor from its archive; Hangover 11.16 (Debian 13 build)	the outputs on the development machine; the checks' own expectations	5/5 (install, x86-64, i386, deb, wine)	2026-10-15	97f001d	cargo xtask distro-check

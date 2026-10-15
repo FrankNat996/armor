@@ -1,0 +1,9 @@
+# armor's measurements on one machine (ADR-0045): written by the cargo xtask commands run with --report.
+#cpu	Cortex-A76
+#pages	16384
+#system	Debian GNU/Linux 13 (trixie)
+#place	kvm
+#kernel	6.12.111+deb13-arm64-16k
+suite	difftest	armor interpreter, jit	qemu-x86_64's results saved on a 4K host	457/457	2026-10-15	97f001d	cargo xtask difftest --expected /mnt/repo/target/difftest-reference
+suite	difftest	armor interpreter, jit, ARMv8.0 paths	qemu-x86_64's results saved on a 4K host	457/457	2026-10-15	97f001d	ARMOR_HOST_FEATURES=baseline cargo xtask difftest --expected /mnt/repo/target/difftest-reference
+suite	difftest	armor lockstep	qemu-x86_64's results saved on a 4K host	457/457	2026-10-15	97f001d	cargo xtask difftest --expected /mnt/repo/target/difftest-reference --lockstep
