@@ -1576,8 +1576,19 @@ mod tests {
         );
         let mut thread = Thread::default();
         // brk to 4 GiB would map most of the address space; pause, and
-        // ppoll with no descriptors and no timeout, wait for a signal.
-        let skip = [nr::BRK, nr::PAUSE, nr::PPOLL, nr::PPOLL_TIME64];
+        // ppoll with no descriptors and no timeout, wait for a signal; fork,
+        // vfork and clone would duplicate the test process (whose child
+        // then hung on a lock of the test harness, and a `wait4` here or in
+        // the x86_64 test waited for it forever).
+        let skip = [
+            nr::BRK,
+            nr::PAUSE,
+            nr::PPOLL,
+            nr::PPOLL_TIME64,
+            nr::FORK,
+            nr::VFORK,
+            nr::CLONE,
+        ];
         for number in (0..512).filter(|n| !skip.contains(n)) {
             let mut cpu = Cpu::new_compat(0, 0);
             cpu.regs[RAX] = number;

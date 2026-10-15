@@ -3660,8 +3660,8 @@ mod tests {
 
     /// Syscalls the tests below must not make whatever the arguments:
     /// pause, and ppoll with no descriptors and no timeout, wait for a
-    /// signal; fork and vfork would duplicate the test process.
-    const BLOCKS: [u64; 4] = [nr::PAUSE, nr::PPOLL, nr::FORK, nr::VFORK];
+    /// signal; fork, vfork and clone would duplicate the test process.
+    const BLOCKS: [u64; 5] = [nr::PAUSE, nr::PPOLL, nr::FORK, nr::VFORK, nr::CLONE];
 
     /// Calls `dispatch` with the first argument -1 (an invalid fd, uid or
     /// address) and the others zero, which makes every implemented syscall
