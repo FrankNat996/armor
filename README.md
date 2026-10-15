@@ -50,8 +50,8 @@ Application by application, with versions, levels and the commands that verify t
 Download the package from the [latest release](https://github.com/FrankNat996/armor/releases/latest) and install it:
 
 ```bash
-wget https://github.com/FrankNat996/armor/releases/download/v0.2.0/armor_0.2.0_arm64.deb
-sudo apt install ./armor_0.2.0_arm64.deb
+wget https://github.com/FrankNat996/armor/releases/download/v0.3.0/armor_0.3.0_arm64.deb
+sudo apt install ./armor_0.3.0_arm64.deb
 ```
 
 This installs `armor`, its window (**armor** in the System menu) and the double-click handler for installers, `.deb` packages and AppImages. From then on armor updates itself: the window says when a new version is out (or use **Check for updates** in its menu, or `armor update`). Once, for Windows programs, download the Windows engine (about 380 MB, verified against pinned checksums):
