@@ -737,7 +737,7 @@ impl AddressSpace {
         let mut next = host_start;
         for &host_page in existing.iter().chain([host_end].iter()) {
             if host_page > next {
-                self.host_map_fixed(&mut tables, next, host_page - next)?;
+                self.host_map_fixed(&mut tables, next, host_page - next, prot == Prot::NONE)?;
             }
             next = host_page + 1;
         }
@@ -777,7 +777,10 @@ impl AddressSpace {
                     hint as *mut libc::c_void,
                     len as usize,
                     libc::PROT_READ | libc::PROT_WRITE,
-                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | extra,
+                    libc::MAP_PRIVATE
+                        | libc::MAP_ANONYMOUS
+                        | extra
+                        | reserve_flag(prot == Prot::NONE),
                     -1,
                     0,
                 )
@@ -1543,7 +1546,13 @@ impl AddressSpace {
     }
 
     /// mmaps `count` host pages starting at host page number `first`.
-    fn host_map_fixed(&self, tables: &mut Tables, first: u64, count: u64) -> Result<(), MapError> {
+    fn host_map_fixed(
+        &self,
+        tables: &mut Tables,
+        first: u64,
+        count: u64,
+        noreserve: bool,
+    ) -> Result<(), MapError> {
         self.admit(tables, count)?;
         let addr = first * self.host_page_size;
         let len = count * self.host_page_size;
@@ -1554,7 +1563,10 @@ impl AddressSpace {
                 addr as *mut libc::c_void,
                 len as usize,
                 libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_FIXED_NOREPLACE,
+                libc::MAP_PRIVATE
+                    | libc::MAP_ANONYMOUS
+                    | libc::MAP_FIXED_NOREPLACE
+                    | reserve_flag(noreserve),
                 -1,
                 0,
             )
@@ -1576,6 +1588,15 @@ impl AddressSpace {
         tables.host_pages.extend(first..first + count);
         Ok(())
     }
+}
+
+/// `MAP_NORESERVE` for the host mapping of a guest reservation (`PROT_NONE`):
+/// host pages are always read-write (ADR-0009), and a read-write private
+/// mapping is charged to the kernel's overcommit accounting, which refuses
+/// a large one (V8 reserves 32 GiB for each Chromium renderer); a
+/// `PROT_NONE` mapping is not charged on a native system either.
+fn reserve_flag(noreserve: bool) -> libc::c_int {
+    if noreserve { libc::MAP_NORESERVE } else { 0 }
 }
 
 /// Sets the permissions of `[start, end)`. Returns whether code may have

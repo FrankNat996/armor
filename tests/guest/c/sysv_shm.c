@@ -5,7 +5,9 @@
  * by the parent after the child writes, IPC_STAT (size, attachments),
  * shmat at a given address (SHM_RND rounds it down; without SHM_REMAP an
  * address already mapped is EINVAL), SHM_RDONLY, shmdt (EINVAL where no
- * attachment starts), IPC_RMID. Prints no ids or addresses.
+ * attachment starts), IPC_RMID; IPC_INFO and SHM_INFO (a Chromium GPU
+ * process asked for IPC_INFO), checked against /proc/sys/kernel. Prints no
+ * ids or addresses.
  */
 #define _GNU_SOURCE
 #include <errno.h>
@@ -72,5 +74,24 @@ int main(void) {
     show("still attached", strcmp(p, "parent wrote") == 0 ? 0 : -1);
     show("shmdt", shmdt(p));
     show("ipc_stat removed", shmctl(id, IPC_STAT, &ds));
+
+    /* The system's limits, as /proc/sys/kernel shows them. */
+    struct shminfo info;
+    memset(&info, 0xff, sizeof info);
+    int highest = shmctl(0, IPC_INFO, (struct shmid_ds *)&info);
+    unsigned long max = 0, mni = 0, all = 0;
+    FILE *f = fopen("/proc/sys/kernel/shmmax", "r");
+    if (f) { fscanf(f, "%lu", &max); fclose(f); }
+    f = fopen("/proc/sys/kernel/shmmni", "r");
+    if (f) { fscanf(f, "%lu", &mni); fclose(f); }
+    f = fopen("/proc/sys/kernel/shmall", "r");
+    if (f) { fscanf(f, "%lu", &all); fclose(f); }
+    printf("ipc_info: %d, shmmax %d shmmni %d shmall %d shmmin %lu shmseg %d\n", highest >= 0,
+           info.shmmax == max, info.shmmni == mni, info.shmall == all, info.shmmin,
+           info.shmseg == mni || info.shmseg > 0);
+    struct shm_info usage;
+    memset(&usage, 0xff, sizeof usage);
+    int used = shmctl(0, SHM_INFO, (struct shmid_ds *)&usage);
+    printf("shm_info: %d, used_ids %d\n", used >= 0, usage.used_ids >= 0 && usage.used_ids <= (int)mni);
     return 0;
 }

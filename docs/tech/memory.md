@@ -59,6 +59,7 @@ The available 4K kernel (`environment.md`) can be used to compare results, but i
   - records `prot` for each 4K page and zeroes the host pages already in use (new ones are already zero).
   - If the host already uses that range it returns `AddressInUse`: verified by the test `mapping_over_host_memory_in_use_fails`.
 - `map_anywhere(len, prot)`: address chosen by the host, aligned to 16K. Used for the stack.
+- **Reservations** (since 2026-10-15): a guest mapping with `PROT_NONE` gets its host pages with `MAP_NORESERVE` (`reserve_flag`, in `map_fixed` and `map_anywhere`). Host pages are always RW, and the kernel charges a private RW mapping to its overcommit accounting, which refused V8's 32 GiB reservation (the "cage" of each Chromium renderer: `mmap` ENOMEM on the host, and Spotify's renderers ended); natively a `PROT_NONE` private mapping is not charged. Difference: when the guest later makes such pages writable, the kernel still does not charge them (native Linux would, and could refuse the `mprotect` with ENOMEM). ✅ Test `reserve_large` (32 GiB `PROT_NONE` with and without `MAP_NORESERVE`, 1 MiB of it made RW and used, four times): identical to qemu and to the Xeon; without the change every reservation failed under armor.
 - `write_privileged`: writes ignoring the guest's permissions. The loader needs it, for read-only segments and for the initial stack.
 - `GuestMemory::{read, write, fetch}`:
   - check the table page by page and report the first faulting byte;

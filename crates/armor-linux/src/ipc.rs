@@ -222,6 +222,14 @@ const SHM_LOCK: u64 = 11;
 const SHM_UNLOCK: u64 = 12;
 const SHM_STAT: u64 = 13;
 const SHM_STAT_ANY: u64 = 15;
+/// shmctl commands that report the system's limits and usage: IPC_INFO
+/// with a `struct shminfo` (nine longs), SHM_INFO with a `struct shm_info`
+/// (an int, padding, five longs). Both layouts are the same on x86-64 and
+/// AArch64 (LP64, the generic kernel structures).
+const SHM_IPC_INFO: u64 = 3;
+const SHM_INFO: u64 = 14;
+const SHMINFO_SIZE: usize = 72;
+const SHM_INFO_SIZE: usize = 48;
 
 /// The guest's attachments: address and length, for shmdt. A forked child
 /// inherits them, as on Linux.
@@ -295,7 +303,7 @@ pub(crate) fn shmdt(mem: &AddressSpace, addr: u64) -> SysResult {
 
 /// shmctl(2): IPC_RMID, SHM_LOCK and SHM_UNLOCK with integers; IPC_STAT,
 /// SHM_STAT, SHM_STAT_ANY and IPC_SET with the 112-byte `struct shmid_ds`
-/// copied as it is. `None` for IPC_INFO and SHM_INFO.
+/// copied as it is; IPC_INFO and SHM_INFO with their structures.
 pub(crate) fn shmctl(mem: &AddressSpace, id: u64, cmd: u64, buf: u64) -> Option<SysResult> {
     let cmd = cmd & !IPC_64;
     Some(match cmd {
@@ -315,6 +323,21 @@ pub(crate) fn shmctl(mem: &AddressSpace, id: u64, cmd: u64, buf: u64) -> Option<
             if cmd != SHM_IPC_SET {
                 copy_out(mem, buf, &ds)?;
             }
+            Ok(r)
+        })(),
+        SHM_IPC_INFO | SHM_INFO => (|| {
+            let mut info = [0u8; SHMINFO_SIZE];
+            let size = if cmd == SHM_IPC_INFO {
+                SHMINFO_SIZE
+            } else {
+                SHM_INFO_SIZE
+            };
+            // SAFETY: `info` holds the larger of the two structures, the
+            // host's layouts.
+            let r = check(unsafe {
+                libc::syscall(libc::SYS_shmctl, id as i32, cmd as i32, info.as_mut_ptr())
+            })?;
+            copy_out(mem, buf, &info[..size])?;
             Ok(r)
         })(),
         _ => return None,

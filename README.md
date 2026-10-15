@@ -31,7 +31,7 @@ Measured on a Raspberry Pi 5 (Cortex-A76, Debian 13, 4K-page kernel), October 20
 | ✅ | **Windows programs: 7-Zip, Notepad++, KeePass 2, EZVIZ Studio** | Installed with `armor install` or a double click, with no manual step; they appear in the desktop menu and open. 7-Zip's archives are byte-identical to those of its native ARM64 build. .NET programs run on Wine Mono; the Visual C++ runtime is installed by armor when a program needs a part Wine lacks. When a program fails to start, armor says why in a desktop notification |
 | ✅ | **Steam (Valve's native ARM64 client)** | Installed by armor (`armor install steam`, or Install Steam in the window): it updates itself, signs in and shows the library. Needs a 4K-page kernel |
 | ✅ | **x86-64 Linux applications: `.deb`, AppImage, `.tar` archives** | Installed with every Debian library they need, verified and unpacked without root; they appear in the menu and open: XnView MP (`.deb`), KeePassXC (AppImage), Sublime Text (`.tar.xz`). Qt applications draw in software for now |
-| 🟡 | **Chromium-based applications (Spotify, Epic Games Launcher)** | Spotify (`.deb`) installs and starts, but stops when its renderer processes exit. The Epic Games Launcher (Windows) installs and updates itself, but its sign-in page does not render (a crash inside its Chromium, under the x86 translator it uses) |
+| 🟡 | **Chromium-based applications (Spotify, Epic Games Launcher)** | Spotify (`.deb`) installs and opens up to its sign-in screen; signing in and playing are not tried yet. The Epic Games Launcher (Windows) installs and updates itself, but does not reach a usable sign-in page |
 | 🟡 | **x86 Linux games** | Doki Doki Literature Club plays on the Pi's GPU with its music (`armor --host-gl`); started by hand for now, not yet from Steam's library |
 | ✅ | **Windows games through Proton** | Doki Doki Literature Club's Windows build runs from Steam with Steam's ARM64 Proton, the Pi's GPU (OpenGL) and sound; Friday Night Funkin', a zip from itch.io, installs with `armor install` and plays from the menu. Direct3D 10/11 games are still to try (the Pi's Vulkan driver lacks a feature DXVK needs) |
 | 🟡 | **GPU acceleration and sound for x86 Linux programs** | OpenGL goes to the host's GPU driver with `--host-gl` (or `host-gl = yes` for an installed application), checked pixel by pixel against software rendering; sound plays through the host's PipeWire. Not yet the default; Vulkan not yet |
@@ -128,7 +128,7 @@ Percentages count the checklist items of [docs/roadmap.md](docs/roadmap.md); the
 
 - **Graphics.** Windows programs that use Direct3D render in software on the Raspberry Pi 5: its Vulkan driver lacks a feature DXVK requires (`multiDrawIndirect`). x86 Linux programs also draw in software.
 - **Speed.** The armor engine takes about 2.6 times the native time on a compression benchmark (FEX: about 1.1). Correctness came first; speed is milestone M10.
-- **Chromium-based applications** (Spotify, the Epic Games Launcher) do not work yet.
+- **Chromium-based applications** are not usable yet: Spotify reaches its sign-in screen, the Epic Games Launcher does not.
 - **Only one machine tested**, and Windows programs need a 4K-page kernel.
 - **Valve's ARM64 Steam client** is not officially supported by Valve outside its own hardware.
 

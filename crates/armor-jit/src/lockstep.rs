@@ -19,9 +19,19 @@
 //!    before the slow path, and that is right if the interpreter raises
 //!    them too (`sse_float` in the translator).
 //!
+//! Memory that changes between the two runs without the guest thread
+//! (the kernel writes the owner of a priority-inheritance futex into the
+//! guest's word, at any moment) cannot be compared either: if a byte the
+//! interpreter wrote no longer holds its value before the undo, the
+//! interpreter's run stands (undoing would erase the other write); if a
+//! byte the interpreter read changed before the translation runs, the
+//! instruction runs once more, interpreted, without a comparison.
+//!
 //! Limits: a translated store to an address the interpreter did not write
 //! is only seen if it changes bytes the interpreter wrote; state the
-//! translator never touches (x87, segment bases) is not compared.
+//! translator never touches (x87, segment bases) is not compared; a change
+//! by another writer while the translation itself runs is reported as a
+//! difference.
 
 use std::cell::{Cell, RefCell};
 
@@ -82,6 +92,8 @@ struct Write {
 struct Recorder<'m, 'a> {
     mem: &'m MemView<'a>,
     writes: RefCell<Vec<Write>>,
+    /// Every read: its address and the bytes the interpreter saw.
+    reads: RefCell<Vec<(u64, Vec<u8>)>>,
     shared: Cell<bool>,
 }
 
@@ -90,7 +102,9 @@ impl GuestMemory for Recorder<'_, '_> {
         if self.mem.in_shared(addr, buf.len()) {
             self.shared.set(true);
         }
-        self.mem.read(addr, buf)
+        self.mem.read(addr, buf)?;
+        self.reads.borrow_mut().push((addr, buf.to_vec()));
+        Ok(())
     }
 
     fn write(&self, addr: u64, data: &[u8]) -> Result<(), MemFault> {
@@ -143,19 +157,34 @@ pub(crate) fn run(
         let recorder = Recorder {
             mem,
             writes: RefCell::new(Vec::new()),
+            reads: RefCell::new(Vec::new()),
             shared: Cell::new(false),
         };
         let interpreted = cpu.step(&recorder);
         let expected = State::of(cpu);
         let shared = recorder.shared.get();
         let writes = recorder.writes.into_inner();
+        let reads = recorder.reads.into_inner();
+        let holds = |addr: u64, bytes: &[u8]| {
+            let mut now = vec![0; bytes.len()];
+            mem.read(addr, &mut now).is_ok() && now == bytes
+        };
+        if !shared && !writes.iter().all(|w| holds(w.addr, &w.new)) {
+            // Another writer changed what the interpreter wrote: its run
+            // stands, not compared.
+            if interpreted? == Step::Syscall {
+                return Ok(Step::Syscall);
+            }
+            continue;
+        }
         for write in writes.iter().rev() {
             mem.write(write.addr, &write.old)
                 .expect("armor bug: cannot undo a write the interpreter made");
         }
         before.restore(cpu);
-        if shared {
-            // Shared memory: interpreted once, not compared.
+        if shared || !reads.iter().all(|(addr, bytes)| holds(*addr, bytes)) {
+            // Shared memory, or memory another writer changed since the
+            // interpreter read it: interpreted once, not compared.
             if cpu.step(mem)? == Step::Syscall {
                 return Ok(Step::Syscall);
             }
