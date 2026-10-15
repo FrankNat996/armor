@@ -11,7 +11,7 @@ without knowing what happens underneath.
 ![x86 decoder 95.8%](https://img.shields.io/badge/x86_decoder-95.8%25-green) ![syscalls 375/375](https://img.shields.io/badge/syscalls-375%2F375-brightgreen)
 <!-- coverage:end -->
 
-> **Project status: early development.** armor is tested on one machine, a Raspberry Pi 5. Some applications already work end to end; many do not yet. Everything below says which is which, with evidence. Nothing is claimed without a reproducible test.
+> **Project status: early development.** Applications are tested on one machine, a Raspberry Pi 5; the test suite also runs on GitHub's ARM64 servers at every change, with 16K and 64K pages in virtual machines, and on Fedora and Arch Linux ARM. Some applications already work end to end; many do not yet. Everything below says which is which, with evidence. Nothing is claimed without a reproducible test.
 
 ## What armor does
 
@@ -147,10 +147,10 @@ Percentages count the checklist items of [docs/roadmap.md](docs/roadmap.md); the
 
 ## Known limitations
 
-- **Graphics.** Windows programs that use Direct3D render in software on the Raspberry Pi 5: its Vulkan driver lacks a feature DXVK requires (`multiDrawIndirect`). x86 Linux programs also draw in software.
-- **Speed.** The armor engine takes about 2.6 times the native time on a compression benchmark (FEX: about 1.1). Correctness came first; speed is milestone M10.
+- **Graphics.** Windows programs that use Direct3D render in software on the Raspberry Pi 5: its Vulkan driver lacks a feature DXVK requires (`multiDrawIndirect`). x86 Linux programs draw in software unless OpenGL goes to the host's GPU with `--host-gl` (not yet the default); Vulkan is not supported for them yet.
+- **Speed.** The armor engine takes 2.7 times the native time to compress with 7-Zip (FEX 1.4, box64 1.1; `cargo xtask bench`, [measurements](docs/tech/performance.md)). Correctness came first; the next steps for speed are measured and listed in the roadmap.
 - **Chromium-based applications** are not usable yet: Spotify reaches its sign-in screen, the Epic Games Launcher does not.
-- **Only one machine tested**, and Windows programs need a 4K-page kernel.
+- **Applications are tested on one machine** (the Raspberry Pi 5), and Steam needs a 4K-page kernel.
 - **Valve's ARM64 Steam client** is not officially supported by Valve outside its own hardware.
 
 ## For developers
@@ -184,7 +184,7 @@ The full verification chain and the testing strategy: [docs/testing.md](docs/tes
 | [Engines measured: armor, FEX, box64, Hangover](docs/tech/engines.md) | [Development environment](docs/environment.md) |
 | [Syscalls](docs/tech/syscalls.md), [memory](docs/tech/memory.md), [signals](docs/tech/signals.md) | [JIT](docs/tech/jit.md), [floating point](docs/tech/floating-point.md), [performance](docs/tech/performance.md) |
 | [x86-64 encoding](docs/tech/x86-64-encoding.md), [flags](docs/tech/x86-64-flags.md), [CPUID](docs/tech/cpuid.md) | [Security and `--sandbox`](docs/tech/security.md), [Steam and games](docs/tech/steam.md) |
-| [Vision](docs/vision.md), [conventions](docs/conventions.md), [glossary](docs/glossary.md) | [References and licenses](docs/references.md) |
+| [Conventions](docs/conventions.md), [glossary](docs/glossary.md) | [References and licenses](docs/references.md) |
 
 ## Acknowledgements
 
