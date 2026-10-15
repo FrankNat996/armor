@@ -39,8 +39,8 @@ Completed on 2026-10-15 (`roadmap.md`): items 1–3 below are done (`armor insta
 4. **Chromium-based applications** (weeks, unknown; moved from M7 on 2026-10-14, ADR-0037; still open after M8 closed on 2026-10-15, `roadmap.md`): the Epic Games Launcher up to sign-in (its CEF renderer terminates under FEX) and Spotify (its renderer processes exit under armor). Partly in external components: measure, report, retry with new versions.
 
 ### M9 — Every ARM64
-Measured on 2026-10-15 (`testing.md`, "Other page sizes" and "Other distributions"):
-1. **A second and a third CPU:** GitHub's ARM64 Linux runner as the second real CPU, running the chain at every push (`.github/workflows/arm64.yml`); the ARMv8.0 paths of the JIT checked by forcing them (`ARMOR_HOST_FEATURES=baseline`) on every host. A real ARMv8.0 CPU without LSE (a Pi 4) is still to try.
+Completed on 2026-10-15 (`roadmap.md`). Measured on 2026-10-15 (`testing.md`, "Other page sizes" and "Other distributions"):
+1. **A second and a third CPU:** GitHub's ARM64 Linux runner (Neoverse-N2) as the second real CPU, running the chain at every push (`.github/workflows/arm64.yml`): 467/467 with every engine; the ARMv8.0 paths of the JIT checked by forcing them (`ARMOR_HOST_FEATURES=baseline`) on every host. A real ARMv8.0 CPU without LSE (a Pi 4) is still to try.
 2. **16K and 64K pages:** armor's engine runs on both (virtual machines on the Pi: every `difftest` case as on 4K, after two fixes); Hangover runs Windows programs on both (7-Zip x64 identical to its ARM64 build, Notepad++ on 16K); Valve's ARM64 Steam client needs 4K pages. ADR-0042: no new engine; Steam on a 4K kernel, a 4K micro-VM where the hardware has no 4K kernel.
 3. **Other distributions:** done with ADR-0043: Debian's archive for Linux applications and Hangover's Debian 13 build on any distribution, armor as a `.tar.gz` with `install.sh`; `cargo xtask distro-check` passes on Fedora 42 and Arch Linux ARM.
 

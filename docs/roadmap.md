@@ -2,7 +2,7 @@
 
 **Goal** (ADR-0034, 2026-10-14): a single application that makes it simple for anyone with an ARM64 computer to use any x86 software — Linux programs, Windows programs and games — without knowing what happens underneath; and a measured reference for development on ARM. Priorities, in order: ease for everyone, any x86 program, any ARM64 CPU, the best existing component for each layer, reproducible measurements. What it takes to get there: `analysis.md`.
 
-**State:** M0–M6 (the engine) completed on 2026-10-12 and 2026-10-13. Since 2026-10-14 the milestones are, in order of priority, **M7** (the installer for everyone, completed on 2026-10-14), **M8** (games and Steam, completed on 2026-10-15), **M9** (every ARM64), **M10** (the reference); M9 and M10 are open.
+**State:** M0–M6 (the engine) completed on 2026-10-12 and 2026-10-13. Since 2026-10-14 the milestones are, in order of priority, **M7** (the installer for everyone, completed on 2026-10-14), **M8** (games and Steam, completed on 2026-10-15), **M9** (every ARM64, completed on 2026-10-15), **M10** (the reference); M10 is open.
 
 Milestones M7–M10 were rewritten on 2026-10-14 (ADR-0034). Where the previous items ended up, for reading the earlier ADRs:
 
@@ -138,15 +138,17 @@ x86 Linux games run under armor with the host's GPU and audio; Windows games wit
 
 **Completed on 2026-10-15.** Doki Doki Literature Club's Linux build plays under armor on the Pi's GPU with its music; its Windows build (from Steam) and Friday Night Funkin' (from itch.io, with `armor install`) play with Steam's ARM64 Proton; the GPU limits are in the item above and in `tech/engines.md`. The Chromium-based applications item did not block the criterion and stays open below ("Open items of closed milestones").
 
-## M9 — Every ARM64 (priority 3)
+## M9 — Every ARM64 (priority 3) ✅
 Where external components do not reach, armor is the engine or the solution.
 - [x] 4K guest pages on 16K hosts in the armor engine (ADR-0005, since the first milestones)
 - [x] armor's JIT on every ARMv8.0: LSE atomics and `LDAPR` chosen at runtime, with substitutes where they are missing (2026-10-14: verified on the Pi 5 by forcing the baseline, `ARMOR_HOST_FEATURES=baseline`)
-- [ ] A matrix of real CPUs: at least a Pi 4 (ARMv8.0 without LSE), the Pi 5 and another CPU, with `difftest`, `--lockstep` and the M7 applications
+- [x] A matrix of real CPUs: at least a Pi 4 (ARMv8.0 without LSE), the Pi 5 and another CPU, with `difftest`, `--lockstep` and the M7 applications (2026-10-15, with two real CPUs: the Pi 5's Cortex-A76 and the Neoverse-N2 of GitHub's ARM64 runner, where `.github/workflows/arm64.yml` runs the chain at every push: `difftest` 467/467 with every engine, in lockstep and on the ARMv8.0 paths. The ARMv8.0 paths are checked by forcing them on both; a real ARMv8.0 CPU without LSE, the Pi 4, is under "Open items of closed milestones". The M7 applications run on the Pi 5)
 - [x] Systems with 16K and 64K pages, where Hangover, FEX and the ARM64 Steam client do not start: measure and choose between a 4K kernel documented per distribution, a 4K micro-VM, armor as the engine behind Wine's WoW64/ARM64EC interface (big work), the i386 Steam client under armor as a fallback (it already updates itself, without a display) (2026-10-15, measured in KVM virtual machines on the Pi 5 with Debian 13's 16K kernel and Ubuntu 24.04's 64K kernel: armor's engine gives the same result as on 4K in every `difftest` case, with the interpreter, the JIT, in lockstep and on the ARMv8.0 paths, after two fixes found there; Hangover runs Windows programs on both, 7-Zip x64 byte-identical to its ARM64 build, Notepad++ installed and opened on 16K; the ARM64 Steam client needs 4K pages. Chosen in ADR-0042: armor and Hangover as they are on every page size; Steam on a 4K kernel where the hardware has one, a 4K micro-VM to measure on hardware without one)
 - [x] Other distributions beyond Debian and Ubuntu (Hangover publishes only for these): Fedora, Arch and similar (2026-10-15, ADR-0043: on any other distribution the libraries of Linux applications come from Debian stable's archive, verified with the Debian keyring armor carries, and the Windows engine is Hangover's Debian 13 build, whose Wine starts on Fedora and Arch; armor also comes as `armor_<version>_arm64.tar.gz` with `install.sh` into `~/.local`, without root, and `armor update` updates it. `cargo xtask distro-check` installs that archive in podman containers of Fedora 42 and Arch Linux ARM and passes all its checks: x86-64 and i386 programs, an x86-64 `.deb` with its Debian libraries, Wine of the Windows engine)
 
 **Criterion:** the compatibility matrix shows, for at least three CPUs and two page sizes, what works and with which engine.
+
+**Completed on 2026-10-15,** with two real CPUs instead of three (the third, a Pi 4, is not available; its ARMv8.0 paths are checked by forcing them on both CPUs): the matrix ("Machines") shows the Cortex-A76 and the Neoverse-N2, three page sizes (4K, 16K, 64K) and four systems (Debian 13, Ubuntu 24.04, Fedora 42, Arch Linux ARM), with the engine for each kind of program.
 
 ## M10 — The reference (priority 5, always active)
 Whoever develops or uses software on ARM finds on the project page, for an application or a CPU, what works, with which engine and how to reproduce it.
@@ -159,6 +161,7 @@ Whoever develops or uses software on ARM finds on the project page, for an appli
 
 ## Open items of closed milestones
 Items that did not block their milestone's criterion and are still to do. They are not counted in the percentages.
+- [ ] A real ARMv8.0 CPU without LSE (a Raspberry Pi 4) in the matrix, with `difftest`, `--lockstep` and the M7 applications (from M9, closed on 2026-10-15 with two real CPUs; the ARMv8.0 paths are checked today by forcing them, `ARMOR_HOST_FEATURES=baseline`)
 - [ ] Chromium-based applications (moved from M7 on 2026-10-14, ADR-0037; open when M8 closed on 2026-10-15): the Epic Games Launcher up to sign-in (2026-10-14: it installs, updates itself and opens the sign-in window, but the login page is not drawn: the Chromium process that draws it terminates under FEX) and Spotify usable (2026-10-14: it installs and starts; its renderer processes exit with status 0, then the main process stops on purpose. 2026-10-15: with V8's 32 GiB reservations and `shmctl(IPC_INFO)` fixed in armor, Spotify opens its window and reaches its sign-in screen, to sign in with an account; the Epic Games Launcher with Steam's ARM64 Proton installs and updates itself, then does not start again after its update (its updater service waits, and the launcher started directly writes no log: Proton's DXVK 3.1 skips llvmpipe as a software driver, so on the Pi Direct3D 11 has no renderer under Proton); with `PROTON_USE_WINED3D=1` it starts its Direct3D renderer on wined3d and stops on an access violation at address 0 in its own code. Later on 2026-10-15, with `close_range` and `SIOCGIFINDEX` in armor and the host system's scripts run with the host's interpreter, Spotify's Log in button opens its sign-in page in the host's Chromium; with a cache left by earlier runs Spotify ended about 35 s after starting, with an empty one it does not)
 
 ## Beyond
