@@ -138,6 +138,7 @@ fn guest_root(name: &str) -> &'static str {
 /// compile for i386 (the others use `__int128`, 64-bit assembly or
 /// `REG_RIP`).
 const I386_SHARED_C_TESTS: &[&str] = &[
+    "close_range",
     "events",
     "file_locks",
     "fork_threads",

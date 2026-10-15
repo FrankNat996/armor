@@ -4,7 +4,8 @@
  * and returns EINTR at once, and afterwards SIGUSR1 is blocked again; with
  * SIGUSR1 in the mask the call times out and the signal stays pending. A
  * bad mask size is EINVAL. Then SIOCGIFNAME for index 1 (the loopback
- * interface). The same source runs as x86-64 and i386.
+ * interface) and SIOCGIFINDEX for "lo" (Spotify's network code). The
+ * same source runs as x86-64 and i386.
  */
 #define _GNU_SOURCE
 #include <errno.h>
@@ -28,6 +29,7 @@ static const char *name(int e) {
     case 0: return "ok";
     case EINTR: return "EINTR";
     case EINVAL: return "EINVAL";
+    case ENODEV: return "ENODEV";
     default: return "other";
     }
 }
@@ -72,5 +74,12 @@ int main(void) {
     ifr.ifr_ifindex = 1;
     r = ioctl(s, SIOCGIFNAME, &ifr);
     printf("SIOCGIFNAME 1: %d %s\n", r, r == 0 ? ifr.ifr_name : name(errno));
+    memset(&ifr, 0, sizeof ifr);
+    strcpy(ifr.ifr_name, "lo");
+    r = ioctl(s, SIOCGIFINDEX, &ifr);
+    printf("SIOCGIFINDEX lo: %d %d\n", r, r == 0 ? ifr.ifr_ifindex : -errno);
+    strcpy(ifr.ifr_name, "armor-none");
+    r = ioctl(s, SIOCGIFINDEX, &ifr);
+    printf("SIOCGIFINDEX armor-none: %d %s\n", r, r == 0 ? "found" : name(errno));
     return 0;
 }

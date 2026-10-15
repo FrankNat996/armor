@@ -168,6 +168,7 @@ pub mod nr {
     pub const CLOCK_NANOSLEEP_TIME64: u64 = 407;
     pub const FUTEX_TIME64: u64 = 422;
     pub const FACCESSAT2: u64 = 439;
+    pub const CLOSE_RANGE: u64 = 436;
     pub const NEWSELECT: u64 = 142;
     pub const POLL: u64 = 168;
     pub const EPOLL_CREATE: u64 = 254;
@@ -305,6 +306,7 @@ pub fn is_implemented(number: u64) -> bool {
             | WRITE
             | OPEN
             | CLOSE
+            | CLOSE_RANGE
             | UNLINK
             | CHDIR
             | LSEEK
@@ -478,6 +480,7 @@ pub fn dispatch(
         nr::OPEN => openat(mem, process, AT_FDCWD, a[0], a[1], a[2]),
         nr::OPENAT => openat(mem, process, signed(a[0]), a[1], a[2], a[3]),
         nr::CLOSE => host(libc::SYS_close, &[a[0]]),
+        nr::CLOSE_RANGE => host(libc::SYS_close_range, &[a[0], a[1], a[2]]),
         nr::DUP => host(libc::SYS_dup, &[a[0]]),
         nr::DUP2 => super::dup2(a[0], a[1]),
         nr::DUP3 => host(libc::SYS_dup3, &[a[0], a[1], a[2]]),

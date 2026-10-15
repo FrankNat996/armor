@@ -55,6 +55,7 @@ pub mod nr {
     pub const ACCESS: u64 = 21;
     pub const FACCESSAT: u64 = 269;
     pub const FACCESSAT2: u64 = 439;
+    pub const CLOSE_RANGE: u64 = 436;
     pub const MMAP: u64 = 9;
     pub const MPROTECT: u64 = 10;
     pub const PKEY_MPROTECT: u64 = 329;
@@ -608,6 +609,7 @@ pub fn is_implemented(number: u64) -> bool {
             | nr::FCNTL
             | nr::OPEN
             | nr::CLOSE
+            | nr::CLOSE_RANGE
             | nr::LSEEK
             | nr::SENDFILE
             | nr::UNAME
@@ -842,6 +844,11 @@ pub fn dispatch(
         nr::FACCESSAT => faccessat(mem, &process.root, a[0], a[1], a[2], 0),
         nr::FACCESSAT2 => faccessat(mem, &process.root, a[0], a[1], a[2], a[3]),
         nr::CLOSE => host(libc::SYS_close, &[a[0]]),
+        // The same flags on both (CLOSE_RANGE_UNSHARE 2, CLOSE_RANGE_CLOEXEC
+        // 4); armor keeps no descriptors of its own open while the guest
+        // runs, so a child closing everything before execve (Spotify, to
+        // open the browser) closes only the guest's.
+        nr::CLOSE_RANGE => host(libc::SYS_close_range, &[a[0], a[1], a[2]]),
         nr::DUP => host(libc::SYS_dup, &[a[0]]),
         nr::DUP2 => dup2(a[0], a[1]),
         // O_CLOEXEC, the only dup3 flag, has the same value on both.
@@ -1368,6 +1375,9 @@ const PLAIN_IOCTLS: &[(u64, usize, bool)] = &[
     // `struct ifreq` (name, then the index at 16), identical on both
     // architectures (Chromium's network code).
     (0x8910, 40, true),
+    // SIOCGIFINDEX: the index of a named interface, the same `struct
+    // ifreq` (Spotify).
+    (0x8933, 40, true),
     // SIOCGIWNAME: whether an interface is wireless (its protocol name in
     // a 32-byte `struct iwreq`; this request uses no pointer).
     (0x8b01, 32, true),
