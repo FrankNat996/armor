@@ -52,6 +52,9 @@ Completed on 2026-10-15 (`roadmap.md`): items 1 and 3 are done (ADR-0045, `guide
 2. **Performance of the armor engine** (months, ongoing): profiling of real programs with `perf` (`tech/performance.md`); the native calls of M8 count more than any JIT optimisation.
 3. **Guide for developers** (days).
 
+### M11 — The best engine (since 2026-10-16)
+The order and the measurements are in `roadmap.md`. In short: the cheap wins first (dead flags everywhere, the correctness comparison of the three engines redone), then the xmm registers in NEON registers (the largest gap, float and SIMD), then the permission checks by the host's MMU on 4K hosts (an ADR first: it changes ADR-0009), fewer copies, the translation cost of startups, AVX2, and last armor's engine behind Wine for Windows programs (an ADR first). The constraint throughout: exactness stays, checked by `difftest`, lockstep and the random JIT tests at every step.
+
 ## 4. Risks
 - **External components:** Hangover, FEX, DXVK and the ARM64 Steam client have their own bugs (Epic) and their own versions. They are pinned by hash, measured at every update, and nothing is declared that has not been proved.
 - **16K and 64K pages:** armor's engine and Hangover run there (M9, measured in virtual machines); Valve's ARM64 Steam client and its Proton do not, so Steam needs a 4K kernel or a 4K micro-VM (ADR-0042), not yet measured on hardware without a 4K kernel.

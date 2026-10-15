@@ -26,6 +26,7 @@ const MILESTONE_NAMES: &[(&str, &str)] = &[
     ("M8", "Games and Steam"),
     ("M9", "Any ARM64"),
     ("M10", "The reference"),
+    ("M11", "The best engine"),
 ];
 
 #[derive(Debug, PartialEq)]
