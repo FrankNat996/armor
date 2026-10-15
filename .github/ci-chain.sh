@@ -18,6 +18,11 @@ qemu-x86_64 --version | head -1
 # with the F flag: the kernel keeps this qemu open for every namespace).
 mountpoint -q /proc/sys/fs/binfmt_misc || mount -t binfmt_misc binfmt_misc /proc/sys/fs/binfmt_misc
 apt-get install -y -q --no-install-recommends qemu-user-binfmt >/dev/null
+# Without systemd in the container nothing reads binfmt.d: register them.
+for f in /usr/lib/binfmt.d/qemu-x86_64.conf /usr/lib/binfmt.d/qemu-i386.conf; do
+    name=$(basename "$f" .conf)
+    [ -e "/proc/sys/fs/binfmt_misc/$name" ] || cat "$f" > /proc/sys/fs/binfmt_misc/register
+done
 grep -E "interpreter|flags" /proc/sys/fs/binfmt_misc/qemu-x86_64 /proc/sys/fs/binfmt_misc/qemu-i386
 useradd -m builder
 cp -a /src /home/builder/armor
