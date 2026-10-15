@@ -38,22 +38,6 @@ Every row below comes from a command run with `--report` on the machine named in
 | Spotify 1.3.4.258 (.deb, x86-64, Chromium) | level 1: its window (Spotify) appeared 20 s after armor run — armor (JIT), Debian's x86-64 libraries (2026-10-15) |
 | XnView MP 1.12.2 (.deb, x86-64) | level 1: its window (XnView) appeared 1 s after armor run — armor (JIT), Debian's x86-64 libraries (2026-10-15) |
 
-### Cortex-A76, 16K pages, Debian GNU/Linux 13 (KVM virtual machine)
-Kernel `6.12.111+deb13-arm64-16k`.
-
-| Kind | What | Engine | Reference | Result | Date | Commit | Command |
-|---|---|---|---|---|---|---|---|
-| suite | difftest | armor interpreter, jit | qemu-x86_64's results saved on a 4K host | 457/457 | 2026-10-15 | 97f001d | `cargo xtask difftest --expected /mnt/repo/target/difftest-reference` |
-| suite | difftest | armor interpreter, jit, ARMv8.0 paths | qemu-x86_64's results saved on a 4K host | 457/457 | 2026-10-15 | 97f001d | `ARMOR_HOST_FEATURES=baseline cargo xtask difftest --expected /mnt/repo/target/difftest-reference` |
-| suite | difftest | armor lockstep | qemu-x86_64's results saved on a 4K host | 457/457 | 2026-10-15 | 97f001d | `cargo xtask difftest --expected /mnt/repo/target/difftest-reference --lockstep` |
-
-### Cortex-A76, 4K pages, Arch Linux ARM (container)
-Kernel `6.18.50+rpt-rpi-v8`.
-
-| Kind | What | Engine | Reference | Result | Date | Commit | Command |
-|---|---|---|---|---|---|---|---|
-| suite | distro-check | armor from its archive; Hangover 11.16 (Debian 13 build) | the outputs on the development machine; the checks' own expectations | 5/5 (install, x86-64, i386, deb, wine) | 2026-10-15 | 97f001d | `cargo xtask distro-check` |
-
 ### Cortex-A76, 4K pages, Debian GNU/Linux 13 (native)
 Kernel `6.18.50+rpt-rpi-v8`.
 
@@ -91,12 +75,14 @@ Performance against the native AArch64 build, same machine (`cargo xtask bench -
 | syscall | 1.212 s, 10.46× | 0.213 s, 1.84× | 0.168 s, 1.45× | 0.340 s, 2.94× |
 | threads | 1.145 s, 12.65× | 0.158 s, 1.74× | fails (signal: 11 (SIGSEGV)) | 0.292 s, 3.22× |
 
-### Cortex-A76, 4K pages, Fedora Linux 42 (container)
-Kernel `6.18.50+rpt-rpi-v8`.
+### Cortex-A76, 16K pages, Debian GNU/Linux 13 (KVM virtual machine)
+Kernel `6.12.111+deb13-arm64-16k`.
 
 | Kind | What | Engine | Reference | Result | Date | Commit | Command |
 |---|---|---|---|---|---|---|---|
-| suite | distro-check | armor from its archive; Hangover 11.16 (Debian 13 build) | the outputs on the development machine; the checks' own expectations | 5/5 (install, x86-64, i386, deb, wine) | 2026-10-15 | 97f001d | `cargo xtask distro-check` |
+| suite | difftest | armor interpreter, jit | qemu-x86_64's results saved on a 4K host | 457/457 | 2026-10-15 | 97f001d | `cargo xtask difftest --expected /mnt/repo/target/difftest-reference` |
+| suite | difftest | armor interpreter, jit, ARMv8.0 paths | qemu-x86_64's results saved on a 4K host | 457/457 | 2026-10-15 | 97f001d | `ARMOR_HOST_FEATURES=baseline cargo xtask difftest --expected /mnt/repo/target/difftest-reference` |
+| suite | difftest | armor lockstep | qemu-x86_64's results saved on a 4K host | 457/457 | 2026-10-15 | 97f001d | `cargo xtask difftest --expected /mnt/repo/target/difftest-reference --lockstep` |
 
 ### Cortex-A76, 64K pages, Ubuntu 24.04.5 LTS (KVM virtual machine)
 Kernel `6.8.0-147-generic-64k`.
@@ -106,6 +92,20 @@ Kernel `6.8.0-147-generic-64k`.
 | suite | difftest | armor interpreter, jit | qemu-x86_64's results saved on a 4K host | 457/457 | 2026-10-15 | 97f001d | `cargo xtask difftest --expected /mnt/repo/target/difftest-reference` |
 | suite | difftest | armor interpreter, jit, ARMv8.0 paths | qemu-x86_64's results saved on a 4K host | 457/457 | 2026-10-15 | 97f001d | `ARMOR_HOST_FEATURES=baseline cargo xtask difftest --expected /mnt/repo/target/difftest-reference` |
 | suite | difftest | armor lockstep | qemu-x86_64's results saved on a 4K host | 457/457 | 2026-10-15 | 97f001d | `cargo xtask difftest --expected /mnt/repo/target/difftest-reference --lockstep` |
+
+### Cortex-A76, 4K pages, Arch Linux ARM (container)
+Kernel `6.18.50+rpt-rpi-v8`.
+
+| Kind | What | Engine | Reference | Result | Date | Commit | Command |
+|---|---|---|---|---|---|---|---|
+| suite | distro-check | armor from its archive; Hangover 11.16 (Debian 13 build) | the outputs on the development machine; the checks' own expectations | 5/5 (install, x86-64, i386, deb, wine) | 2026-10-15 | 97f001d | `cargo xtask distro-check` |
+
+### Cortex-A76, 4K pages, Fedora Linux 42 (container)
+Kernel `6.18.50+rpt-rpi-v8`.
+
+| Kind | What | Engine | Reference | Result | Date | Commit | Command |
+|---|---|---|---|---|---|---|---|
+| suite | distro-check | armor from its archive; Hangover 11.16 (Debian 13 build) | the outputs on the development machine; the checks' own expectations | 5/5 (install, x86-64, i386, deb, wine) | 2026-10-15 | 97f001d | `cargo xtask distro-check` |
 
 ### Neoverse-N2, 4K pages, Debian GNU/Linux 13 (container)
 Kernel `6.17.0-1022-azure`.
