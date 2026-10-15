@@ -27,11 +27,11 @@ Measured on a Raspberry Pi 5 (Cortex-A76, Debian 13, 4K-page kernel), October 20
 
 | | What | Status |
 |---|---|---|
-| ✅ | **Linux x86-64 and i386 command-line programs** | 458 of 458 test cases give the same output as `qemu`, 259 of 259 the same as a real x86 CPU. Debian's coreutils, busybox, grep, sed, gawk, findutils, tar, gzip, xz, make, perl and python pass their test cases |
+| ✅ | **Linux x86-64 and i386 command-line programs** | 467 of 467 test cases give the same output as `qemu`, 267 of 267 the same as a real x86 CPU. Debian's coreutils, busybox, grep, sed, gawk, findutils, tar, gzip, xz, make, perl and python pass their test cases |
 | ✅ | **Windows programs: 7-Zip, Notepad++, KeePass 2, EZVIZ Studio** | Installed with `armor install` or a double click, with no manual step; they appear in the desktop menu and open. 7-Zip's archives are byte-identical to those of its native ARM64 build. .NET programs run on Wine Mono; the Visual C++ runtime is installed by armor when a program needs a part Wine lacks. When a program fails to start, armor says why in a desktop notification |
 | ✅ | **Steam (Valve's native ARM64 client)** | Installed by armor (`armor install steam`, or Install Steam in the window): it updates itself, signs in and shows the library. Needs a 4K-page kernel |
 | ✅ | **x86-64 Linux applications: `.deb`, AppImage, `.tar` archives** | Installed with every Debian library they need, verified and unpacked without root; they appear in the menu and open: XnView MP (`.deb`), KeePassXC (AppImage), Sublime Text (`.tar.xz`). Qt applications draw in software for now |
-| 🟡 | **Chromium-based applications (Spotify, Epic Games Launcher)** | Spotify (`.deb`) installs and opens up to its sign-in screen; signing in and playing are not tried yet. The Epic Games Launcher (Windows) installs and updates itself, but does not reach a usable sign-in page |
+| 🟡 | **Chromium-based applications (Spotify, Epic Games Launcher)** | Spotify (`.deb`) installs and opens up to its sign-in screen, and its Log in button opens the sign-in page in the system's browser; signing in and playing are not tried yet. The Epic Games Launcher (Windows) installs and updates itself, but does not reach a usable sign-in page |
 | 🟡 | **x86 Linux games** | Doki Doki Literature Club plays on the Pi's GPU with its music (`armor --host-gl`); started by hand for now, not yet from Steam's library |
 | ✅ | **Windows games through Proton** | Doki Doki Literature Club's Windows build runs from Steam with Steam's ARM64 Proton, the Pi's GPU (OpenGL) and sound; Friday Night Funkin', a zip from itch.io, installs with `armor install` and plays from the menu. Direct3D 10/11 games are still to try (the Pi's Vulkan driver lacks a feature DXVK needs) |
 | 🟡 | **GPU acceleration and sound for x86 Linux programs** | OpenGL goes to the host's GPU driver with `--host-gl` (or `host-gl = yes` for an installed application), checked pixel by pixel against software rendering; sound plays through the host's PipeWire. Not yet the default; Vulkan not yet |
@@ -50,8 +50,8 @@ Application by application, with versions, levels and the commands that verify t
 Download the package from the [latest release](https://github.com/FrankNat996/armor/releases/latest) and install it:
 
 ```bash
-wget https://github.com/FrankNat996/armor/releases/download/v0.3.0/armor_0.3.0_arm64.deb
-sudo apt install ./armor_0.3.0_arm64.deb
+wget https://github.com/FrankNat996/armor/releases/download/v0.4.0/armor_0.4.0_arm64.deb
+sudo apt install ./armor_0.4.0_arm64.deb
 ```
 
 This installs `armor`, its window (**armor** in the System menu) and the double-click handler for installers, `.deb` packages and AppImages. From then on armor updates itself: the window says when a new version is out (or use **Check for updates** in its menu, or `armor update`). Once, for Windows programs, download the Windows engine (about 380 MB, verified against pinned checksums):
