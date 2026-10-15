@@ -54,6 +54,9 @@ pub struct AppConf {
     /// in `prefix/`), or `proton` (Steam's ARM64 Proton, the prefix in
     /// `proton/pfx`; ADR-0040).
     pub engine: String,
+    /// A Linux program's OpenGL through the host's libGL (`--host-gl`,
+    /// ADR-0041).
+    pub host_gl: bool,
     pub env: Vec<(String, String)>,
 }
 
@@ -71,6 +74,9 @@ pub fn render_app_conf(conf: &AppConf, reasons: &[(String, String)]) -> String {
     }
     if conf.engine == "proton" {
         text.push_str("engine = proton\n");
+    }
+    if conf.host_gl {
+        text.push_str("host-gl = yes\n");
     }
     for (name, value) in &conf.env {
         if let Some((_, why)) = reasons.iter().find(|(n, _)| n == name) {
@@ -102,6 +108,7 @@ pub fn parse_app_conf(text: &str) -> Result<AppConf, String> {
             "mono" if value == "yes" || value == "no" => conf.mono = value == "yes",
             "vcredist" if value == "yes" || value == "no" => conf.vcredist = value == "yes",
             "engine" if value == "hangover" || value == "proton" => conf.engine = value.to_string(),
+            "host-gl" if value == "yes" || value == "no" => conf.host_gl = value == "yes",
             "env" => {
                 let (name, val) = value
                     .split_once('=')
@@ -137,6 +144,9 @@ pub enum Installer {
     AppImage,
     /// A tar archive, possibly compressed (gzip, xz, bzip2, zstd).
     Archive,
+    /// A zip archive: a Windows program that needs no installer (most
+    /// games of itch.io), or an installer packed in a zip.
+    Zip,
 }
 
 /// The first bytes of an OLE compound file, the container of `.msi`.
@@ -170,12 +180,18 @@ pub fn installer_kind(file: &[u8]) -> Result<Installer, String> {
         b"BZh",
         &[0x28, 0xb5, 0x2f, 0xfd],
     ];
+    if file.starts_with(b"PK\x03\x04") {
+        return Ok(Installer::Zip);
+    }
     if compressed.iter().any(|magic| file.starts_with(magic))
         || file.get(257..262) == Some(b"ustar")
     {
         return Ok(Installer::Archive);
     }
-    Err("not an installer armor knows (.exe, .msi, .deb, AppImage, .tar archive)".to_string())
+    Err(
+        "not an installer armor knows (.exe, .msi, .deb, AppImage, .tar or .zip archive)"
+            .to_string(),
+    )
 }
 
 /// The application name from an installer's file name: its stem (without
@@ -614,6 +630,47 @@ pub fn dxvk_settings(drivers: &[String]) -> Vec<(String, String, String)> {
     Vec::new()
 }
 
+/// Kernel GPU drivers whose OpenGL driver reports a lower version than
+/// the programs it runs need, with the version to report instead and the
+/// reason. Measured, one by one.
+const GL_VERSION_OVERRIDES: &[(&str, &str, &str, &str)] = &[(
+    "v3d",
+    "3.3",
+    "330",
+    "the Raspberry Pi 5's OpenGL driver (v3d) reports OpenGL 3.1, so programs that ask for \
+     GLSL 1.50 or 3.30 refuse to start, although it draws them (measured with Friday Night \
+     Funkin', 2026-10-15, Mesa 26.2.2)",
+)];
+
+/// The OpenGL settings for a host whose GPUs use the kernel drivers
+/// `drivers`: Mesa's version override when every GPU is one of
+/// `GL_VERSION_OVERRIDES`, with the reason.
+pub fn gl_settings(drivers: &[String]) -> Vec<(String, String, String)> {
+    let found: Vec<_> = drivers
+        .iter()
+        .filter_map(|d| GL_VERSION_OVERRIDES.iter().find(|(k, ..)| k == d))
+        .collect();
+    match found.as_slice() {
+        [(_, gl, glsl, why), rest @ ..]
+            if found.len() == drivers.len() && rest.iter().all(|(_, g, ..)| g == gl) =>
+        {
+            vec![
+                (
+                    "MESA_GL_VERSION_OVERRIDE".to_string(),
+                    gl.to_string(),
+                    why.to_string(),
+                ),
+                (
+                    "MESA_GLSL_VERSION_OVERRIDE".to_string(),
+                    glsl.to_string(),
+                    why.to_string(),
+                ),
+            ]
+        }
+        _ => Vec::new(),
+    }
+}
+
 /// The kernel drivers of the host's GPU render nodes.
 fn gpu_drivers() -> Vec<String> {
     let mut drivers = Vec::new();
@@ -817,6 +874,36 @@ fn engine_command(places: &Places, app: &Path, conf: &AppConf) -> Result<Command
     Ok(wine_command(&places.wine, app, conf))
 }
 
+/// The command that runs `arguments` in an installed Windows application:
+/// when the first one is a program (`C:\\...\\x.exe`), in that program's
+/// folder, as Windows' Explorer starts it (portable programs and games
+/// look for their files there).
+fn program_command(
+    places: &Places,
+    app: &Path,
+    conf: &AppConf,
+    arguments: &[OsString],
+) -> Result<Command, String> {
+    let mut command = engine_command(places, app, conf)?;
+    command.args(arguments);
+    let prefix = if conf.engine == "proton" {
+        app.join("proton/pfx")
+    } else {
+        app.join("prefix")
+    };
+    let folder = arguments
+        .first()
+        .map(|a| a.to_string_lossy())
+        .filter(|a| a.to_lowercase().ends_with(".exe"))
+        .and_then(|a| crate::shortcuts::host_path(&prefix, &a))
+        .and_then(|program| program.parent().map(Path::to_path_buf))
+        .filter(|folder| folder.is_dir());
+    if let Some(folder) = folder {
+        command.current_dir(folder);
+    }
+    Ok(command)
+}
+
 /// The menu entries of the shortcuts in a prefix's Start Menus (read by
 /// armor, `shortcuts.rs`): the shortcut opened with Wine's `start`, the icon
 /// taken from the program into `<app>/icons/`. Uninstallers are left out.
@@ -881,19 +968,11 @@ fn link_entries(app: &Path, prefix: &Path) -> Vec<(PathBuf, Entry)> {
     entries
 }
 
-/// `armor install` of a Windows program with Steam's ARM64 Proton
-/// (ADR-0040): the prefix made by Proton in `<app>/proton/pfx`, the
-/// installer run there, the menu entries from its Start Menu shortcuts.
-fn install_with_proton(
-    places: &Places,
-    proton: &SteamProton,
-    file: &Path,
-    msi: bool,
-    extra: &[OsString],
-    mut name: String,
-    explicit_name: bool,
-) -> Result<(), String> {
-    let mut app = places.app(&name);
+/// A new application directory for Steam's ARM64 Proton (the prefix,
+/// made by Proton at its first run, in `<app>/proton/pfx`); returns it with
+/// its `app.conf`, already written.
+fn proton_app(places: &Places, name: &str) -> Result<(PathBuf, AppConf), String> {
+    let app = places.app(name);
     if app.exists() {
         return Err(format!(
             "{name} is already installed ({}): `armor remove {name}` first",
@@ -911,13 +990,300 @@ fn install_with_proton(
         ..AppConf::default()
     };
     let mut reasons = Vec::new();
-    for (variable, value, why) in dxvk_settings(&gpu_drivers()) {
+    let drivers = gpu_drivers();
+    for (variable, value, why) in dxvk_settings(&drivers)
+        .into_iter()
+        .chain(gl_settings(&drivers))
+    {
         eprintln!("armor: {variable}={value}: {why}");
         conf.env.push((variable.clone(), value));
         reasons.push((variable, why));
     }
     fs::write(app.join("app.conf"), render_app_conf(&conf, &reasons))
         .map_err(|e| format!("{}: {e}", app.display()))?;
+    Ok((app, conf))
+}
+
+/// The single directory every entry of a zip is in, if there is one.
+pub fn zip_top_dir(names: &[String]) -> Option<String> {
+    let mut top: Option<&str> = None;
+    for name in names {
+        let (first, _) = name.split_once('/')?;
+        if first.is_empty() {
+            return None;
+        }
+        match top {
+            None => top = Some(first),
+            Some(t) if t == first => {}
+            Some(_) => return None,
+        }
+    }
+    top.map(str::to_string)
+}
+
+/// Programs packed with a game or application that are not the program
+/// itself: installers, uninstallers, crash reporters, runtimes, updaters.
+pub fn is_helper_program(stem: &str) -> bool {
+    let stem = stem.to_lowercase();
+    [
+        "unins",
+        "setup",
+        "install",
+        "crashhandler",
+        "crash_handler",
+        "crashreport",
+        "crashpad",
+        "vc_redist",
+        "vcredist",
+        "dxsetup",
+        "dxwebsetup",
+        "dotnet",
+        "updater",
+        "notification_helper",
+        "redist",
+    ]
+    .iter()
+    .any(|word| stem.contains(word))
+}
+
+/// The paths (relative, with `/`) of the `.exe` files in `names` at the
+/// shallowest depth that has any, those of `helpers` or the others.
+fn shallowest_exes(names: &[String], helpers: bool) -> Vec<String> {
+    let exes: Vec<&String> = names
+        .iter()
+        .filter(|n| n.to_lowercase().ends_with(".exe"))
+        .filter(|n| {
+            let stem = Path::new(n.as_str())
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            is_helper_program(&stem) == helpers
+        })
+        .collect();
+    let Some(depth) = exes.iter().map(|n| n.matches('/').count()).min() else {
+        return Vec::new();
+    };
+    let mut found: Vec<String> = exes
+        .into_iter()
+        .filter(|n| n.matches('/').count() == depth)
+        .cloned()
+        .collect();
+    found.sort();
+    found
+}
+
+/// The programs a portable Windows zip holds (paths inside the zip, with
+/// its single top directory removed): the `.exe` files at the shallowest
+/// depth that has any, helpers left out.
+pub fn zip_programs(names: &[String]) -> Vec<String> {
+    shallowest_exes(names, false)
+}
+
+/// `armor install` of a zip: a portable Windows program (a game of
+/// itch.io, typically) is unpacked into `C:\Games\<name>` of a new prefix
+/// (Steam's ARM64 Proton when Steam is installed, else Hangover) and gets a
+/// menu entry for each program at its top; a zip that holds only an
+/// installer has it run as for an `.exe` or `.msi`.
+fn install_zip(
+    places: &Places,
+    file: &Path,
+    extra: &[OsString],
+    mut name: String,
+    explicit_name: bool,
+) -> Result<(), String> {
+    let listing = Command::new("unzip")
+        .arg("-Z1")
+        .arg(file)
+        .output()
+        .map_err(|e| format!("unzip: {e} (install the `unzip` package)"))?;
+    if !listing.status.success() {
+        return Err(format!(
+            "{}: unzip cannot read it: {}",
+            file.display(),
+            String::from_utf8_lossy(&listing.stderr).trim()
+        ));
+    }
+    let names: Vec<String> = String::from_utf8_lossy(&listing.stdout)
+        .lines()
+        .map(str::to_string)
+        .collect();
+    let top = zip_top_dir(&names);
+    let inside: Vec<String> = names
+        .iter()
+        .filter_map(|n| match &top {
+            Some(t) => n.strip_prefix(&format!("{t}/")).map(str::to_string),
+            None => Some(n.clone()),
+        })
+        .filter(|n| !n.is_empty() && !n.ends_with('/'))
+        .collect();
+    let programs = zip_programs(&inside);
+    let scratch = places
+        .data_home
+        .join("armor/cache/scratch")
+        .join(format!("zip-{}", std::process::id()));
+    let unpack = |dest: &Path| -> Result<(), String> {
+        fs::create_dir_all(dest).map_err(|e| format!("{}: {e}", dest.display()))?;
+        eprintln!("armor: unpacking {}", file.display());
+        let status = Command::new("unzip")
+            .args(["-q", "-o"])
+            .arg(file)
+            .arg("-d")
+            .arg(dest)
+            .status()
+            .map_err(|e| format!("unzip: {e}"))?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(format!("unzip {}: {}", file.display(), status_text(status)))
+        }
+    };
+    if programs.is_empty() {
+        // An installer in a zip: unpack it (with the files next to it) and
+        // run it.
+        let msis: Vec<&String> = inside
+            .iter()
+            .filter(|n| !n.contains('/') && n.to_lowercase().ends_with(".msi"))
+            .collect();
+        let installers = shallowest_exes(&inside, true)
+            .into_iter()
+            .filter(|n| {
+                let lower = n.to_lowercase();
+                lower.contains("setup") || lower.contains("install")
+            })
+            .collect::<Vec<_>>();
+        let (installer, msi) = match (installers.as_slice(), msis.as_slice()) {
+            ([one], _) => (one.clone(), false),
+            ([], [one]) => ((*one).clone(), true),
+            _ => {
+                return Err(format!(
+                    "{}: no Windows program or installer found in this zip",
+                    file.display()
+                ));
+            }
+        };
+        unpack(&scratch)?;
+        let base = match &top {
+            Some(t) => scratch.join(t),
+            None => scratch.clone(),
+        };
+        let result = install_windows(
+            places,
+            &base.join(&installer),
+            msi,
+            extra,
+            name,
+            explicit_name,
+        );
+        let _ = fs::remove_dir_all(&scratch);
+        return result;
+    }
+    if !explicit_name {
+        let better = match programs.as_slice() {
+            [one] => Path::new(one)
+                .file_stem()
+                .map(|s| sanitize_name(&s.to_string_lossy())),
+            _ => top.as_deref().map(sanitize_name),
+        };
+        if let Some(better) = better.filter(|b| profile::valid_name(b)) {
+            name = better;
+        }
+    }
+    let (app, prefix, conf, proton) = match steam_proton(places) {
+        Some(proton) => {
+            let (app, conf) = proton_app(places, &name)?;
+            (app.clone(), app.join("proton/pfx"), conf, Some(proton))
+        }
+        None => {
+            let (app, conf) = hangover_prefix(places, &name)?;
+            (app.clone(), app.join("prefix"), conf, None)
+        }
+    };
+    let result = (|| -> Result<Vec<String>, String> {
+        if let Some(proton) = &proton {
+            // Proton makes the prefix at its first run.
+            eprintln!("armor: preparing the prefix with Steam's {STEAM_PROTON}");
+            let status = proton_command(proton, &app, &conf)
+                .arg("wineboot")
+                .status()
+                .map_err(|e| format!("{}: {e}", proton.entry_point.display()))?;
+            if !prefix.join("drive_c").is_dir() {
+                return Err(format!("Proton made no prefix ({})", status_text(status)));
+            }
+        }
+        let games = prefix.join("drive_c/Games");
+        let dest = games.join(&name);
+        unpack(&scratch)?;
+        let unpacked = match &top {
+            Some(t) => scratch.join(t),
+            None => scratch.clone(),
+        };
+        fs::create_dir_all(&games).map_err(|e| format!("{}: {e}", games.display()))?;
+        fs::rename(&unpacked, &dest).map_err(|e| format!("{}: {e}", dest.display()))?;
+        let icons = app.join("icons");
+        let mut entries = Vec::new();
+        for (n, program) in programs.iter().enumerate() {
+            let host = dest.join(program);
+            let Some(windows) = crate::shortcuts::windows_path(&prefix, &host) else {
+                continue;
+            };
+            let icon = fs::read(&host)
+                .ok()
+                .and_then(|bytes| crate::shortcuts::pe_icon(&bytes, 0))
+                .and_then(|ico| {
+                    fs::create_dir_all(&icons).ok()?;
+                    let path = icons.join(format!("{n}.ico"));
+                    fs::write(&path, ico).ok()?;
+                    Some(path.to_string_lossy().into_owned())
+                });
+            entries.push(Entry {
+                name: Path::new(program)
+                    .file_stem()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_default(),
+                // Started directly (`armor run` runs it in its folder,
+                // `program_command`): through Wine's `start`, a console
+                // program, a console window would open next to it.
+                arguments: vec![windows],
+                icon,
+                wm_class: None,
+            });
+        }
+        write_entry_files(places, &name, &app, "windows", entries)
+    })();
+    let _ = fs::remove_dir_all(&scratch);
+    match result {
+        Ok(names) => {
+            eprintln!("armor: {name} installed; in the menu:");
+            for entry in &names {
+                eprintln!("  {entry}");
+            }
+            Ok(())
+        }
+        Err(e) => {
+            if proton.is_none() {
+                let _ = wine_command(&places.wineserver(), &app, &conf)
+                    .arg("-k")
+                    .status();
+            }
+            let _ = fs::remove_dir_all(&app);
+            Err(format!("{e}: nothing was kept"))
+        }
+    }
+}
+
+/// `armor install` of a Windows program with Steam's ARM64 Proton
+/// (ADR-0040): the prefix made by Proton in `<app>/proton/pfx`, the
+/// installer run there, the menu entries from its Start Menu shortcuts.
+fn install_with_proton(
+    places: &Places,
+    proton: &SteamProton,
+    file: &Path,
+    msi: bool,
+    extra: &[OsString],
+    mut name: String,
+    explicit_name: bool,
+) -> Result<(), String> {
+    let (mut app, conf) = proton_app(places, &name)?;
     eprintln!(
         "armor: running {} with Steam's {STEAM_PROTON}",
         file.display()
@@ -1053,7 +1419,7 @@ fn prefix_programs(prefix: &Path) -> Vec<String> {
 /// `armor install [--name NAME] <file> [-- installer arguments]`.
 fn install(args: &[OsString]) -> Result<(), String> {
     let usage = "usage: armor install [--name NAME] [--pause] <file.exe|file.msi|file.deb|\
-                 file.AppImage|file.tar.*|steam> [-- installer arguments]";
+                 file.AppImage|file.tar.*|file.zip|steam> [-- installer arguments]";
     let (mut name, mut rest) = (None, args);
     if let [flag, value, tail @ ..] = rest
         && flag == "--name"
@@ -1082,7 +1448,7 @@ fn install(args: &[OsString]) -> Result<(), String> {
             .map_err(|e| format!("{}: {e}", file.display()))?;
     }
     let kind = installer_kind(&bytes).map_err(|e| format!("{}: {e}", file.display()))?;
-    let mut name = name.unwrap_or_else(|| default_name(&file));
+    let name = name.unwrap_or_else(|| default_name(&file));
     if !profile::valid_name(&name) {
         return Err(format!(
             "application name {name:?}: only letters, digits and . _ + - (not starting with .); \
@@ -1099,19 +1465,106 @@ fn install(args: &[OsString]) -> Result<(), String> {
     if kind == Installer::Archive {
         return install_archive(&places, &file, name, explicit_name);
     }
-    if let Some(proton) = steam_proton(&places) {
-        return install_with_proton(
-            &places,
-            &proton,
-            &file,
-            kind == Installer::WindowsMsi,
-            extra,
-            name,
-            explicit_name,
+    if kind == Installer::Zip {
+        return install_zip(&places, &file, extra, name, explicit_name);
+    }
+    install_windows(
+        &places,
+        &file,
+        kind == Installer::WindowsMsi,
+        extra,
+        name,
+        explicit_name,
+    )
+}
+
+/// `armor install` of a Windows installer (`.exe` or `.msi`): with Steam's
+/// ARM64 Proton when Steam is installed, else with Hangover.
+fn install_windows(
+    places: &Places,
+    file: &Path,
+    msi: bool,
+    extra: &[OsString],
+    mut name: String,
+    explicit_name: bool,
+) -> Result<(), String> {
+    if let Some(proton) = steam_proton(places) {
+        return install_with_proton(places, &proton, file, msi, extra, name, explicit_name);
+    }
+    let (mut app, conf) = hangover_prefix(places, &name)?;
+    eprintln!("armor: running {}", file.display());
+    let mut installer = wine_command(&places.wine, &app, &conf);
+    if msi {
+        installer.args(["msiexec", "/i"]);
+    }
+    let status = installer
+        .arg(file)
+        .args(extra)
+        .status()
+        .map_err(|e| format!("{}: {e}", places.wine.display()))?;
+    // The installer may leave processes behind: msiexec and Wine's menu
+    // builder finishing their work (wait for them), or programs that keep
+    // running, such as an updater or the program itself started at the end
+    // (do not wait for those forever).
+    wait_for_prefix(places, &app, &conf, INSTALLER_GRACE);
+    let failed = !status.success();
+    if !explicit_name {
+        let programs = app.join("menu/applications/wine/Programs");
+        let shortcuts: Vec<PathBuf> = desktop_files(&programs)
+            .into_iter()
+            .filter_map(|p| p.strip_prefix(&programs).ok().map(Path::to_path_buf))
+            .collect();
+        if let Some(better) = name_from_shortcuts(&shortcuts)
+            && better != name
+            && !places.app(&better).exists()
+        {
+            let renamed = places.app(&better);
+            fs::rename(&app, &renamed).map_err(|e| format!("{}: {e}", renamed.display()))?;
+            eprintln!("armor: named {better} after its menu entries (`--name` chooses another)");
+            name = better;
+            app = renamed;
+        }
+    }
+    let entries = write_entries(places, &name, &app)?;
+    if failed && entries.is_empty() {
+        // Cancelled, or failed before installing anything that shows: keep
+        // nothing behind.
+        let _ = wine_command(&places.wineserver(), &app, &conf)
+            .arg("-k")
+            .status();
+        fs::remove_dir_all(&app).map_err(|e| format!("{}: {e}", app.display()))?;
+        return Err(format!(
+            "the installer ended with {} and created no menu entry (cancelled?): nothing was \
+             kept; run `armor install` again to retry",
+            status_text(status)
+        ));
+    }
+    if failed {
+        eprintln!(
+            "armor: the installer ended with {}; keeping what it installed",
+            status_text(status)
         );
     }
+    if entries.is_empty() {
+        eprintln!(
+            "armor: {name} installed, but its installer created no menu shortcut; run a \
+             program with `armor run {name} 'C:\\path\\to\\program.exe'`"
+        );
+    } else {
+        eprintln!("armor: {name} installed; in the menu:");
+        for entry in &entries {
+            eprintln!("  {entry}");
+        }
+    }
+    Ok(())
+}
+
+/// A new Hangover prefix for application `name` (`<app>/prefix`), with
+/// DXVK and Wine Mono when the engine has them; returns the application's
+/// directory and its `app.conf`, already written.
+fn hangover_prefix(places: &Places, name: &str) -> Result<(PathBuf, AppConf), String> {
     places.check_wine()?;
-    let mut app = places.app(&name);
+    let app = places.app(name);
     if app.exists() {
         return Err(format!(
             "{name} is already installed ({}): `armor remove {name}` first",
@@ -1137,6 +1590,11 @@ fn install(args: &[OsString]) -> Result<(), String> {
     }
     keep_desktop_inside(&app.join("prefix"))?;
     let mut reasons = Vec::new();
+    for (name, value, why) in gl_settings(&gpu_drivers()) {
+        eprintln!("armor: {name}={value}: {why}");
+        conf.env.push((name.clone(), value));
+        reasons.push((name, why));
+    }
     if install_dxvk(&places.dxvk(), &app.join("prefix"))? {
         conf.dxvk = true;
         for (name, value, why) in dxvk_settings(&gpu_drivers()) {
@@ -1178,71 +1636,7 @@ fn install(args: &[OsString]) -> Result<(), String> {
     }
     fs::write(app.join("app.conf"), render_app_conf(&conf, &reasons))
         .map_err(|e| format!("{}: {e}", app.display()))?;
-    eprintln!("armor: running {}", file.display());
-    let mut installer = wine_command(&places.wine, &app, &conf);
-    if kind == Installer::WindowsMsi {
-        installer.args(["msiexec", "/i"]);
-    }
-    let status = installer
-        .arg(&file)
-        .args(extra)
-        .status()
-        .map_err(|e| format!("{}: {e}", places.wine.display()))?;
-    // The installer may leave processes behind: msiexec and Wine's menu
-    // builder finishing their work (wait for them), or programs that keep
-    // running, such as an updater or the program itself started at the end
-    // (do not wait for those forever).
-    wait_for_prefix(&places, &app, &conf, INSTALLER_GRACE);
-    let failed = !status.success();
-    if !explicit_name {
-        let programs = app.join("menu/applications/wine/Programs");
-        let shortcuts: Vec<PathBuf> = desktop_files(&programs)
-            .into_iter()
-            .filter_map(|p| p.strip_prefix(&programs).ok().map(Path::to_path_buf))
-            .collect();
-        if let Some(better) = name_from_shortcuts(&shortcuts)
-            && better != name
-            && !places.app(&better).exists()
-        {
-            let renamed = places.app(&better);
-            fs::rename(&app, &renamed).map_err(|e| format!("{}: {e}", renamed.display()))?;
-            eprintln!("armor: named {better} after its menu entries (`--name` chooses another)");
-            name = better;
-            app = renamed;
-        }
-    }
-    let entries = write_entries(&places, &name, &app)?;
-    if failed && entries.is_empty() {
-        // Cancelled, or failed before installing anything that shows: keep
-        // nothing behind.
-        let _ = wine_command(&places.wineserver(), &app, &conf)
-            .arg("-k")
-            .status();
-        fs::remove_dir_all(&app).map_err(|e| format!("{}: {e}", app.display()))?;
-        return Err(format!(
-            "the installer ended with {} and created no menu entry (cancelled?): nothing was \
-             kept; run `armor install` again to retry",
-            status_text(status)
-        ));
-    }
-    if failed {
-        eprintln!(
-            "armor: the installer ended with {}; keeping what it installed",
-            status_text(status)
-        );
-    }
-    if entries.is_empty() {
-        eprintln!(
-            "armor: {name} installed, but its installer created no menu shortcut; run a \
-             program with `armor run {name} 'C:\\path\\to\\program.exe'`"
-        );
-    } else {
-        eprintln!("armor: {name} installed; in the menu:");
-        for entry in &entries {
-            eprintln!("  {entry}");
-        }
-    }
-    Ok(())
+    Ok((app, conf))
 }
 
 /// Wine links each user's `Desktop` in the prefix to the real desktop
@@ -2308,6 +2702,9 @@ fn run(args: &[OsString]) -> Result<ExitCode, String> {
                 command.env(variable, value);
             }
         }
+        if conf.host_gl {
+            command.arg("--host-gl");
+        }
         command
             .arg("--root")
             .arg(&root)
@@ -2319,8 +2716,7 @@ fn run(args: &[OsString]) -> Result<ExitCode, String> {
         report_run(&name, &app, &run);
         return Ok(run.code);
     }
-    let mut command = engine_command(&places, &app, &conf)?;
-    command.args(&arguments);
+    let command = program_command(&places, &app, &conf, &arguments)?;
     let first = run_watched(command, &name, &app)?;
     // Only when the program could not start (not for an optional DLL a
     // running program probed).
@@ -2349,8 +2745,7 @@ fn run(args: &[OsString]) -> Result<ExitCode, String> {
         return Ok(first.code);
     }
     let conf = read_conf(&app)?;
-    let mut command = engine_command(&places, &app, &conf)?;
-    command.args(&arguments);
+    let command = program_command(&places, &app, &conf, &arguments)?;
     let second = run_watched(command, &name, &app)?;
     report_run(&name, &app, &second);
     Ok(second.code)
@@ -3013,6 +3408,12 @@ mod tests {
             ]
         );
         assert_eq!(parse_app_conf("kind = linux\n").unwrap().kind, "linux");
+        assert!(
+            parse_app_conf("kind = linux\nhost-gl = yes\n")
+                .unwrap()
+                .host_gl
+        );
+        assert!(parse_app_conf("host-gl = on\n").is_err());
         assert!(parse_app_conf("kind = macos\n").is_err());
         assert!(parse_app_conf("dxvk = maybe\n").is_err());
         assert!(parse_app_conf("env = =x\n").is_err());
@@ -3074,6 +3475,78 @@ mod tests {
     }
 
     #[test]
+    fn gl_version_follows_the_gpu() {
+        let settings = gl_settings(&["v3d".to_string()]);
+        let pairs: Vec<(&str, &str)> = settings
+            .iter()
+            .map(|(n, v, _)| (n.as_str(), v.as_str()))
+            .collect();
+        assert_eq!(
+            pairs,
+            [
+                ("MESA_GL_VERSION_OVERRIDE", "3.3"),
+                ("MESA_GLSL_VERSION_OVERRIDE", "330")
+            ]
+        );
+        assert!(settings[0].2.contains("OpenGL 3.1"));
+        // Another GPU next to it, or none: no override.
+        assert!(gl_settings(&["amdgpu".to_string(), "v3d".to_string()]).is_empty());
+        assert!(gl_settings(&[]).is_empty());
+    }
+
+    #[test]
+    fn zips_are_installers() {
+        assert_eq!(installer_kind(b"PK\x03\x04rest"), Ok(Installer::Zip));
+    }
+
+    #[test]
+    fn portable_zips_give_their_programs() {
+        let names = |list: &[&str]| list.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        // A game at the top of the zip (Friday Night Funkin' for Windows).
+        let funkin = names(&[
+            "Funkin.exe",
+            "libvlc.dll",
+            "plugins/codec/libx264_plugin.dll",
+            "assets/",
+            "assets/music/x.ogg",
+        ]);
+        assert_eq!(zip_top_dir(&funkin), None);
+        assert_eq!(zip_programs(&funkin), ["Funkin.exe"]);
+        // One directory holding everything, with helpers next to the game.
+        let unity = names(&[
+            "Game/",
+            "Game/Game.exe",
+            "Game/UnityCrashHandler64.exe",
+            "Game/Game_Data/x.assets",
+            "Game/redist/vc_redist.x64.exe",
+        ]);
+        assert_eq!(zip_top_dir(&unity).as_deref(), Some("Game"));
+        let inside: Vec<String> = unity
+            .iter()
+            .filter_map(|n| n.strip_prefix("Game/").map(str::to_string))
+            .filter(|n| !n.is_empty())
+            .collect();
+        assert_eq!(zip_programs(&inside), ["Game.exe"]);
+        // Programs only in a subdirectory, and an installer alone.
+        assert_eq!(
+            zip_programs(&names(&[
+                "readme.txt",
+                "bin/b.exe",
+                "bin/a.exe",
+                "bin/x/c.exe"
+            ])),
+            ["bin/a.exe", "bin/b.exe"]
+        );
+        assert!(zip_programs(&names(&["setup.exe", "data.bin"])).is_empty());
+        assert_eq!(
+            shallowest_exes(&names(&["setup.exe", "data.bin"]), true),
+            ["setup.exe"]
+        );
+        assert!(is_helper_program("unins000"));
+        assert!(!is_helper_program("Funkin"));
+    }
+
+    #[test]
     fn app_conf_round_trips() {
         let conf = AppConf {
             kind: "windows".to_string(),
@@ -3081,6 +3554,7 @@ mod tests {
             mono: true,
             vcredist: true,
             engine: "proton".to_string(),
+            host_gl: true,
             env: vec![(
                 "DXVK_FILTER_DEVICE_NAME".to_string(),
                 "llvmpipe".to_string(),

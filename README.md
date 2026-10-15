@@ -33,7 +33,7 @@ Measured on a Raspberry Pi 5 (Cortex-A76, Debian 13, 4K-page kernel), October 20
 | ✅ | **x86-64 Linux applications: `.deb`, AppImage, `.tar` archives** | Installed with every Debian library they need, verified and unpacked without root; they appear in the menu and open: XnView MP (`.deb`), KeePassXC (AppImage), Sublime Text (`.tar.xz`). Qt applications draw in software for now |
 | 🟡 | **Chromium-based applications (Spotify, Epic Games Launcher)** | Spotify (`.deb`) installs and starts, but stops when its renderer processes exit. The Epic Games Launcher (Windows) installs and updates itself, but its sign-in page does not render (a crash inside its Chromium, under the x86 translator it uses) |
 | 🟡 | **x86 Linux games** | Doki Doki Literature Club plays on the Pi's GPU with its music (`armor --host-gl`); started by hand for now, not yet from Steam's library |
-| ✅ | **Windows games through Proton** | The first one, Doki Doki Literature Club's Windows build, runs with Steam's ARM64 Proton, the Pi's GPU (OpenGL) and sound. Direct3D 10/11 games are still to try (the Pi's Vulkan driver lacks a feature DXVK needs) |
+| ✅ | **Windows games through Proton** | Doki Doki Literature Club's Windows build runs from Steam with Steam's ARM64 Proton, the Pi's GPU (OpenGL) and sound; Friday Night Funkin', a zip from itch.io, installs with `armor install` and plays from the menu. Direct3D 10/11 games are still to try (the Pi's Vulkan driver lacks a feature DXVK needs) |
 | 🟡 | **GPU acceleration and sound for x86 Linux programs** | OpenGL goes to the host's GPU driver with `--host-gl` (or `host-gl = yes` for an installed application), checked pixel by pixel against software rendering; sound plays through the host's PipeWire. Not yet the default; Vulkan not yet |
 | ❌ | **Other machines** | Only the Raspberry Pi 5 is tested. Windows programs need a 4K-page kernel |
 
@@ -85,7 +85,7 @@ Or, without a terminal: double-click a Windows installer, a `.deb` or an AppImag
 | You give armor | armor uses | armor's part |
 |---|---|---|
 | an x86 Linux program | **the armor engine**: a translator from x86-64 and i386 to ARM64, with an interpreter and a JIT compiler | the engine itself |
-| a Windows `.exe` or `.msi` | **Steam's ARM64 Proton** when Steam is installed (`armor install steam`), else **[Hangover](https://github.com/AndreRH/hangover)**: Wine built for ARM64, with [FEX](https://github.com/FEX-Emu/FEX) translating the x86 code; **[DXVK](https://github.com/doitsujin/dxvk)** for Direct3D; **Wine Mono** for .NET | downloads and verifies them, gives each application its own prefix, chooses the graphics settings for the GPU, creates the menu entries |
+| a Windows `.exe`, `.msi` or `.zip` | **Steam's ARM64 Proton** when Steam is installed (`armor install steam`), else **[Hangover](https://github.com/AndreRH/hangover)**: Wine built for ARM64, with [FEX](https://github.com/FEX-Emu/FEX) translating the x86 code; **[DXVK](https://github.com/doitsujin/dxvk)** for Direct3D; **Wine Mono** for .NET | downloads and verifies them, gives each application its own prefix, chooses the graphics settings for the GPU, creates the menu entries |
 | an x86-64 `.deb`, AppImage or `.tar` archive | **Debian's or Ubuntu's amd64 archive** for the libraries, then the armor engine | resolves, downloads, verifies and unpacks the packages into the application's own root |
 | Steam and its games | **Valve's ARM64 Steam client** and Proton | downloads the client from Valve, verified, and starts it in a place of its own |
 
@@ -99,13 +99,13 @@ The milestones M0–M6 built the engine. M7–M10 are open, in order of priority
 |---|---|---|---|
 | **M0–M6 — The engine** ✅ | x86-64 programs: decoder, interpreter, threads, signals, memory, floating point and SIMD, dynamic linking, JIT | all | — |
 | **M7 — The installer for everyone** ✅ | Any x86 program installed with a double click, nothing done by hand | i386 support; Windows `.exe`/`.msi` with menu entries; the Windows engine downloaded and verified; Wine Mono, GPU settings and the Visual C++ runtime automatic; failure messages; `.deb`, AppImage and `.tar` installation; double click; the window; the first release | — |
-| **M8 — Games and Steam** | Linux and Windows games, with the host's GPU and sound | Valve's ARM64 Steam client, installed by armor; an x86 Linux game under armor with the host's GPU (OpenGL) and sound; a Windows game with Proton | Windows games from other stores with `armor install`; Chromium-based applications (Epic, Spotify) |
+| **M8 — Games and Steam** | Linux and Windows games, with the host's GPU and sound | Valve's ARM64 Steam client, installed by armor; an x86 Linux game under armor with the host's GPU (OpenGL) and sound; Windows games with Proton, from Steam and from itch.io | Chromium-based applications (Epic, Spotify) |
 | **M9 — Any ARM64** | Every ARM64 CPU and page size, more distributions | 4K guest pages on 16K hosts; the JIT on any ARMv8.0 CPU | real CPUs beyond the Pi 5; Windows programs on 16K-page systems; distributions beyond Debian and Ubuntu |
 | **M10 — The reference** | What works where, with which engine, reproducibly | differential tests against qemu and a real x86 CPU; FEX and box64 measured on the same cases | a compatibility matrix generated from measurements; performance; a guide for developers |
 
 <!-- progress:start -->
 <!-- Generated by `cargo xtask progress` from docs/roadmap.md. Do not edit. -->
-![Roadmap 88%](https://img.shields.io/badge/roadmap-88%25-green)
+![Roadmap 89%](https://img.shields.io/badge/roadmap-89%25-green)
 
 | Milestone | Progress | Items done |
 |---|---|---|
@@ -117,7 +117,7 @@ The milestones M0–M6 built the engine. M7–M10 are open, in order of priority
 | Dynamic linking and runtime | ![M5 100%](https://img.shields.io/badge/M5-100%25-brightgreen) | 7/7 |
 | AArch64 JIT and performance | ![M6 100%](https://img.shields.io/badge/M6-100%25-brightgreen) | 6/6 |
 | The installer for everyone: any x86 program | ![M7 100%](https://img.shields.io/badge/M7-100%25-brightgreen) | 10/10 |
-| Games and Steam | ![M8 71%](https://img.shields.io/badge/M8-71%25-green) | 5/7 |
+| Games and Steam | ![M8 85%](https://img.shields.io/badge/M8-85%25-green) | 6/7 |
 | Any ARM64 | ![M9 40%](https://img.shields.io/badge/M9-40%25-yellow) | 2/5 |
 | The reference | ![M10 25%](https://img.shields.io/badge/M10-25%25-orange) | 1/4 |
 <!-- progress:end -->

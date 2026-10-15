@@ -594,8 +594,10 @@ const INSTALLER_PATTERNS: &[&str] = &[
     "*.txz",
     "*.tar.bz2",
     "*.tar.zst",
+    "*.zip",
     "*.EXE",
     "*.MSI",
+    "*.ZIP",
 ];
 
 fn install(ui: &Rc<Ui>, path: &Path) {
@@ -614,7 +616,7 @@ fn install(ui: &Rc<Ui>, path: &Path) {
 fn choose_installer(ui: &Rc<Ui>) {
     let filter = gtk::FileFilter::new();
     filter.set_name(Some(
-        "x86 programs (.exe, .msi, .deb, .AppImage, .tar.gz, .tar.xz)",
+        "x86 programs (.exe, .msi, .zip, .deb, .AppImage, .tar.gz, .tar.xz)",
     ));
     for pattern in INSTALLER_PATTERNS {
         filter.add_pattern(pattern);
@@ -1050,7 +1052,7 @@ fn build(application: &gtk::Application) {
     let header = gtk::HeaderBar::new();
     let install_header = install_button("Install");
     install_header.set_tooltip_text(Some(
-        "Install a program (.exe, .msi, .deb, .AppImage, .tar)",
+        "Install a program (.exe, .msi, .zip, .deb, .AppImage, .tar)",
     ));
     header.pack_start(&install_header);
     let search = gtk::SearchEntry::builder()
@@ -1140,7 +1142,7 @@ fn build(application: &gtk::Application) {
         "system-software-install-symbolic",
         "No applications yet",
         "Drop an installer here, double-click it in the file manager, or choose one: \
-         Windows .exe and .msi, Linux .deb, AppImage and .tar archives.",
+         Windows .exe, .msi and .zip, Linux .deb, AppImage and .tar archives.",
         Some(&install_empty),
     );
     let nomatch = status_page(
