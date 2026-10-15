@@ -5,6 +5,7 @@
 
 mod events;
 mod files;
+pub mod host;
 mod ipc;
 pub mod loader;
 mod net;

@@ -104,5 +104,8 @@ armor (bin) ──► armor-linux ──► armor-cpu ──► armor-x86
 
 Details in `tech/memory.md`.
 
+## Calls into the host's libraries (ADR-0041, since 2026-10-15)
+Guest stubs make syscall 0x410000 with a function id and sixteen argument slots; `armor_linux::host` calls the matching host function (`dlopen`/`dlsym` from libc) and writes the result back; unknown ids give `ENOSYS`, and the stub falls back to the guest's own code. Increment 1: the mechanism, with `ldexp` from the host's `libm` (`tests/guest/c/host_call.c`, `tech/syscalls.md`). Next: the OpenGL and GLX stubs and table generated from Khronos' XML, the host's own X connection with the guest's X ids, strings and mapped buffers copied or registered, and `--host-gl`.
+
 ## Related open decisions
 Golden files for running without qemu (`testing.md`). Closed: 4K pages on 16K hosts (ADR-0009, 0012, 0021, 0022), IR (none, ADR-0021). Dependencies: ADR-0008. Dynamic linking: ADR-0011 (real x86-64 `ld.so` from a guest rootfs), ADR-0012 (file `mmap` by copy), ADR-0013 (guest root).

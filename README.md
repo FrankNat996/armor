@@ -27,7 +27,7 @@ Measured on a Raspberry Pi 5 (Cortex-A76, Debian 13, 4K-page kernel), October 20
 
 | | What | Status |
 |---|---|---|
-| ✅ | **Linux x86-64 and i386 command-line programs** | 455 of 455 test cases give the same output as `qemu`, 259 of 259 the same as a real x86 CPU. Debian's coreutils, busybox, grep, sed, gawk, findutils, tar, gzip, xz, make, perl and python pass their test cases |
+| ✅ | **Linux x86-64 and i386 command-line programs** | 458 of 458 test cases give the same output as `qemu`, 259 of 259 the same as a real x86 CPU. Debian's coreutils, busybox, grep, sed, gawk, findutils, tar, gzip, xz, make, perl and python pass their test cases |
 | ✅ | **Windows programs: 7-Zip, Notepad++, KeePass 2, EZVIZ Studio** | Installed with `armor install` or a double click, with no manual step; they appear in the desktop menu and open. 7-Zip's archives are byte-identical to those of its native ARM64 build. .NET programs run on Wine Mono; the Visual C++ runtime is installed by armor when a program needs a part Wine lacks. When a program fails to start, armor says why in a desktop notification |
 | ✅ | **Steam (Valve's native ARM64 client)** | Installed by armor (`armor install steam`, or Install Steam in the window): it updates itself, signs in and shows the library. Needs a 4K-page kernel |
 | ✅ | **x86-64 Linux applications: `.deb`, AppImage, `.tar` archives** | Installed with every Debian library they need, verified and unpacked without root; they appear in the menu and open: XnView MP (`.deb`), KeePassXC (AppImage), Sublime Text (`.tar.xz`). Qt applications draw in software for now |
