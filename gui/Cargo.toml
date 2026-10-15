@@ -5,7 +5,7 @@
 [package]
 name = "armor-gui"
 description = "The window of armor: installed x86 applications, install, open, remove"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/FrankNat996/armor"
