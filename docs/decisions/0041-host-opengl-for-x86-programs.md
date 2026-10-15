@@ -1,6 +1,6 @@
 # 0041 — OpenGL of x86 Linux programs through the host's libGL
 
-- **Status:** Proposed
+- **Status:** Accepted (2026-10-15)
 - **Date:** 2026-10-15
 - Context: M8 (`roadmap.md`: real graphics for x86 Linux programs, through calls to the host's own libraries), ADR-0018 (guest memory mapped at the same addresses as armor's), ADR-0008 (dependencies), `tech/steam.md`.
 
@@ -20,6 +20,7 @@ Measured on Doki Doki Literature Club (Ren'Py, 2026-10-15): SDL2 creates the win
 ## Alternatives considered
 - **An x86-64 Mesa built with the Pi's v3d driver**, the driver's own ioctls passed through armor: no translation layer to write, but the driver's CPU work stays translated (slower), it covers only the GPUs whose drivers are built, and it needs a Mesa build for x86 kept in step with the host's kernel. Not chosen.
 - **Calling the host's libX11 too (as FEX's thunks do):** the most general, but X11 has hundreds of functions and callbacks; GLX with shared X ids avoids it for OpenGL.
+- **Vulkan only, with OpenGL through Zink** (Mesa's OpenGL on Vulkan, in the guest's x86 Mesa): one layer to call into instead of two, but on the Pi the Vulkan driver (v3dv) is weaker than the OpenGL one (v3d) (it lacks `multiDrawIndirect`, which DXVK 2.x needs), and Zink's own work would run translated. OpenGL games go to the host's OpenGL; Vulkan comes after, on the same mechanism, for games written for it.
 - **Calling the host's SDL2:** covers window, input and GL at once, but SDL is not the only way games open a window (GLFW, raw X11), and its callbacks (audio) would call guest code from host threads.
 
 ## Consequences
