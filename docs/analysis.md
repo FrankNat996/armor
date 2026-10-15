@@ -16,7 +16,7 @@ Rewritten on 2026-10-15, after M7–M9 closed; the 2026-10-14 table is in the re
 | Steam and games | `armor install steam` (Valve's ARM64 client), Windows games with its ARM64 Proton (Doki Doki Literature Club, Friday Night Funkin' from itch.io), an x86 Linux game on the GPU | Direct3D games on the Pi's GPU, games that need Vulkan under armor |
 | CPUs and systems | Cortex-A76 (Pi 5) and Neoverse-N2 (GitHub's runner, at every push); 4K, 16K and 64K pages; Debian, Ubuntu, Fedora, Arch Linux ARM; the JIT's ARMv8.0 paths forced on both CPUs | a real ARMv8.0 CPU (Pi 4); Steam on 16K and 64K pages needs a 4K kernel or a micro-VM (ADR-0042) |
 | Reference | `difftest` against qemu, the Xeon, the native build and saved results, `--lockstep`, `--engine box64\|fex`, `bench`, `app-check`; results recorded per machine and the matrix generated from them (ADR-0045); a guide for developers (`guide.md`) | more machines in the matrix, more applications checked unattended |
-| armor itself | an arm64 `.deb` and a `.tar.gz` with `install.sh` in every release (`v0.4.0`), `armor update`, the window `armor-gui` | packages in the distributions' own repositories |
+| armor itself | an arm64 `.deb` and a `.tar.gz` with `install.sh` in every release (since `v0.5.0`), `armor update`, the window `armor-gui` | packages in the distributions' own repositories |
 
 ## 3. What to do, in order of priority
 

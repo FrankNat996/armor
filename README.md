@@ -64,8 +64,8 @@ Application by application, with versions, levels and the commands that verify t
 Download the package from the [latest release](https://github.com/FrankNat996/armor/releases/latest) and install it:
 
 ```bash
-wget https://github.com/FrankNat996/armor/releases/download/v0.4.0/armor_0.4.0_arm64.deb
-sudo apt install ./armor_0.4.0_arm64.deb
+wget https://github.com/FrankNat996/armor/releases/download/v0.5.0/armor_0.5.0_arm64.deb
+sudo apt install ./armor_0.5.0_arm64.deb
 ```
 
 This installs `armor`, its window (**armor** in the System menu) and the double-click handler for installers, `.deb` packages and AppImages. From then on armor updates itself: the window says when a new version is out (or use **Check for updates** in its menu, or `armor update`). Once, for Windows programs, download the Windows engine (about 380 MB, verified against pinned checksums):
@@ -74,10 +74,11 @@ This installs `armor`, its window (**armor** in the System menu) and the double-
 armor engine fetch
 ```
 
-On other distributions (Fedora, Arch and similar; ADR-0043), from the next release the archive `armor_<version>_arm64.tar.gz` installs armor for your user, without root (`uninstall.sh` removes it; `armor update` updates it):
+On other distributions (Fedora, Arch and similar; ADR-0043), the archive installs armor for your user, without root (`uninstall.sh` removes it; `armor update` updates it):
 
 ```bash
-tar -xzf armor_<version>_arm64.tar.gz && sh armor_<version>_arm64/install.sh
+wget https://github.com/FrankNat996/armor/releases/download/v0.5.0/armor_0.5.0_arm64.tar.gz
+tar -xzf armor_0.5.0_arm64.tar.gz && sh armor_0.5.0_arm64/install.sh
 ```
 
 To build the package from source instead (needs [Rust](https://rustup.rs), `libgtk-4-dev` and `dpkg-dev`): `git clone https://github.com/FrankNat996/armor.git && cd armor && cargo xtask package`, then `sudo apt install ./target/package/armor_*_arm64.deb` (on other distributions, `install.sh` from `target/package/armor_*_arm64.tar.gz`).
