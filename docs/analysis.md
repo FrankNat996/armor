@@ -32,10 +32,11 @@ A single application that makes it simple for anyone with an ARM64 computer to u
 6. **Double click and interface** (weeks). MIME types associated with `armor install`; then a minimal window. The choice of toolkit (GTK, a local web interface, …) is to be made with an ADR. Done on 2026-10-14: `armor-gui` in GTK 4 (ADR-0035); the double click covers `.exe`, `.msi`, `.deb` and AppImages.
 
 ### M8 — Games and Steam
+Completed on 2026-10-15 (`roadmap.md`): items 1–3 below are done (`armor install steam`; Doki Doki Literature Club with Proton ARM64 and the GPU limits measured; OpenGL through the host's libGL, ADR-0041); item 4 is still open.
 1. **Steam installed by armor** (days): Valve's ARM64 client with the three host libraries it asks for (GTK2, IBus, PipeWire) and the launcher, done by hand today.
 2. **A Windows game with Proton ARM64** (days–weeks): Proton is already installed by the client; it needs to be tried and the limits of the Pi's GPU measured (v3dv, without `multiDrawIndirect`, which DXVK 2.x asks for).
 3. **Real graphics and audio for x86 Linux programs under armor** (months). Today an x86 Linux game uses the x86 libraries (Mesa, SDL, ALSA) translated, hence software rendering and no GPU driver. The solution is to call the host's native libraries from the x86 functions (OpenGL/Vulkan, SDL, X11, audio), with the ABI verified. It is the largest piece of work of M8 and also the one that helps performance most.
-4. **Chromium-based applications** (weeks, unknown; moved from M7 on 2026-10-14, ADR-0037): the Epic Games Launcher up to sign-in (its CEF renderer terminates under FEX) and Spotify (its renderer processes exit under armor). Partly in external components: measure, report, retry with new versions.
+4. **Chromium-based applications** (weeks, unknown; moved from M7 on 2026-10-14, ADR-0037; still open after M8 closed on 2026-10-15, `roadmap.md`): the Epic Games Launcher up to sign-in (its CEF renderer terminates under FEX) and Spotify (its renderer processes exit under armor). Partly in external components: measure, report, retry with new versions.
 
 ### M9 — Every ARM64
 1. **A second and a third CPU** (days, with the hardware): a Pi 4 (ARMv8.0 without LSE) and another CPU, with `difftest`, `--lockstep` and the applications of M7.
