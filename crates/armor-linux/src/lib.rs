@@ -12,6 +12,7 @@ mod net;
 pub mod process;
 pub mod root;
 pub mod sandbox;
+pub mod seccomp;
 pub mod signal;
 pub mod syscall;
 
@@ -70,6 +71,12 @@ pub fn terminate_by_signal(signal: i32) -> ! {
     // handler, so the default must be restored first.
     unsafe {
         libc::signal(signal, libc::SIG_DFL);
+        // A signal the guest blocks (mirrored into armor's mask) must still
+        // end it, as the kernel forces a fatal one.
+        let mut set: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut set);
+        libc::sigaddset(&mut set, signal);
+        libc::pthread_sigmask(libc::SIG_UNBLOCK, &set, std::ptr::null_mut());
         libc::raise(signal);
     }
     // Only reached if the signal does not terminate the process.

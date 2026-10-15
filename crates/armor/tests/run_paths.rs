@@ -280,6 +280,56 @@ fn a_guest_killed_by_a_fault_leaves_a_small_core() {
 }
 
 #[test]
+fn syscalls_answered_as_a_kernel_configuration() {
+    // ADR-0044: each syscall, with zero arguments, exits with the errno it
+    // got: mov eax, N; syscall; neg eax; mov edi, eax; mov eax, 60; syscall.
+    let cases: [(u32, i32, &str); 11] = [
+        (101, 1, "ptrace: EPERM (Yama ptrace_scope 3)"),
+        (425, 38, "io_uring_setup: ENOSYS"),
+        (426, 38, "io_uring_enter: ENOSYS"),
+        (323, 38, "userfaultfd: ENOSYS"),
+        (447, 38, "memfd_secret: ENOSYS"),
+        (462, 38, "mseal: ENOSYS"),
+        (212, 38, "lookup_dcookie: ENOSYS"),
+        (216, 38, "remap_file_pages: ENOSYS"),
+        (274, 38, "get_robust_list: ENOSYS"),
+        (219, 4, "restart_syscall: EINTR"),
+        (453, 95, "map_shadow_stack: EOPNOTSUPP"),
+    ];
+    for (number, errno, what) in cases {
+        let mut code = vec![0xb8];
+        code.extend(number.to_le_bytes());
+        code.extend([
+            0x0f, 0x05, 0xf7, 0xd8, 0x89, 0xc7, 0xb8, 60, 0, 0, 0, 0x0f, 0x05,
+        ]);
+        let program = temp_file(&format!("answer-{number}"), &x86_64_with_code(&code));
+        let out = armor(&[program.to_str().unwrap()]);
+        assert_eq!(out.status.code(), Some(errno), "{what}: {out:?}");
+    }
+}
+
+#[test]
+fn seccomp_strict_mode_allows_write_and_kills_on_the_rest() {
+    // prctl(PR_SET_SECCOMP, SECCOMP_MODE_STRICT); write(1, "ok\n", 3);
+    // getpid(): SIGKILL, as Linux does in strict mode.
+    let mut code = vec![
+        0xbf, 22, 0, 0, 0, 0xbe, 1, 0, 0, 0, 0xb8, 157, 0, 0, 0, 0x0f, 0x05, // prctl
+        0xbf, 1, 0, 0, 0, // mov edi, 1
+    ];
+    // lea rsi, [rip + text]: the text is 21 bytes after this instruction.
+    code.extend([0x48, 0x8d, 0x35, 21, 0, 0, 0]);
+    code.extend([0xba, 3, 0, 0, 0, 0xb8, 1, 0, 0, 0, 0x0f, 0x05]); // write
+    code.extend([0xb8, 39, 0, 0, 0, 0x0f, 0x05]); // getpid
+    code.extend([0x31, 0xff]); // xor edi, edi (exit 0, not reached)
+    code.extend(b"ok\n");
+    let program = temp_file("seccomp-strict", &x86_64_with_code(&code));
+    let out = armor(&[program.to_str().unwrap()]);
+    use std::os::unix::process::ExitStatusExt;
+    assert_eq!(out.stdout, b"ok\n", "{out:?}");
+    assert_eq!(out.status.signal(), Some(9), "{out:?}");
+}
+
+#[test]
 fn other_files_are_refused_with_a_suggestion() {
     let data = temp_file("data.txt", b"hello\n");
     let out = armor(&[data.to_str().unwrap()]);

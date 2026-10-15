@@ -218,6 +218,19 @@ pub fn execve(
     word: usize,
 ) -> Result<i64, i64> {
     let guest_path = read_string(mem, path)?;
+    execve_path(mem, process, guest_path, argv, envp, word)
+}
+
+/// execve(2) of the program at `guest_path`, already read from the guest
+/// (execveat builds it from a descriptor).
+pub fn execve_path(
+    mem: &AddressSpace,
+    process: &Process,
+    guest_path: Vec<u8>,
+    argv: u64,
+    envp: u64,
+    word: usize,
+) -> Result<i64, i64> {
     let args = read_strings(mem, argv, word)?;
     let env = read_strings(mem, envp, word)?;
     let guest_path = if crate::syscall::is_self_exe(&guest_path) {
@@ -282,7 +295,10 @@ fn exec_armor(
         program.to_vec(),
     ]);
     args.extend(rest.iter().cloned());
-    exec_host(&armor, &args, env)
+    // The guest's seccomp filters go to the new armor (ADR-0044).
+    let mut env = env.to_vec();
+    env.extend(crate::seccomp::exec_variable());
+    exec_host(&armor, &args, &env)
 }
 
 /// Replaces armor with the host program `path` (a native AArch64 program,

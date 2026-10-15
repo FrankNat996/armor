@@ -401,7 +401,11 @@ fn main() -> ExitCode {
     if let Err(e) = limits::apply_kernel(&resource_limits) {
         return armor_error(format_args!("{e}"));
     }
+    // The seccomp filters of the program that exec'd this one (ADR-0044):
+    // armor's, not the guest's environment.
+    let seccomp_fd = env::var(armor_linux::seccomp::EXEC_VARIABLE).ok();
     let env: Vec<Vec<u8>> = env::vars_os()
+        .filter(|(key, _)| key != armor_linux::seccomp::EXEC_VARIABLE)
         .map(|(key, value)| [key.as_bytes(), b"=", value.as_bytes()].concat())
         .collect();
     let env = match &profile {
@@ -504,6 +508,12 @@ fn main() -> ExitCode {
     // signals.
     let mut thread = syscall::Thread::default();
     thread.signals.inherit_from_host();
+    if let Some(filters) = seccomp_fd
+        .as_deref()
+        .and_then(armor_linux::seccomp::inherited)
+    {
+        thread.seccomp = filters;
+    }
 
     // Shared by every guest thread for the rest of armor's life.
     // The GIL stays for lockstep, whose run-twice-and-compare scheme needs

@@ -50,6 +50,7 @@ pub mod nr {
     pub const GETSID: u64 = 147;
     pub const FDATASYNC: u64 = 148;
     pub const PRCTL: u64 = 172;
+    pub const SECCOMP: u64 = 354;
     pub const SCHED_GETAFFINITY: u64 = 242;
     pub const STATFS64: u64 = 268;
     pub const FSTATFS64: u64 = 269;
@@ -257,6 +258,7 @@ pub fn is_implemented(number: u64) -> bool {
             | GETSID
             | FDATASYNC
             | PRCTL
+            | SECCOMP
             | SCHED_GETAFFINITY
             | STATFS64
             | FSTATFS64
@@ -430,9 +432,20 @@ pub fn dispatch(
     process: &Process,
     thread: &mut Thread,
 ) -> Outcome {
+    let low = |cpu: &Cpu, n: usize| cpu.regs[n] & 0xffff_ffff;
+    let number = low(cpu, RAX);
+    let a = [RBX, RCX, RDX, RSI, RDI, RBP].map(|r| low(cpu, r));
+    if let Some(outcome) = super::seccomp_gate(
+        cpu,
+        process,
+        thread,
+        number,
+        a,
+        crate::seccomp::AUDIT_ARCH_I386,
+    ) {
+        return outcome;
+    }
     let reg = |n: usize| cpu.regs[n] & 0xffff_ffff;
-    let number = reg(RAX);
-    let a = [reg(RBX), reg(RCX), reg(RDX), reg(RSI), reg(RDI), reg(RBP)];
     // A signed 32-bit argument (an offset, a descriptor that may be
     // AT_FDCWD), sign-extended for the host.
     let signed = |v: u64| v as u32 as i32 as i64 as u64;
@@ -465,7 +478,27 @@ pub fn dispatch(
         }
         // glibc falls back to clone, as on x86_64.
         nr::CLONE3 => Err(err(libc::ENOSYS)),
-        nr::EXECVE => crate::process::execve(mem, process, a[0], a[1], a[2], 4),
+        nr::EXECVE => {
+            crate::seccomp::prepare_exec(&thread.seccomp);
+            crate::process::execve(mem, process, a[0], a[1], a[2], 4)
+        }
+        nr::SECCOMP => match crate::seccomp::syscall(
+            mem,
+            &process.seccomp,
+            &mut thread.seccomp,
+            a[0],
+            a[1],
+            a[2],
+        ) {
+            Ok(result) => result,
+            Err(what) => return Outcome::Unsupported(what),
+        },
+        nr::PRCTL if a[0] == 21 || a[0] == 22 => {
+            match super::prctl_seccomp(mem, process, thread, a[0], a[1], a[2]) {
+                Ok(result) => result,
+                Err(what) => return Outcome::Unsupported(what),
+            }
+        }
         nr::WAIT4 => crate::process::wait4(mem, signed(a[0]), a[1], a[2], a[3], true),
         nr::WAITPID => crate::process::wait4(mem, signed(a[0]), a[1], a[2], 0, true),
         nr::FTRUNCATE => host(libc::SYS_ftruncate, &[a[0], signed(a[1])]),

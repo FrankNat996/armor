@@ -54,6 +54,7 @@ Every significant decision has its own file `NNNN-title.md`. ADRs are never dele
 | [0041](0041-host-opengl-for-x86-programs.md) | OpenGL of x86 Linux programs through the host's libGL (GLX with shared X ids, generated stubs) | Accepted (2026-10-15) |
 | [0042](0042-hosts-with-16k-and-64k-pages.md) | Hosts with 16K and 64K pages: armor and Hangover as they are, Steam on a 4K kernel | Accepted (2026-10-15) |
 | [0043](0043-other-distributions.md) | Other distributions: one archive of armor, Debian's libraries and Hangover's Debian build everywhere | Accepted (2026-10-15) |
+| [0044](0044-every-x86-64-syscall-handled.md) | Every x86-64 syscall handled: as the kernel would answer | Accepted (2026-10-15) |
 
 ## Template
 ```markdown

@@ -95,7 +95,22 @@ const OTHER_MACHINE: [(&str, &str); 14] = [
 /// `--oracle` compares them (docs/testing.md, known discrepancies). A name
 /// with a `*/` prefix is a C source in every variant of the program
 /// (`c/`, `c-pie/`, `c-dyn/`, or the i386 `c32/`, `c32-pie/`, `c32-dyn/`).
-const HARDWARE_ONLY: [(&str, &str); 16] = [
+const HARDWARE_ONLY: [(&str, &str); 22] = [
+    ("*/seccomp", "qemu-x86_64 does not emulate seccomp filters"),
+    ("*/linux_aio", "qemu-x86_64 has no Linux AIO (ENOSYS)"),
+    ("*/message_queues", "qemu-x86_64 has no mq_notify (ENOSYS)"),
+    (
+        "*/process_calls",
+        "qemu-x86_64 has no process_vm_readv/writev and futex_waitv, and its execveat of a descriptor fails",
+    ),
+    (
+        "*/identity_calls",
+        "qemu-x86_64 has no mlock2 and process_mrelease (ENOSYS) and ignores PER_LINUX32 in uname",
+    ),
+    (
+        "*/signalfd",
+        "qemu-x86_64 accepts a signal mask of 4 bytes, which Linux refuses",
+    ),
     (
         "sse/mxcsr_hardware",
         "qemu never raises DE and propagates the wrong NaN",
@@ -178,6 +193,41 @@ fn hardware_only(name: &str) -> Option<&'static str> {
     })
 }
 
+/// C tests (stems of `tests/guest/c/`) whose reference is the same source
+/// built for AArch64 and run natively on this machine (`--native`): the
+/// syscalls they check are done by the host kernel for the guest (ADR-0044),
+/// and qemu has none of them, while the hardware oracle's container
+/// filters some (keys). They run only with `--native`.
+pub const NATIVE_ORACLE: [&str; 1] = ["system_calls"];
+
+/// Whether `name` is a case of `NATIVE_ORACLE` (any x86-64 variant).
+fn native_only(name: &str) -> Option<&'static str> {
+    let stem = name.rsplit('/').next()?;
+    let x86_64 = name.starts_with("c/") || name.starts_with("c-pie/") || name.starts_with("c-dyn/");
+    NATIVE_ORACLE.iter().copied().find(|s| *s == stem && x86_64)
+}
+
+/// The native AArch64 build of a `NATIVE_ORACLE` test, made with the host's
+/// compiler into `target/guest/native/`.
+fn native_build(paths: &Paths, stem: &str) -> Result<PathBuf, String> {
+    let out = paths.guest_out.join("native").join(stem);
+    std::fs::create_dir_all(out.parent().expect("inside target/guest"))
+        .map_err(|e| format!("cannot create target/guest/native: {e}"))?;
+    let output = exec(
+        std::process::Command::new("cc")
+            .args(["-O2", "-Wall", "-o"])
+            .arg(&out)
+            .arg(paths.root.join(format!("tests/guest/c/{stem}.c"))),
+    )?;
+    if !output.status.success() {
+        return Err(format!(
+            "cc failed on {stem}.c:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    Ok(out)
+}
+
 /// Saved reference results (`--save`, `--expected`).
 enum Saved {
     Write(PathBuf),
@@ -228,6 +278,10 @@ pub fn run(args: &[String]) -> Result<(), String> {
         [flag, rest @ ..] if flag == "--oracle" => (Some(Oracle::from_env()?), rest),
         _ => (None, args),
     };
+    let (native, args) = match args {
+        [flag, rest @ ..] if flag == "--native" => (true, rest),
+        _ => (false, args),
+    };
     let (saved, args) = match args {
         [flag, dir, rest @ ..] if flag == "--save" => (Some(Saved::Write(dir.into())), rest),
         [flag, dir, rest @ ..] if flag == "--expected" => (Some(Saved::Read(dir.into())), rest),
@@ -253,7 +307,19 @@ pub fn run(args: &[String]) -> Result<(), String> {
         build_armor(&paths)?;
     }
     let mut runs = collect(&paths, filter)?;
+    if native {
+        runs.retain(|run| native_only(&run.name).is_some());
+    } else {
+        runs.retain(|run| match native_only(&run.name) {
+            Some(_) => {
+                println!("SKIP {} (native oracle only: --native)", run.name);
+                false
+            }
+            None => true,
+        });
+    }
     let reference = match (&oracle, &saved) {
+        _ if native => "native",
         (Some(_), _) => "hardware",
         (None, Some(Saved::Read(_))) => "saved",
         _ => "qemu",
@@ -310,6 +376,15 @@ pub fn run(args: &[String]) -> Result<(), String> {
     let mut uploaded = std::collections::HashMap::new();
     for run in &runs {
         let expected = match &oracle {
+            _ if native => {
+                let stem = native_only(&run.name).expect("only native cases are left");
+                let bin = native_build(&paths, stem)?;
+                exec(
+                    std::process::Command::new(&bin)
+                        .args(&run.args)
+                        .stdin(Stdio::null()),
+                )?
+            }
             Some(oracle) => {
                 let key = run.bin.clone();
                 let remote = match uploaded.get(&key) {

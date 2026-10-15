@@ -150,6 +150,10 @@ Where external components do not reach, armor is the engine or the solution.
 
 **Completed on 2026-10-15,** with two real CPUs instead of three (the third, a Pi 4, is not available; its ARMv8.0 paths are checked by forcing them on both CPUs): the matrix ("Machines") shows the Cortex-A76 and the Neoverse-N2, three page sizes (4K, 16K, 64K) and four systems (Debian 13, Ubuntu 24.04, Fedora 42, Arch Linux ARM), with the engine for each kind of program.
 
+## Every x86-64 syscall (before M10) ✅
+Not a milestone: done between M9 and M10 so that no x86-64 syscall stops armor.
+- [x] Every syscall of the kernel headers answered (ADR-0044, 2026-10-15): 375 of 375, by the host kernel with the arguments converted, emulated (`seccomp`), or as a real kernel configuration answers (io_uring absent, `ptrace` refused, …), each family with a C test against the Xeon, qemu or the native oracle (`tech/syscalls.md`, "Every syscall")
+
 ## M10 — The reference (priority 5, always active)
 Whoever develops or uses software on ARM finds on the project page, for an application or a CPU, what works, with which engine and how to reproduce it.
 - [x] Test bench: `difftest` against qemu and against a real x86 CPU (Xeon X5675), JIT lockstep, the same cases under box64 and FEX (`--engine`), `bench` with the box64 and FEX columns (2026-10-14: armor 427/427, FEX 345/397 on 4K pages, box64 218/397 on 16K pages)

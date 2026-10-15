@@ -23,7 +23,13 @@ use crate::net::{self, Word};
 use crate::root::GuestRoot;
 use crate::signal::{NSIG, SIGACTION_SIZE, Signals};
 
+mod admin;
+mod aio;
 pub mod i386;
+mod processes;
+mod queues;
+mod system;
+mod transfer;
 
 pub mod nr {
     pub const READ: u64 = 0;
@@ -71,6 +77,7 @@ pub mod nr {
     pub const NEWFSTATAT: u64 = 262;
     pub const READLINKAT: u64 = 267;
     pub const SET_ROBUST_LIST: u64 = 273;
+    pub const SECCOMP: u64 = 317;
     pub const PRLIMIT64: u64 = 302;
     pub const GETRANDOM: u64 = 318;
     pub const DUP3: u64 = 292;
@@ -340,6 +347,8 @@ const PR_CAPBSET_READ: u64 = 23;
 const PR_GET_DUMPABLE: u64 = 3;
 const PR_SET_DUMPABLE: u64 = 4;
 const PR_SET_NO_NEW_PRIVS: u64 = 38;
+const PR_GET_SECCOMP: u64 = 21;
+const PR_SET_SECCOMP: u64 = 22;
 /// `PR_SET_VMA` ("SVMA"): names anonymous memory, for diagnostics.
 const PR_SET_VMA: u64 = 0x5356_4d41;
 const PR_GET_NO_NEW_PRIVS: u64 = 39;
@@ -473,6 +482,8 @@ pub struct Process {
     /// armor's `--diagnose` option, which execve passes on too
     /// (ADR-0028).
     pub diagnose: Option<Vec<u8>>,
+    /// The seccomp filters a TSYNC gave every thread (ADR-0044).
+    pub seccomp: crate::seccomp::Shared,
 }
 
 /// The program break.
@@ -500,6 +511,7 @@ impl Process {
             jit: false,
             lockstep: false,
             diagnose: None,
+            seccomp: crate::seccomp::Shared::default(),
             brk: Mutex::new(Brk {
                 start: brk_start,
                 current: brk_start,
@@ -518,6 +530,8 @@ pub struct Thread {
     /// Address registered with set_tid_address or CLONE_CHILD_CLEARTID:
     /// zeroed and woken when the thread exits.
     pub clear_child_tid: u64,
+    /// Its seccomp filters (ADR-0044).
+    pub seccomp: crate::seccomp::Seccomp,
 }
 
 #[derive(Debug)]
@@ -636,6 +650,7 @@ pub fn is_implemented(number: u64) -> bool {
             | nr::ARCH_PRCTL
             | nr::SET_TID_ADDRESS
             | nr::SET_ROBUST_LIST
+            | nr::SECCOMP
             | nr::RSEQ
             | nr::UMASK
             | nr::UNLINK
@@ -805,7 +820,123 @@ pub fn is_implemented(number: u64) -> bool {
             | nr::IOPL
             | nr::IOPERM
             | nr::URETPROBE
-    )
+    ) || [
+        system::HANDLED,
+        transfer::HANDLED,
+        processes::HANDLED,
+        queues::HANDLED,
+        aio::HANDLED,
+        admin::HANDLED,
+    ]
+    .iter()
+    .any(|handled| handled.contains(&number))
+}
+
+/// prctl's PR_GET_SECCOMP and PR_SET_SECCOMP (mode 1 strict, mode 2 a
+/// filter), on the thread's emulated seccomp (ADR-0044).
+pub(crate) fn prctl_seccomp(
+    mem: &AddressSpace,
+    process: &Process,
+    thread: &mut Thread,
+    option: u64,
+    mode: u64,
+    program: u64,
+) -> Result<SysResult, String> {
+    if option == PR_GET_SECCOMP {
+        return Ok(Ok(thread.seccomp.mode() as i64));
+    }
+    Ok(match mode {
+        1 => thread.seccomp.set_strict(),
+        2 => return thread.seccomp.add_filter(mem, &process.seccomp, 0, program),
+        _ => Err(err(libc::EINVAL)),
+    })
+}
+
+/// Runs the thread's seccomp filters (ADR-0044) before syscall `number`:
+/// `Some` when the syscall does not run, with the outcome.
+pub(crate) fn seccomp_gate(
+    cpu: &mut Cpu,
+    process: &Process,
+    thread: &mut Thread,
+    number: u64,
+    args: [u64; 6],
+    arch: u32,
+) -> Option<Outcome> {
+    use crate::seccomp::Verdict;
+    const SIGSYS: i32 = 31;
+    thread.seccomp.sync(&process.seccomp);
+    if !thread.seccomp.active() {
+        return None;
+    }
+    match thread.seccomp.judge(number, arch, cpu.rip, args) {
+        Verdict::Allow => None,
+        Verdict::Errno(e) => {
+            cpu.regs[RAX] = e as u64;
+            Some(Outcome::Continue)
+        }
+        Verdict::Trap(errno) => {
+            // As force_sig_seccomp: a SIGSYS the guest blocks or ignores
+            // kills it.
+            let action = thread.signals.action(SIGSYS as u64);
+            let ignored = u64::from_le_bytes(action[..8].try_into().expect("8 bytes")) == 1;
+            if ignored || thread.signals.mask() & (1 << (SIGSYS - 1)) != 0 {
+                return Some(Outcome::Fatal(
+                    SIGSYS,
+                    "seccomp: SIGSYS blocked or ignored".to_string(),
+                ));
+            }
+            // The syscall number back in rax, as the kernel's rollback.
+            cpu.regs[RAX] = number;
+            let info = crate::seccomp::trap_info(errno, cpu.rip, number, arch);
+            // SAFETY: integers and a 128-byte siginfo; armor's handler
+            // records the signal for this thread.
+            unsafe {
+                libc::syscall(
+                    libc::SYS_rt_tgsigqueueinfo,
+                    libc::getpid(),
+                    libc::gettid(),
+                    SIGSYS,
+                    info.as_ptr(),
+                )
+            };
+            Some(Outcome::Continue)
+        }
+        Verdict::KillThread
+            if process
+                .live_threads
+                .load(std::sync::atomic::Ordering::SeqCst)
+                > 1 =>
+        {
+            Some(Outcome::ExitThread(0))
+        }
+        Verdict::KillThread | Verdict::KillProcess => Some(Outcome::Fatal(
+            SIGSYS,
+            "seccomp killed the program".to_string(),
+        )),
+        Verdict::Kill => Some(Outcome::Fatal(
+            libc::SIGKILL,
+            "seccomp strict mode".to_string(),
+        )),
+    }
+}
+
+/// The syscalls of ADR-0044, by family (`syscall/*.rs`).
+fn more(
+    mem: &AddressSpace,
+    process: &Process,
+    thread: &mut Thread,
+    number: u64,
+    a: [u64; 6],
+) -> Option<Result<SysResult, String>> {
+    if number == processes::nr::EXECVEAT {
+        crate::seccomp::prepare_exec(&thread.seccomp);
+    }
+    system::dispatch(mem, process, number, a)
+        .or_else(|| transfer::dispatch(mem, process, number, a))
+        .or_else(|| processes::dispatch(mem, process, number, a))
+        .or_else(|| queues::dispatch(mem, number, a))
+        .or_else(|| aio::dispatch(mem, thread, number, a))
+        .or_else(|| admin::dispatch(mem, process, number, a))
 }
 
 /// Handles the syscall the guest just executed (number in rax, arguments
@@ -829,6 +960,16 @@ pub fn dispatch(
         cpu.regs[R8],
         cpu.regs[R9],
     ];
+    if let Some(outcome) = seccomp_gate(
+        cpu,
+        process,
+        thread,
+        number,
+        a,
+        crate::seccomp::AUDIT_ARCH_X86_64,
+    ) {
+        return outcome;
+    }
     let result: SysResult = match number {
         crate::host::HOST_CALL => {
             crate::host::host_call(mem, process.root.host_gl().is_some(), a[0], a[1])
@@ -886,6 +1027,23 @@ pub fn dispatch(
         nr::SETUID => host(libc::SYS_setuid, &[a[0]]),
         nr::SETGID => host(libc::SYS_setgid, &[a[0]]),
         nr::GETGROUPS => getgroups(mem, a[0], a[1]),
+        nr::SECCOMP => match crate::seccomp::syscall(
+            mem,
+            &process.seccomp,
+            &mut thread.seccomp,
+            a[0],
+            a[1],
+            a[2],
+        ) {
+            Ok(result) => result,
+            Err(what) => return Outcome::Unsupported(what),
+        },
+        nr::PRCTL if a[0] == PR_GET_SECCOMP || a[0] == PR_SET_SECCOMP => {
+            match prctl_seccomp(mem, process, thread, a[0], a[1], a[2]) {
+                Ok(result) => result,
+                Err(what) => return Outcome::Unsupported(what),
+            }
+        }
         nr::PRCTL => match prctl(mem, a[0], a[1], [a[2], a[3], a[4]]) {
             Some(result) => result,
             None => return Outcome::Unsupported(format!("prctl option {}", a[0])),
@@ -1136,7 +1294,10 @@ pub fn dispatch(
                 Err(what) => return Outcome::Unsupported(what),
             }
         }
-        nr::EXECVE => crate::process::execve(mem, process, a[0], a[1], a[2], 8),
+        nr::EXECVE => {
+            crate::seccomp::prepare_exec(&thread.seccomp);
+            crate::process::execve(mem, process, a[0], a[1], a[2], 8)
+        }
         nr::WAIT4 => crate::process::wait4(mem, a[0], a[1], a[2], a[3], false),
         nr::GETPPID => host(libc::SYS_getppid, &[]),
         // Process groups, sessions and priorities: integers only, the same
@@ -1247,7 +1408,11 @@ pub fn dispatch(
             Err(what) => return Outcome::Unsupported(format!("mremap: {what}")),
         },
         n if n & X32_SYSCALL_BIT != 0 => Err(err(libc::ENOSYS)),
-        n => return Outcome::Unsupported(format!("syscall {n}")),
+        n => match more(mem, process, thread, n, a) {
+            Some(Ok(result)) => result,
+            Some(Err(what)) => return Outcome::Unsupported(what),
+            None => return Outcome::Unsupported(format!("syscall {n}")),
+        },
     };
     cpu.regs[RAX] = result.unwrap_or_else(|e| e) as u64;
     Outcome::Continue
@@ -1296,7 +1461,7 @@ pub(crate) fn host(number: libc::c_long, args: &[u64]) -> SysResult {
     let arg = |i: usize| args.get(i).copied().unwrap_or(0);
     // SAFETY: callers only pass syscalls whose arguments are integers, so
     // the host kernel never dereferences a guest address.
-    let result = unsafe { libc::syscall(number, arg(0), arg(1), arg(2), arg(3)) };
+    let result = unsafe { libc::syscall(number, arg(0), arg(1), arg(2), arg(3), arg(4), arg(5)) };
     if result < 0 {
         Err(host_errno())
     } else {
@@ -1577,7 +1742,13 @@ fn uname(mem: &AddressSpace, buf: u64) -> SysResult {
     // c_char is u8 on AArch64, the only host armor targets (ADR-0002).
     let field = |chars: &[libc::c_char]| chars.to_vec();
     let mut machine = [0u8; 65];
-    machine[..6].copy_from_slice(b"x86_64");
+    // Under the PER_LINUX32 persona x86-64 Linux says i686.
+    let name: &[u8] = if system::linux32() {
+        b"i686"
+    } else {
+        b"x86_64"
+    };
+    machine[..name.len()].copy_from_slice(name);
     // Six 65-byte fields, the same layout on both architectures.
     let mut out = Vec::with_capacity(390);
     out.extend(field(&names.sysname));
@@ -3433,6 +3604,7 @@ fn clone(
     let mut child_thread = Thread {
         signals: thread.signals.for_new_thread(),
         clear_child_tid: 0,
+        seccomp: thread.seccomp.clone(),
     };
     if flags & CLONE_CHILD_CLEARTID != 0 {
         child_thread.clear_child_tid = child_tid;

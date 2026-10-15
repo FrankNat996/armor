@@ -41,6 +41,7 @@ runuser -u builder -- bash -c '
       "cargo xtask difftest" \
       "cargo xtask difftest --lockstep" \
       "env ARMOR_HOST_FEATURES=baseline cargo xtask difftest" \
+      "cargo xtask difftest --native" \
       "cargo xtask encoder-check" \
       "cargo xtask sandbox-check"; do
     echo "::group::$step"

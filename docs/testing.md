@@ -247,6 +247,9 @@ Every JIT increment has its own mutation tests (`tech/jit.md`). When a mutation 
 Many instructions leave some flags **architecturally undefined**: qemu, the hardware and armor may legitimately produce different values.
 Every test compares RFLAGS through a **mask** that contains only the flags defined for that instruction (`FLAGS_STATUS`, `FLAGS_NO_AF`, …). Examples and sources in `tech/x86-64-flags.md`.
 
+## Native oracle (ADR-0044, since 2026-10-15)
+For syscalls that armor hands to the host kernel (keys, NUMA policies, file handles, the administrators' calls), qemu often has no implementation and the Xeon's container filters some of them. **`difftest --native`** runs the C tests listed in `NATIVE_ORACLE` (`difftest.rs`; today `system_calls`) built for AArch64 with the host's compiler (`target/guest/native/`), on this machine, as the reference: the same kernel answers the native program and armor's guest. Those cases run only with `--native` (the other modes skip them), and the chain runs it. Also new on 2026-10-15, compared with the Xeon only (`HARDWARE_ONLY`, qemu lacks the calls): `identity_calls`, `signalfd`, `process_calls`, `message_queues`, `linux_aio`, `seccomp`; `xattr_splice` with qemu as well.
+
 ## Other page sizes (roadmap M9, since 2026-10-15)
 armor runs on hosts with 4K, 16K and 64K pages. The Pi 5 boots one kernel at a time, so the other sizes are measured in KVM virtual machines on it (QEMU 10.0.13, `-cpu host`, 4 CPUs, 3 GiB):
 - **16K:** Debian 13's cloud image (`debian-13-genericcloud-arm64.qcow2`, SHA-512 checked against Debian's list) with Debian's own 16K kernel, `linux-image-arm64-16k` (`6.12.111+deb13-arm64-16k`, `getconf PAGESIZE` = 16384);

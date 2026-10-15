@@ -748,7 +748,7 @@ impl Signals {
 
 /// The host signal set for guest set `blocked`, minus the signals armor
 /// keeps.
-fn host_set(blocked: u64) -> libc::sigset_t {
+pub(crate) fn host_set(blocked: u64) -> libc::sigset_t {
     // SAFETY: an all-zero sigset is valid; sigemptyset initializes it.
     let mut set: libc::sigset_t = unsafe { std::mem::zeroed() };
     // SAFETY: set is a valid sigset_t for these calls.

@@ -23,7 +23,7 @@ What runs where, and how it was checked (`testing.md`, "Other page sizes" and "O
 
 | Machine | CPU | Pages | System | x86 Linux programs (armor) | Windows programs (Hangover 11.16) | Steam ARM64 client |
 |---|---|---|---|---|---|---|
-| Raspberry Pi 5 | Cortex-A76 (ARMv8.2, LSE, LRCPC) | 4K | Debian 13 | ✅ 467/467 `difftest` against qemu with every engine, 267 against the Xeon | ✅ the entries below | ✅ |
+| Raspberry Pi 5 | Cortex-A76 (ARMv8.2, LSE, LRCPC) | 4K | Debian 13 | ✅ 470/470 `difftest` against qemu with every engine, 281 against the Xeon, 3 against the native oracle | ✅ the entries below | ✅ |
 | GitHub's ARM64 Linux runner (`.github/workflows/arm64.yml`, at every push) | Neoverse-N2 (ARMv9.0, SVE2, LSE2) | 4K | Debian 13 container on Ubuntu 24.04, kernel `6.17.0-1022-azure` | ✅ 467/467 `difftest` against qemu with every engine and on the ARMv8.0 paths | not tried | not tried |
 | Raspberry Pi 5, JIT forced to ARMv8.0 | the same, without LSE and `LDAPR` | 4K | Debian 13 | ✅ 467/467 | — | — |
 | KVM virtual machine on the Pi 5 | Cortex-A76 | 16K | Debian 13, kernel `6.12.111+deb13-arm64-16k` | ✅ 454/454 against the 4K results, every engine and the ARMv8.0 paths | ✅ 7-Zip x64 (archive identical to its ARM64 build), Notepad++ | ❌ needs 4K pages |
