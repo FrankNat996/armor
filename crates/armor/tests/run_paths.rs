@@ -214,6 +214,52 @@ fn host_system_scripts_use_the_host_interpreter() {
     assert_eq!(out.status.code(), Some(7), "{out:?}");
 }
 
+/// The x86-64 executable of `x86_64_exit_7` with `code` in place of its
+/// code.
+fn x86_64_with_code(code: &[u8]) -> Vec<u8> {
+    let code_offset = 64 + 56;
+    let mut f = x86_64_exit_7();
+    f.truncate(code_offset);
+    f.extend(code);
+    let size = f.len() as u64;
+    // filesz and memsz of the single PT_LOAD.
+    f[64 + 32..64 + 40].copy_from_slice(&size.to_le_bytes());
+    f[64 + 40..64 + 48].copy_from_slice(&size.to_le_bytes());
+    f
+}
+
+#[test]
+fn a_guest_killed_by_a_fault_leaves_a_small_core() {
+    // xor ecx, ecx; mov eax, 1; div ecx: #DE, so SIGFPE with a core dump.
+    let program = temp_file(
+        "divide-by-zero",
+        &x86_64_with_code(&[0x31, 0xc9, 0xb8, 1, 0, 0, 0, 0xf7, 0xf1]),
+    );
+    let dir = std::env::temp_dir().join(format!("armor-core-{}", std::process::id()));
+    fs::create_dir_all(&dir).unwrap();
+    // Through a shell, for `ulimit -c`: cores on, as where the kernel pipes
+    // them to a handler, which ignores the limit.
+    let out = Command::new("sh")
+        .arg("-c")
+        .arg("ulimit -c unlimited; exec \"$0\" \"$1\"")
+        .arg(env!("CARGO_BIN_EXE_armor"))
+        .arg(&program)
+        .current_dir(&dir)
+        .env_remove("ARMOR_ROOT")
+        .output()
+        .unwrap();
+    use std::os::unix::process::ExitStatusExt;
+    assert_eq!(out.status.signal(), Some(8), "{out:?}");
+    // Where the kernel writes cores into the working directory (the
+    // Raspberry Pi), armor's is the headers alone, not its address space
+    // (34 GB before).
+    for entry in fs::read_dir(&dir).unwrap() {
+        let size = entry.unwrap().metadata().unwrap().len();
+        assert!(size < 1 << 20, "a core of {size} bytes");
+    }
+    let _ = fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn other_files_are_refused_with_a_suggestion() {
     let data = temp_file("data.txt", b"hello\n");

@@ -39,6 +39,12 @@ pub fn reset_signal_dispositions() {
 /// Ends armor the way the kernel would end the guest for `signal` (e.g. a
 /// fault becomes SIGSEGV), so the exit status matches a native run.
 pub fn terminate_by_signal(signal: i32) -> ! {
+    // A core dump of armor says nothing about the guest, and armor's
+    // address space is large (the JIT's 32 GiB permission table, the
+    // guest's memory): where the kernel pipes cores to a handler (Ubuntu's
+    // apport, GitHub's runners) dumping it took minutes. Mappings are left
+    // out of the dump; the exit status still says the core was dumped.
+    let _ = std::fs::write("/proc/self/coredump_filter", "0");
     // SAFETY: restoring the default disposition and raising a signal have no
     // memory-safety preconditions. The Rust runtime installs its own SIGSEGV
     // handler, so the default must be restored first.

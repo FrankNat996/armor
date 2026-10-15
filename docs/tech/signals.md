@@ -8,6 +8,7 @@ State as of 2026-10-12 (with additions of 2026-10-14, marked): **delivery to the
   - Later instances of the same signal stay pending in the host kernel, which queues them as for a native process. This also holds for real-time signals.
   - The guest's `SIG_DFL` and `SIG_IGN` become the same disposition in the host, so the kernel carries out the default actions (termination, ignoring).
 - **Synchronous** (faults): armor generates them from the interpreter's errors (`fault_signal`). A fault with the signal blocked or ignored terminates the process, as Linux does (it forces the default action).
+- **Termination by a fault** (`terminate_by_signal`): armor restores the default action and raises the signal on itself, so the exit status is a native run's (killed by SIGSEGV, SIGFPE, … with "core dumped"). Since 2026-10-15 armor first writes `0` to `/proc/self/coredump_filter`, so its core holds the headers only (32 KB instead of 34 GB of mostly empty address space: the JIT's permission table and the guest's memory). ✅ Found on GitHub's ARM64 runner, where the kernel pipes cores to a handler: every `faults/*` case outlasted `difftest`'s two minutes while the core was streamed. Test `a_guest_killed_by_a_fault_leaves_a_small_core` (`crates/armor/tests/run_paths.rs`, fails without it).
 
   | Interpreter error | Signal | `si_code` | `si_addr` | trapno |
   |---|---|---|---|---|
