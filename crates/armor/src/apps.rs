@@ -1219,9 +1219,26 @@ fn install_zip(
         };
         fs::create_dir_all(&games).map_err(|e| format!("{}: {e}", games.display()))?;
         fs::rename(&unpacked, &dest).map_err(|e| format!("{}: {e}", dest.display()))?;
+        // Menu entries for the graphical programs, when there are any: a
+        // console program (7-Zip's `7z.exe`) does nothing from a menu.
+        const GRAPHICAL: u16 = 2;
+        let subsystem = |program: &String| {
+            fs::read(dest.join(program))
+                .ok()
+                .and_then(|bytes| crate::inspect::pe_subsystem(&bytes))
+        };
+        let graphical: Vec<&String> = programs
+            .iter()
+            .filter(|p| subsystem(p) == Some(GRAPHICAL))
+            .collect();
+        let shown: Vec<&String> = if graphical.is_empty() {
+            programs.iter().collect()
+        } else {
+            graphical
+        };
         let icons = app.join("icons");
         let mut entries = Vec::new();
-        for (n, program) in programs.iter().enumerate() {
+        for (n, program) in shown.into_iter().enumerate() {
             let host = dest.join(program);
             let Some(windows) = crate::shortcuts::windows_path(&prefix, &host) else {
                 continue;

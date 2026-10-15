@@ -398,6 +398,16 @@ pub(crate) fn pe_machine(file: &[u8]) -> Option<u16> {
     (header[..4] == *b"PE\0\0").then(|| u16::from_le_bytes([header[4], header[5]]))
 }
 
+/// The subsystem of a PE file (`IMAGE_SUBSYSTEM_*`: 2 a graphical
+/// program, 3 a console one), at offset 68 of the optional header in both
+/// PE32 and PE32+.
+pub(crate) fn pe_subsystem(file: &[u8]) -> Option<u16> {
+    pe_machine(file)?;
+    let pe_offset = u32::from_le_bytes(file.get(0x3c..0x40)?.try_into().ok()?) as usize;
+    let at = pe_offset.checked_add(24 + 68)?;
+    Some(u16::from_le_bytes(file.get(at..at + 2)?.try_into().ok()?))
+}
+
 fn inspect_pe(machine: u16) -> Report {
     // COFF machine values from the PE/COFF specification.
     let name = match machine {
@@ -496,6 +506,16 @@ mod tests {
         f[0x80..0x84].copy_from_slice(b"PE\0\0");
         f[0x84..0x86].copy_from_slice(&machine.to_le_bytes());
         f
+    }
+
+    #[test]
+    fn the_pe_subsystem_is_read() {
+        let mut f = pe(0x8664);
+        assert_eq!(pe_subsystem(&f), None, "too short for an optional header");
+        f.resize(0x80 + 24 + 70, 0);
+        f[0x80 + 24 + 68..0x80 + 24 + 70].copy_from_slice(&2u16.to_le_bytes());
+        assert_eq!(pe_subsystem(&f), Some(2));
+        assert_eq!(pe_subsystem(b"not a PE"), None);
     }
 
     #[test]
