@@ -296,6 +296,9 @@ pub fn exec_native(path: &[u8], args: &[Vec<u8>], env: &[Vec<u8>]) -> i64 {
 }
 
 fn exec_host(path: &[u8], args: &[Vec<u8>], env: &[Vec<u8>]) -> Result<i64, i64> {
+    // A native program dumps cores as it would without armor; a new armor
+    // limits its own again.
+    crate::restore_core_dumps();
     let c = |bytes: &Vec<u8>| CString::new(bytes.clone()).map_err(|_| -i64::from(libc::EINVAL));
     let path = CString::new(path.to_vec()).map_err(|_| -i64::from(libc::EINVAL))?;
     let args = args.iter().map(c).collect::<Result<Vec<_>, _>>()?;

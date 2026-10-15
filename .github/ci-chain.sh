@@ -3,7 +3,9 @@
 # machine's system: the same gcc, glibc and qemu 10), run by
 # .github/workflows/arm64.yml with the repository at /src. The tools are
 # installed as root; the chain runs as a normal user, since some tests check
-# permissions. Every step runs, and the script fails if any did.
+# permissions. The container is privileged, to register qemu with
+# binfmt_misc and for --sandbox. Every step runs, and the script fails if
+# any did.
 set -u
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -q >/dev/null
@@ -11,6 +13,12 @@ apt-get install -y -q --no-install-recommends ca-certificates curl git build-ess
     gcc-x86-64-linux-gnu libc6-dev-amd64-cross binutils-x86-64-linux-gnu \
     gcc-i686-linux-gnu libc6-dev-i386-cross nasm qemu-user xz-utils bzip2 >/dev/null
 qemu-x86_64 --version | head -1
+# qemu runs the x86 programs that a test program starts with execve only
+# through binfmt_misc, as on the development machine (qemu-user-binfmt,
+# with the F flag: the kernel keeps this qemu open for every namespace).
+mountpoint -q /proc/sys/fs/binfmt_misc || mount -t binfmt_misc binfmt_misc /proc/sys/fs/binfmt_misc
+apt-get install -y -q --no-install-recommends qemu-user-binfmt >/dev/null
+grep -E "interpreter|flags" /proc/sys/fs/binfmt_misc/qemu-x86_64 /proc/sys/fs/binfmt_misc/qemu-i386
 useradd -m builder
 cp -a /src /home/builder/armor
 chown -R builder: /home/builder/armor

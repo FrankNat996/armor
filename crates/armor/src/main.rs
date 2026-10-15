@@ -455,6 +455,7 @@ fn main() -> ExitCode {
             ));
         }
     };
+    armor_linux::limit_core_dumps();
     let program = &program;
     let arg_bytes: Vec<&[u8]> = std::iter::once(&argv0)
         .chain(&guest_args)

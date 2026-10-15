@@ -250,6 +250,25 @@ fn a_guest_killed_by_a_fault_leaves_a_small_core() {
         .unwrap();
     use std::os::unix::process::ExitStatusExt;
     assert_eq!(out.status.signal(), Some(8), "{out:?}");
+    // The guest's own SIGABRT (glibc's abort), which the kernel delivers
+    // to armor itself: getpid; kill(pid, SIGABRT).
+    let program = temp_file(
+        "abort",
+        &x86_64_with_code(&[
+            0xb8, 39, 0, 0, 0, 0x0f, 0x05, 0x89, 0xc7, 0xbe, 6, 0, 0, 0, 0xb8, 62, 0, 0, 0, 0x0f,
+            0x05,
+        ]),
+    );
+    let out = Command::new("sh")
+        .arg("-c")
+        .arg("ulimit -c unlimited; exec \"$0\" \"$1\"")
+        .arg(env!("CARGO_BIN_EXE_armor"))
+        .arg(&program)
+        .current_dir(&dir)
+        .env_remove("ARMOR_ROOT")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.signal(), Some(6), "{out:?}");
     // Where the kernel writes cores into the working directory (the
     // Raspberry Pi), armor's is the headers alone, not its address space
     // (34 GB before).
