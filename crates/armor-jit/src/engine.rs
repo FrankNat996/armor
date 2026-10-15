@@ -462,6 +462,7 @@ impl Jit {
                     .expect("one block fits in an empty buffer")
             }
         };
+        crate::stats::perf_map(code, words.len() * 4, rip, block.len());
         Entry::Code(code)
     }
 }

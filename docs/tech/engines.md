@@ -166,7 +166,7 @@ Measurements of 2026-10-14 (ADR-0033, "Measurements"; today an item of M7). Pi 5
 | Linux x64 `7zz` | `qemu-x86_64` 10.0.13 | 93.9 |
 | Linux ARM64 `7zz` | native | 21.0 |
 
-**Reading:** on this compression workload FEX costs about 12% more than native (Linux), box64 19%, armor 2.6 times native (0.6 times qemu's time). Under Wine FEX ARM64EC (24.3 s) is close to the Windows ARM64 build (21.9 s). The test root `target/guest/rootfs` does not have `libstdc++.so.6`, which `7zz` asks for; `rootfs-games` does.
+**Reading:** on this compression workload FEX costs about 12% more than native (Linux), box64 19%, armor 2.6 times native (0.6 times qemu's time). Since 2026-10-15 `cargo xtask bench` has a 7-Zip workload of its own (`7zz` compressing a generated 12 MB file to `.xz`, reproducible from the command alone), where armor went from 3.2 to 2.7 times native after the JIT changes of that day (`tech/performance.md`, "7-Zip"). Under Wine FEX ARM64EC (24.3 s) is close to the Windows ARM64 build (21.9 s). The test root `target/guest/rootfs` does not have `libstdc++.so.6`, which `7zz` asks for; `rootfs-games` does.
 
 ### How to reproduce
 ```bash

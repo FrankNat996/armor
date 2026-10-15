@@ -6,6 +6,7 @@
 //! ones (ADR-0029) are `tests/guest/asm32/**/*.S`, named `i386/<path>`.
 //! See docs/testing.md.
 
+mod app_check;
 mod bench;
 mod busybox;
 mod coverage;
@@ -20,6 +21,7 @@ mod glgen;
 mod oracle;
 mod package;
 mod progress;
+mod results;
 mod rootfs;
 mod sandbox_check;
 
@@ -90,7 +92,12 @@ commands:
   distro-check                   the package's archive installed and used in
                                  podman containers of Fedora and Arch Linux
                                  ARM: x86-64 and i386 programs, an x86-64
-                                 .deb, the Windows engine (ADR-0043)";
+                                 .deb, the Windows engine (ADR-0043)
+  app-check [--report] [id...]   install and run real applications under
+                                 Xvfb: a window, or 7-Zip's archive against
+                                 its ARM64 build (ADR-0045)
+  matrix [--check]               render the matrix in COMPATIBILITY_MATRIX.md
+                                 and README.md from docs/results/ (ADR-0045)";
 
 const GUEST_CC: &str = "x86_64-linux-gnu-gcc";
 const QEMU: &str = "qemu-x86_64";
@@ -224,7 +231,17 @@ fn main() -> ExitCode {
             _ => Err(format!("usage: cargo xtask gl-gen [--check]\n\n{USAGE}")),
         },
         Some("gl-check") => gl::check(&Paths::new()),
-        Some("distro-check") => distro::check(&Paths::new()),
+        Some("distro-check") => {
+            let mut rest = args[1..].to_vec();
+            let report = results::take_flag(&mut rest);
+            distro::check(&Paths::new(), report)
+        }
+        Some("app-check") => app_check::run(&args[1..]),
+        Some("matrix") => match &args[1..] {
+            [] => results::run(&Paths::new().root, false),
+            [flag] if flag == "--check" => results::run(&Paths::new().root, true),
+            _ => Err(format!("usage: cargo xtask matrix [--check]\n\n{USAGE}")),
+        },
         Some("coverage") => match &args[1..] {
             [] => coverage::run(false),
             [flag] if flag == "--check" => coverage::run(true),

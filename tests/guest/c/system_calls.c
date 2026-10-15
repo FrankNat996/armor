@@ -21,6 +21,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/quota.h>
 #include <sys/syscall.h>
@@ -131,6 +132,11 @@ int main(void) {
     struct timespec invalid = {1, 2000000000};
     show("clock_settime invalid", syscall(SYS_clock_settime, CLOCK_REALTIME, &invalid));
     privileged("syslog size", syscall(SYS_syslog, 10, NULL, 0));
+    /* FICLONE and FICLONERANGE (Qt copies files with FICLONE) from a
+       descriptor that is not open. */
+    show("FICLONE bad source", ioctl(fd, 0x40049409, -1));
+    long long clone_range[4] = {-1, 0, 0, 0};
+    show("FICLONERANGE bad source", ioctl(fd, 0x4020940d, clone_range));
     unlink(name);
     return 0;
 }

@@ -112,3 +112,35 @@ pub fn interpreted_summary() -> String {
         .collect();
     format!("jit interpreted: {total} instructions; {}", list.join(", "))
 }
+
+/// `/tmp/perf-<pid>.map` when `ARMOR_PERF_MAP` is set: one line per
+/// translated block, its code and the guest address it came from, so that
+/// `perf report` names the JIT's code by the x86 code it runs
+/// (docs/tech/performance.md). Opened at the first block.
+static PERF_MAP: std::sync::OnceLock<Option<std::sync::Mutex<std::fs::File>>> =
+    std::sync::OnceLock::new();
+
+/// Records a published block in the perf map, if there is one.
+pub fn perf_map(code: *const u8, bytes: usize, rip: u64, instructions: usize) {
+    let map = PERF_MAP.get_or_init(|| {
+        std::env::var_os("ARMOR_PERF_MAP")?;
+        let path = format!("/tmp/perf-{}.map", std::process::id());
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .ok()
+            .map(std::sync::Mutex::new)
+    });
+    if let Some(file) = map {
+        use std::io::Write;
+        let line = format!(
+            "{:x} {bytes:x} x86 {rip:#x} ({instructions} instructions)\n",
+            code as usize
+        );
+        let _ = file
+            .lock()
+            .expect("perf map lock")
+            .write_all(line.as_bytes());
+    }
+}

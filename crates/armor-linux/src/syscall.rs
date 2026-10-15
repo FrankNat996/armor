@@ -1526,6 +1526,8 @@ pub(crate) fn record_lock(fd: u64, cmd: u64, raw: [u8; 32]) -> Result<(i64, [u8;
 /// 2026-10-14): request, size, and whether the kernel writes it back. The
 /// structure goes through a host copy.
 const SIOCETHTOOL: u64 = 0x8946;
+/// FICLONE: `_IOW(0x94, 9, int)`.
+const FICLONE: u64 = 0x4004_9409;
 
 const PLAIN_IOCTLS: &[(u64, usize, bool)] = &[
     // UDMABUF_CREATE: a dma-buf from a memfd (memfd, flags, offset, size).
@@ -1543,6 +1545,9 @@ const PLAIN_IOCTLS: &[(u64, usize, bool)] = &[
     // SIOCGIFINDEX: the index of a named interface, the same `struct
     // ifreq` (Spotify).
     (0x8933, 40, true),
+    // FICLONERANGE: `struct file_clone_range` (source descriptor, offset,
+    // length, destination offset: four 64-bit fields).
+    (0x4020_940d, 32, false),
     // SIOCGIWNAME: whether an interface is wireless (its protocol name in
     // a 32-byte `struct iwreq`; this request uses no pointer).
     (0x8b01, 32, true),
@@ -2868,6 +2873,11 @@ fn ioctl(mem: &AddressSpace, fd: u64, request: u64, arg: u64) -> Option<SysResul
     // pointers in `struct iwreq`: answered as a device without them.
     if (0x8b00..=0x8bff).contains(&request) && request != 0x8b01 {
         return Some(Err(err(libc::EOPNOTSUPP)));
+    }
+    // FICLONE: the source descriptor is the argument itself (Qt copies
+    // files with it; KeePassXC). Same number on both.
+    if request == FICLONE {
+        return Some(host(libc::SYS_ioctl, &[fd, request, arg]));
     }
     if let Some(&(_, size, reads)) = PLAIN_IOCTLS.iter().find(|(r, ..)| *r == request) {
         return Some(plain_ioctl(mem, fd, request, arg, size, reads));

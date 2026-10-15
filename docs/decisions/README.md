@@ -55,6 +55,7 @@ Every significant decision has its own file `NNNN-title.md`. ADRs are never dele
 | [0042](0042-hosts-with-16k-and-64k-pages.md) | Hosts with 16K and 64K pages: armor and Hangover as they are, Steam on a 4K kernel | Accepted (2026-10-15) |
 | [0043](0043-other-distributions.md) | Other distributions: one archive of armor, Debian's libraries and Hangover's Debian build everywhere | Accepted (2026-10-15) |
 | [0044](0044-every-x86-64-syscall-handled.md) | Every x86-64 syscall handled: as the kernel would answer | Accepted (2026-10-15) |
+| [0045](0045-matrix-from-recorded-measurements.md) | The compatibility matrix generated from recorded measurements | Accepted (2026-10-15) |
 
 ## Template
 ```markdown

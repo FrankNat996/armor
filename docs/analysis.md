@@ -5,16 +5,18 @@ Written on 2026-10-14 with ADR-0034, which reordered the priorities. It starts f
 ## 1. The goal, in one sentence
 A single application that makes it simple for anyone with an ARM64 computer to use any x86 software — Linux programs, Windows programs and games — without knowing what happens underneath; and a measured reference for development on ARM.
 
-## 2. Where we are (2026-10-14)
+## 2. Where we are (2026-10-15)
+Rewritten on 2026-10-15, after M7–M9 closed; the 2026-10-14 table is in the repository history.
+
 | Layer | What exists, measured | What is missing |
 |---|---|---|
-| Engine for x86 Linux programs (armor) | x86-64 and i386, static and dynamic, threads, signals, exact x87, SSE up to 4.2, JIT with the interpreter as backup; `difftest` 427/427 identical to qemu, 236/236 identical to a real Xeon; 203 real programs (coreutils, busybox, tools, interpreters); first game (Doki Doki Literature Club) up to the first scene (`COMPATIBILITY_MATRIX.md`) | performance (7-Zip Linux: 2.6× native, FEX 1.1×), real graphics and audio (today the x86 libraries in software), AVX |
-| Windows programs | `armor install`/`run`/`list`/`remove` and `armor engine fetch` (Hangover 11.16: Wine ARM64X with FEX; DXVK 2.7.1); 7-Zip x64 from `.exe` and `.msi`, archives identical to the native ARM64 build (`tech/engines.md`) | automatic steps (Wine Mono, runtime components, renderer choice), real applications beyond 7-Zip; Epic stops at the sign-in page (later on 2026-10-14: Wine Mono and the renderer choice automatic, Notepad++ installs and opens; runtime components still missing) |
-| Linux applications (added on 2026-10-14) | `armor install` of x86-64 `.deb`, AppImages and `.tar.*` archives with the Debian libraries they need, verified: XnView MP, KeePassXC and Sublime Text open from the menu | Chromium-based applications (Spotify stops when its renderers exit); Qt's OpenGL probe hangs under armor (software drawing for now); libraries shared between applications on disk |
-| Steam and games | Valve's ARM64 Steam client on the Pi, with sign-in; Proton Experimental (ARM64) and the FEX layer installed by the client, not yet used | Steam installed by armor, a Windows game with Proton, x86 Linux games with GPU and audio |
-| CPUs and systems | Pi 5 with the 4K kernel; armor's JIT also verified in baseline ARMv8.0 mode; armor engine also on 16K pages | no second CPU measured; on 16K pages Hangover, FEX and the ARM64 Steam client do not start; only Debian and Ubuntu |
-| Reference | `difftest` against qemu, against the Xeon, `--lockstep`, `--engine box64|fex`, `bench` | matrix generated from the measurements, a readable page for developers |
-| armor itself | it builds with Rust from source; since 2026-10-14 an arm64 `.deb` in the repository's releases (`v0.1.0`, then `v0.2.0`) | packages for other distributions |
+| Engine for x86 Linux programs (armor) | x86-64 and i386, static and dynamic, threads, signals, exact x87, SSE up to 4.2, JIT with the interpreter as backup; every x86-64 syscall answered (375/375, ADR-0044); `difftest` 470/470 identical to qemu, 281/281 identical to a real Xeon; Doki Doki Literature Club playable on the Pi's GPU with its music (`--host-gl`, ADR-0041) (`COMPATIBILITY_MATRIX.md`) | performance (§3, M10), AVX, Vulkan for Linux programs, the native SDL and X11 libraries |
+| Windows programs | `armor install`/`run`/`list`/`remove`, `armor engine fetch` (Hangover 11.16, DXVK 2.7.1, Wine Mono), Steam's ARM64 Proton when Steam is installed (ADR-0040); Wine Mono, the GPU's renderer and the Visual C++ runtime chosen by armor; 7-Zip (x64 and x86, archives identical to the ARM64 build), Notepad++, KeePass 2 (.NET) and Friday Night Funkin' checked unattended (`app-check`) | Chromium-based applications (Epic's sign-in page), WPF programs, Direct3D 10/11 on the Pi's GPU (v3dv lacks `multiDrawIndirect`), disk space (§4) |
+| Linux applications | `armor install` of x86-64 `.deb`, AppImages and `.tar.*` archives with the Debian libraries they need, verified: XnView MP, KeePassXC and Spotify open (checked unattended), Sublime Text opens on the desktop | Spotify signed in and playing (not tried: an account), Qt's OpenGL probe (software drawing for now), libraries shared between applications on disk |
+| Steam and games | `armor install steam` (Valve's ARM64 client), Windows games with its ARM64 Proton (Doki Doki Literature Club, Friday Night Funkin' from itch.io), an x86 Linux game on the GPU | Direct3D games on the Pi's GPU, games that need Vulkan under armor |
+| CPUs and systems | Cortex-A76 (Pi 5) and Neoverse-N2 (GitHub's runner, at every push); 4K, 16K and 64K pages; Debian, Ubuntu, Fedora, Arch Linux ARM; the JIT's ARMv8.0 paths forced on both CPUs | a real ARMv8.0 CPU (Pi 4); Steam on 16K and 64K pages needs a 4K kernel or a micro-VM (ADR-0042) |
+| Reference | `difftest` against qemu, the Xeon, the native build and saved results, `--lockstep`, `--engine box64\|fex`, `bench`, `app-check`; results recorded per machine and the matrix generated from them (ADR-0045); a guide for developers (`guide.md`) | more machines in the matrix, more applications checked unattended |
+| armor itself | an arm64 `.deb` and a `.tar.gz` with `install.sh` in every release (`v0.4.0`), `armor update`, the window `armor-gui` | packages in the distributions' own repositories |
 
 ## 3. What to do, in order of priority
 
@@ -45,13 +47,14 @@ Completed on 2026-10-15 (`roadmap.md`). Measured on 2026-10-15 (`testing.md`, "O
 3. **Other distributions:** done with ADR-0043: Debian's archive for Linux applications and Hangover's Debian 13 build on any distribution, armor as a `.tar.gz` with `install.sh`; `cargo xtask distro-check` passes on Fedora 42 and Arch Linux ARM.
 
 ### M10 — The reference (always active)
+Completed on 2026-10-15 (`roadmap.md`): items 1 and 3 are done (ADR-0045, `guide.md`); item 2 goes on (7-Zip from 3.2 to 2.7 times native, `tech/performance.md`).
 1. **Matrix generated from the measurements** (days): every row (application, engine, CPU, pages, date, command) produced by `difftest`, `bench` and the application tests, not written by hand.
 2. **Performance of the armor engine** (months, ongoing): profiling of real programs with `perf` (`tech/performance.md`); the native calls of M8 count more than any JIT optimisation.
 3. **Guide for developers** (days).
 
 ## 4. Risks
 - **External components:** Hangover, FEX, DXVK and the ARM64 Steam client have their own bugs (Epic) and their own versions. They are pinned by hash, measured at every update, and nothing is declared that has not been proved.
-- **16K pages:** the external components do not run there; until M9 chooses a route, on those systems only x86 Linux programs under armor work.
+- **16K and 64K pages:** armor's engine and Hangover run there (M9, measured in virtual machines); Valve's ARM64 Steam client and its Proton do not, so Steam needs a 4K kernel or a 4K micro-VM (ADR-0042), not yet measured on hardware without a 4K kernel.
 - **GPU:** graphics depend on the host's Vulkan driver. On the Pi 5 the V3DV driver is not enough for DXVK 2.x: Windows programs with Direct3D use the software renderer (slow).
 - **Disk space:** the Windows engine takes 2.4 GB; every Wine prefix starts at about 2.3 GB (7-Zip installed), Epic's after the update takes 5.1 (measured with `du` on 2026-10-14). It must be shown to the user before installing, and the prefixes should share Wine's files instead of copying them.
 - **Licenses:** Wine LGPL-2.1, FEX and box64 MIT, DXVK zlib; armor redistributes nothing, it downloads them from the source. GPL code (qemu) stays excluded from armor.

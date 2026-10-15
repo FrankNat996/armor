@@ -37,10 +37,10 @@ Summary of the current code (`crates/armor-jit`). The per-increment sections, fu
 - `lockstep.rs`: the instruction-by-instruction oracle;
 - `stats.rs`: translation counters for the whole process (blocks, guest instructions, AArch64 instructions, time), printed at exit when `ARMOR_JIT_STATS` is set. `cargo xtask bench` uses them (`tech/performance.md`). On python startup: 34,503 blocks, 146,657 guest instructions, 3.48 million AArch64 instructions (about 24 per guest instruction, prologues, exits and slow paths included), 100 ms (2026-10-13, after increment 19, which hardly changes this total: dead flags weigh in hot loops, not in the bulk of the code).
 
-**Block.** At most 64 guest instructions; it ends at a jump, at the first untranslated instruction or at the limit. It is an `extern "C" fn(cpu, page_table, context) -> state` function:
-- **prologue**, executed only when the block is called by the engine: saves `x19`–`x30` on the stack, loads the mapped guest registers, `rflags` and the budget, and clears `KIND`. It is 15 instructions; `CHAINED_ENTRY` = 60 bytes;
+**Block.** At most 64 guest instructions; it ends at an unconditional jump, a call or a return, at the first untranslated instruction or at the limit. A conditional jump inside a block is a side exit (since 2026-10-15, below). It is an `extern "C" fn(cpu, page_table, context) -> state` function:
+- **prologue**, executed only when the block is called by the engine: saves `x19`–`x30` on the stack, loads the mapped guest registers, `rflags` and the budget, and clears `KIND`. It is 16 instructions; `CHAINED_ENTRY` = 64 bytes (60 until 2026-10-15, when r10 and r11 got host registers);
 - **body:** at the start it subtracts the block's instruction count from the budget, then the translated instructions;
-- **exits:** towards a known address, a rewritable `b` (chaining); towards a computed address, the lookup in the indirect jump table; otherwise the epilogue;
+- **exits:** towards a known address, a rewritable `b` (chaining); towards a computed address, the lookup in the indirect jump table; otherwise the epilogue. A conditional jump that is not the block's last instruction branches, when taken, to an out-of-line exit with the flags state of that point, and the block goes on;
 - **epilogue**, on the way to the engine: computes the flags still pending, writes registers, `rflags` and `rip` back into the `Cpu`, and returns the status (`Context::status`): continue, interpret the instruction at `rip`, or continue and link the exit.
 
 **Host registers:**
@@ -49,14 +49,14 @@ Summary of the current code (`crates/armor-jit`). The per-increment sections, fu
 |---|---|
 | `x0`, `x1`, `x2` | `Cpu`, page table, `Context` |
 | `x22`–`x29` | rax, rcx, rdx, rbx, rsp, rbp, rsi, rdi |
-| `x3`, `x9`, `x16`, `x17` | r12, r13, r14, r15 (r8–r11 stay in the `Cpu`) |
+| `x3`, `x9`, `x16`, `x17` | r12, r13, r14, r15 |
+| `x18`, `x30` | r10, r11 (since 2026-10-15; r8 and r9 stay in the `Cpu`) |
 | `x12`, `x13` | `rflags`, budget |
 | `x19`, `x20`, `x21` | lazy flags: operands (`FA`, `FB`) and code of the pending operation (`KIND`) |
 | `x4`–`x7`, `x8`, `x10`, `x11`, `x14`, `x15` | temporaries; `x7` is the guest address, `x8` also the exit `rip` |
 | `v0`–`v2` | temporaries for SSE operations with NEON |
-| `x30` | link register (saved: blocks call the flag routine) |
 
-`x18` is not used.
+`x18` is free for programs on Linux (the platform register only elsewhere). `x30` is the link register only for the one call blocks make, to the flag routine (generated code, which touches neither): the block keeps it on the stack around that `blr`.
 
 **Lazy flags.**
 - Instructions that write all the flags by themselves (`add`, `sub`, `cmp`, `and`, `or`, `xor`, `test`, `neg`) and `inc`/`dec` save only the operands.
@@ -532,6 +532,12 @@ In concurrent mode the JIT used two extensions later than ARMv8.0: FEAT_LRCPC (`
 - **New in the encoder:** `LDAR`, `LDAXR`, `STLXR`, `CLREX`, verified by `encoder-check` (12,579 instructions, 0 differences).
 - **`lock cmpxchg16b`** (in `armor-mem`, inline assembly): `CASPAL` with FEAT_LSE, otherwise an `LDAXP`/`STLXP` loop that on a failed comparison writes back the value read (x86 writes in both cases, and only a successful `STLXP` makes the 16-byte read atomic); chosen with `AT_HWCAP` and the same `ARMOR_HOST_FEATURES`. Unit test `compare_exchange_16_both_ways` on both versions.
 - **Verification:** `ARMOR_HOST_FEATURES=baseline` pretends the CPU lacks both extensions, so the ARMv8.0 paths run on the Pi 5 too. `random_code_matches_the_interpreter_on_armv8_0` (1,500 random programs in concurrent mode, JIT and lockstep against the interpreter); mutations caught on the atomic addition and on the `cmpxchg` comparison; with the variable, `threads`, `threads_signals`, `shared_atomics`, `litmus`, `processes`, `shared_memory` (x86-64 and i386) identical to qemu with `--jit` and `--lockstep`, and `shared_atomics` and `litmus` identical in 20 runs out of 20. ⚠️ A real CPU without the extensions (a Pi 4) is missing: until there is one, the variable is the proof.
+
+## Side exits and operands in place (M10, 2026-10-15)
+Found with a profile of 7-Zip (`tech/performance.md`, "7-Zip"):
+- **Side exits.** `ends_block` no longer stops at `jcc`. Inside a block, `jcc` emits only the conditional branch (`branch_if`, with the host condition when the flags are pending) to a label whose code is out of line, after the body: the lazy-flags state of the jump (`side_exits`), then `exit_direct` to the target, chainable like any exit. The fall-through continues in the block with its registers and pending flags, instead of starting a block whose flags are `Lazy::Dynamic` (a `jb` after a `je` called the generic flag routine). Liveness (`live_flags`) needs no change: `jcc` already counts as reading every flag. A `jcc` that is the block's last instruction keeps both exits. The budget is subtracted at the block's start for every instruction, so a side exit counts instructions that did not run: the engine only gets control back a little earlier. Lockstep blocks are one instruction, so side exits are checked by the random tests (`jcc` over an `inc`) and by `difftest` with the JIT.
+- **Operands in place** (`operand_in`, `destination_in`, `whole_register`): a guest register mapped whole, read at 32 or 64 bits, is used directly by ALU operations, `test`, `mov` and as the destination of `movzx`/`movsx`, without a copy into `A`/`B`. A 32-bit operand may have other bits above in its host register, so the lazy flags save 32-bit operands with `mov w` (zero-extending), and a `mov` into a register kept in the `Cpu` still goes through `read_operand`, which zero-extends (the random tests found both).
+- **r10 and r11** in `x18` and `x30` (table above).
 
 ## Postponed
 Traces, SMC through host protection, per-page invalidation. Done after this list: scalar SSE floating point (increment 17), parallelism with TSO (ADR-0023).

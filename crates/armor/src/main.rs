@@ -218,6 +218,10 @@ fn main() -> ExitCode {
         armor_jit::stats::count_interpreted();
     }
     let args: Vec<OsString> = env::args_os().skip(1).collect();
+    if args.len() == 1 && args[0] == "--version" {
+        println!("armor {}", env!("CARGO_PKG_VERSION"));
+        return ExitCode::SUCCESS;
+    }
     if args.first().is_some_and(|a| a == "inspect") {
         return match &args[1..] {
             [path] => inspect_file(path),

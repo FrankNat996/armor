@@ -228,6 +228,19 @@ fn native_build(paths: &Paths, stem: &str) -> Result<PathBuf, String> {
     Ok(out)
 }
 
+/// `qemu-x86_64 <version>`.
+fn qemu_version() -> String {
+    let out = exec(std::process::Command::new(crate::QEMU).arg("--version"))
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+        .unwrap_or_default();
+    let version = out
+        .split_whitespace()
+        .skip_while(|w| *w != "version")
+        .nth(1)
+        .unwrap_or("?");
+    format!("qemu-x86_64 {version}")
+}
+
 /// Saved reference results (`--save`, `--expected`).
 enum Saved {
     Write(PathBuf),
@@ -274,6 +287,10 @@ fn load(dir: &Path, name: &str) -> Result<Output, String> {
 }
 
 pub fn run(args: &[String]) -> Result<(), String> {
+    let mut args = args.to_vec();
+    let report = crate::results::take_flag(&mut args);
+    let command_args = args.join(" ");
+    let args = args.as_slice();
     let (oracle, args) = match args {
         [flag, rest @ ..] if flag == "--oracle" => (Some(Oracle::from_env()?), rest),
         _ => (None, args),
@@ -431,6 +448,55 @@ pub fn run(args: &[String]) -> Result<(), String> {
         }
     }
     println!("{} passed, {failures} failed", runs.len() - failures);
+    if report {
+        if !filter.is_empty() {
+            println!("--report: not recorded, only some cases ran");
+        } else {
+            let baseline = std::env::var("ARMOR_HOST_FEATURES").is_ok_and(|v| v == "baseline");
+            let mut engine = engines
+                .iter()
+                .map(|e| e.name())
+                .collect::<Vec<_>>()
+                .join(", ");
+            engine = format!(
+                "{} {engine}",
+                if engines.iter().all(|e| e.is_armor()) {
+                    "armor"
+                } else {
+                    ""
+                }
+            )
+            .trim()
+            .to_string();
+            if baseline {
+                engine.push_str(", ARMv8.0 paths");
+            }
+            let reference = match (&oracle, &saved) {
+                _ if native => "the same source built for AArch64, run natively".to_string(),
+                (Some(oracle), _) => oracle.describe(),
+                (None, Some(Saved::Read(_))) => {
+                    "qemu-x86_64's results saved on a 4K host".to_string()
+                }
+                _ => qemu_version(),
+            };
+            let env = if baseline {
+                "ARMOR_HOST_FEATURES=baseline "
+            } else {
+                ""
+            };
+            let record = crate::results::Record::now(
+                "suite",
+                "difftest",
+                &engine,
+                &reference,
+                &format!("{}/{}", runs.len() - failures, runs.len()),
+                format!("{env}cargo xtask difftest {command_args}").trim(),
+            );
+            let machine = crate::results::Machine::here();
+            let file = crate::results::record(&paths.root, &machine, &[record])?;
+            println!("recorded in {}", file.display());
+        }
+    }
     if failures == 0 {
         Ok(())
     } else {

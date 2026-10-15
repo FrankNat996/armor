@@ -129,6 +129,7 @@ struct Sample {
 
 pub fn run(args: &[String]) -> Result<(), String> {
     let (mut runs, mut interpreter, mut filter) = (DEFAULT_RUNS, false, Vec::new());
+    let mut report = false;
     let mut others = Vec::new();
     let mut rest = args.iter();
     while let Some(arg) = rest.next() {
@@ -141,6 +142,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
                     .ok_or(USAGE)?;
             }
             "--interpreter" => interpreter = true,
+            "--report" => report = true,
             "--box64" => others.push(Runner::Box64),
             "--fex" => others.push(Runner::Fex),
             name => filter.push(name.to_string()),
@@ -215,6 +217,45 @@ pub fn run(args: &[String]) -> Result<(), String> {
         table.push((workload, samples, broken));
     }
     print_table(&runners, &table, runs);
+    if report {
+        let command = format!(
+            "cargo xtask bench {}",
+            args.join(" ").replace("--report", "")
+        )
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+        let mut records = Vec::new();
+        for (workload, samples, broken) in &table {
+            let native = samples
+                .get(&Runner::Native)
+                .map(|s| median(&mut s.iter().map(|x| x.time).collect::<Vec<_>>()));
+            for &runner in runners.iter().filter(|r| **r != Runner::Native) {
+                let result = match (broken.get(&runner), samples.get(&runner), native) {
+                    (Some(why), _, _) => why.clone(),
+                    (None, Some(s), Some(n)) => {
+                        let t = median(&mut s.iter().map(|x| x.time).collect::<Vec<_>>());
+                        format!(
+                            "{:.3} s, {:.2}× the native time (median of {runs})",
+                            t.as_secs_f64(),
+                            t.as_secs_f64() / n.as_secs_f64()
+                        )
+                    }
+                    _ => continue,
+                };
+                records.push(crate::results::Record::now(
+                    "performance",
+                    &workload.name,
+                    runner.label(),
+                    "the native AArch64 build, same machine",
+                    &result,
+                    &command,
+                ));
+            }
+        }
+        let file = crate::results::record(&paths.root, &crate::results::Machine::here(), &records)?;
+        println!("recorded in {}", file.display());
+    }
     Ok(())
 }
 
@@ -230,6 +271,97 @@ fn build_release_armor(paths: &Paths) -> Result<PathBuf, String> {
         return Err("building armor failed".to_string());
     }
     Ok(paths.root.join("target/release/armor"))
+}
+
+/// 7-Zip 26.04 compressing with LZMA2 (`-txz -mx=9 -mmt=1`, the archive
+/// on stdout, so every engine's output is compared byte for byte): the
+/// Linux x86-64 `7zz` against the native ARM64 one, both from the
+/// downloads of `app-check`, in the games root (it needs libstdc++). The
+/// input is made here from a fixed seed: 10 MB of pseudo-random text
+/// from a small vocabulary and 2 MB of random bytes. Left out when the
+/// downloads or the games root are missing.
+fn seven_zip_workload(paths: &Paths, out: &Path) -> Result<Option<Workload>, String> {
+    let downloads = paths.root.join("target/apps/downloads/7zip-26.04");
+    let games = rootfs::dir_of(paths, rootfs::Arch::Games);
+    let archives = [
+        downloads.join("7z2604-linux-x64.tar.xz"),
+        downloads.join("7z2604-linux-arm64.tar.xz"),
+    ];
+    if !archives.iter().all(|a| a.is_file()) || !rootfs::available_of(paths, rootfs::Arch::Games) {
+        return Ok(None);
+    }
+    let mut programs = Vec::new();
+    for (archive, dir) in archives.iter().zip(["7zip-x64", "7zip-arm64"]) {
+        let dir = out.join(dir);
+        fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+        if !dir.join("7zz").is_file() {
+            exec(
+                Command::new("tar")
+                    .arg("-xf")
+                    .arg(archive)
+                    .arg("-C")
+                    .arg(&dir),
+            )?;
+        }
+        programs.push(dir.join("7zz"));
+    }
+    let input = out.join("7zip-input.bin");
+    let mut state: u64 = 0x9e37_79b9_7f4a_7c15;
+    let mut next = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    const WORDS: [&str; 24] = [
+        "armor",
+        "translates",
+        "x86",
+        "programs",
+        "to",
+        "AArch64",
+        "the",
+        "guest",
+        "memory",
+        "page",
+        "register",
+        "flags",
+        "signal",
+        "thread",
+        "kernel",
+        "file",
+        "window",
+        "library",
+        "and",
+        "with",
+        "for",
+        "each",
+        "result",
+        "compressed",
+    ];
+    let mut data = Vec::with_capacity(12 << 20);
+    while data.len() < 10 << 20 {
+        let word = WORDS[(next() % WORDS.len() as u64) as usize];
+        data.extend_from_slice(word.as_bytes());
+        data.push(if next() % 12 == 0 { b'\n' } else { b' ' });
+    }
+    while data.len() < 12 << 20 {
+        data.extend_from_slice(&next().to_le_bytes());
+    }
+    fs::write(&input, &data).map_err(|e| format!("{}: {e}", input.display()))?;
+    let args: Vec<String> = ["a", "-txz", "-mx=9", "-mmt=1", "-so", "-an"]
+        .iter()
+        .map(|s| s.to_string())
+        .chain([input.display().to_string()])
+        .collect();
+    Ok(Some(Workload {
+        name: "7zip".to_string(),
+        what: "7-Zip 26.04 (Linux 7zz) compressing 12 MB with LZMA2, one thread".to_string(),
+        guest: programs[0].clone(),
+        root: games,
+        args: args.clone(),
+        native: Some((programs[1].clone(), args)),
+    }))
 }
 
 fn workloads(paths: &Paths) -> Result<Vec<Workload>, String> {
@@ -288,6 +420,9 @@ fn workloads(paths: &Paths) -> Result<Vec<Workload>, String> {
             args: Vec::new(),
             native: Some((native, Vec::new())),
         });
+    }
+    if let Some(seven_zip) = seven_zip_workload(paths, &out)? {
+        list.push(seven_zip);
     }
     if !rootfs::available(paths) {
         return Err(

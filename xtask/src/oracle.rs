@@ -48,6 +48,22 @@ impl Oracle {
         options
     }
 
+    /// The oracle's CPU and kernel, for the results (ADR-0045).
+    pub fn describe(&self) -> String {
+        let out = crate::exec(
+            &mut self.ssh("grep -m1 'model name' /proc/cpuinfo | cut -d: -f2; uname -r"),
+        );
+        let text = out
+            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+            .unwrap_or_default();
+        let mut lines = text.lines().map(str::trim);
+        format!(
+            "x86-64 hardware: {}, Linux {}",
+            lines.next().unwrap_or("unknown CPU"),
+            lines.next().unwrap_or("?")
+        )
+    }
+
     fn ssh(&self, command: &str) -> Command {
         let mut cmd = Command::new("ssh");
         cmd.args(self.options()).arg(&self.destination).arg(command);

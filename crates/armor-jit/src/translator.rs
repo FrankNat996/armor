@@ -7,7 +7,7 @@
 //!   interpreter. In concurrent mode (ADR-0023) `supported_concurrent`:
 //!   accesses are ordered like x86's TSO (`guest_load`, `guest_store`) and
 //!   atomic instructions use LSE atomics (`Translator::atomic`).
-//! - **Registers:** 12 guest registers live in host registers (`GUEST`),
+//! - **Registers:** 14 guest registers live in host registers (`GUEST`),
 //!   loaded by the prologue and stored by the epilogue; the others stay in
 //!   the `Cpu`.
 //! - **Flags are lazy:** the operands of the last flag-setting instruction
@@ -65,7 +65,7 @@ pub const EXIT_CHAIN: u64 = 2;
 pub const MAX_BLOCK_INSTRUCTIONS: usize = 64;
 
 /// Offset of the entry that chained blocks jump to: after the prologue.
-pub const CHAINED_ENTRY: usize = 60;
+pub const CHAINED_ENTRY: usize = 64;
 
 /// What a block reads and writes besides the `Cpu`.
 #[derive(Debug, Default)]
@@ -223,8 +223,8 @@ const GUEST: [Option<HostReg>; 16] = {
         h(29),
         None,
         None,
-        None,
-        None,
+        h(18),
+        h(30),
         h(3),
         h(9),
         h(16),
@@ -666,12 +666,13 @@ fn host_condition(p: Pending, cond: X86Cond) -> Option<Cond> {
     })
 }
 
-/// Whether `insn` ends a basic block.
+/// Whether `insn` ends a block: an unconditional change of `rip`. A
+/// conditional jump leaves the block only when taken (a side exit), so
+/// that what follows it shares the block's registers and lazy flags.
 pub fn ends_block(insn: &Instruction) -> bool {
     matches!(
         insn.op,
         Op::Jmp { .. }
-            | Op::Jcc { .. }
             | Op::Call { .. }
             | Op::CallIndirect(_)
             | Op::JmpIndirect(_)
@@ -797,6 +798,8 @@ pub fn translate(
         a: Assembler::new(),
         epilogue: None,
         slow_paths: Vec::new(),
+        side_exits: Vec::new(),
+        last: false,
         chain_stubs: Vec::new(),
         page_edges: Vec::new(),
         unaligned: Vec::new(),
@@ -844,7 +847,7 @@ pub fn translate(
     assert_eq!(
         t.a.len() * 4,
         CHAINED_ENTRY,
-        "the prologue is twelve pairs, two loads and a move"
+        "the prologue is thirteen pairs, two loads and a move"
     );
     // The budget: when it runs out, back to the engine before this block.
     let start = block.first().expect("a block has an instruction").rip;
@@ -853,8 +856,9 @@ pub fn translate(
     t.a.b_cond(Cond::Mi, out_of_budget);
     let mut fell_through = true;
     let live = live_flags(block);
-    for (g, &live) in block.iter().zip(&live) {
+    for (i, (g, &live)) in block.iter().zip(&live).enumerate() {
         t.live = live;
+        t.last = i + 1 == block.len();
         assert!(
             supported(&g.insn),
             "translating an unsupported {:?}",
@@ -881,6 +885,11 @@ pub fn translate(
     }
     // Out-of-line code: each piece starts with the lazy-flags state of
     // the point it is reached from.
+    for (label, rip, lazy) in std::mem::take(&mut t.side_exits) {
+        t.a.bind(label);
+        t.lazy = lazy;
+        t.exit_direct(rip)?;
+    }
     t.a.bind(out_of_budget);
     t.lazy = Lazy::Dynamic;
     t.exit(start, EXIT_CONTINUE)?;
@@ -973,6 +982,8 @@ pub fn flags_routine() -> Result<Vec<u32>, EncodeError> {
         a: Assembler::new(),
         epilogue: None,
         slow_paths: Vec::new(),
+        side_exits: Vec::new(),
+        last: false,
         chain_stubs: Vec::new(),
         page_edges: Vec::new(),
         unaligned: Vec::new(),
@@ -1049,6 +1060,18 @@ enum Loc {
     Host(HostReg, u32),
     /// Bytes in the `Cpu` at this offset.
     Mem(u32),
+}
+
+/// The host register of a guest register operand mapped whole, when
+/// `size` lets an operation read it in place (`operand_in`).
+fn whole_register(operand: Operand, size: Size) -> Option<HostReg> {
+    match operand {
+        Operand::Reg(reg) if matches!(size, Size::B32 | Size::B64) => match location(reg)? {
+            Loc::Host(h, 0) => Some(h),
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 fn location(reg: Reg) -> Option<Loc> {
@@ -1171,6 +1194,11 @@ struct Translator {
     epilogue: Option<Label>,
     /// Slow paths: label, instruction, lazy flags at that instruction.
     slow_paths: Vec<(Label, u64, Lazy)>,
+    /// Out of line: the taken side of a conditional jump inside the block
+    /// (label, target, lazy flags at the jump).
+    side_exits: Vec<(Label, u64, Lazy)>,
+    /// The instruction being translated is the block's last.
+    last: bool,
     /// Lazy flags at the current point of the emitted code.
     lazy: Lazy,
     /// Chainable exits: the patchable `b`, its stub, the target.
@@ -1221,7 +1249,7 @@ impl Translator {
         // the lazy flags in `FLAGS` first.
         if touches_flags(insn)
             && !lazy_flags(insn)
-            && !matches!(insn.op, Op::Jcc { .. })
+            && !matches!(insn.op, Op::Jcc { .. } | Op::Cmov { .. } | Op::Setcc { .. })
             && !self.skip_flags
             && !overwrites
         {
@@ -1242,29 +1270,51 @@ impl Translator {
                     self.a.dmb(Barrier::Ish);
                 }
             }
-            Op::Mov { dst, src } => {
-                self.read_operand(B, src, size, at, &mut slow)?;
-                self.write_operand(dst, size, B, at, &mut slow)?;
-            }
+            Op::Mov { dst, src } => match whole_register(dst, size) {
+                // Straight into the mapped register: a load or an
+                // immediate lands there, a register is one move.
+                Some(h) => {
+                    let b = self.operand_in(h, src, size, at, &mut slow)?;
+                    // `mov r32, same r32` still clears the top half.
+                    if b != h || (size == Size::B32 && src == dst) {
+                        self.a.mov(w, h, b);
+                    }
+                }
+                // A store writes only `size` bytes; a register kept in
+                // memory takes 64 bits, zero-extended by `read_operand`.
+                None if matches!(dst, Operand::Mem(_)) => {
+                    let b = self.operand_in(B, src, size, at, &mut slow)?;
+                    self.write_operand(dst, size, b, at, &mut slow)?;
+                }
+                None => {
+                    self.read_operand(B, src, size, at, &mut slow)?;
+                    self.write_operand(dst, size, B, at, &mut slow)?;
+                }
+            },
             Op::Extend {
                 signed,
                 dst,
                 src,
                 src_size,
             } => {
+                // Straight into a mapped destination of 32 or 64 bits.
+                let rt = whole_register(Operand::Reg(dst), size).unwrap_or(B);
                 match src {
-                    Operand::Reg(reg) => self.read_reg(signed, B, reg, src_size)?,
+                    Operand::Reg(reg) => self.read_reg(signed, rt, reg, src_size)?,
                     Operand::Mem(m) => {
                         self.address(&m, next, true)?;
                         self.check(Check::Read, bytes(src_size), at.rip, &mut slow)?;
-                        self.guest_load(signed, src_size, B)?;
+                        self.guest_load(signed, src_size, rt)?;
                     }
                     Operand::Imm(_) => unreachable!("checked by supported"),
                 }
-                if w == Width::W {
-                    self.a.mov(Width::W, B, B);
+                // Zero-extended loads and UBFX already clear the top half.
+                if w == Width::W && signed {
+                    self.a.mov(Width::W, rt, rt);
                 }
-                self.store_reg(dst, size, B)?;
+                if rt == B {
+                    self.store_reg(dst, size, B)?;
+                }
             }
             Op::Lea { dst, src } => {
                 // LEA computes the offset only: no segment base.
@@ -1275,15 +1325,15 @@ impl Translator {
                 self.store_reg(dst, size, ADDR)?;
             }
             Op::Alu { op, dst, src } => {
-                self.read_destination(dst, size, at, &mut slow, op != AluOp::Cmp)?;
-                self.read_operand(B, src, size, at, &mut slow)?;
+                let a = self.destination_in(dst, size, at, &mut slow, op != AluOp::Cmp)?;
+                let b = self.operand_in(B, src, size, at, &mut slow)?;
                 let kind = match op {
                     AluOp::Add => {
-                        self.arith(false, size, A, B)?;
+                        self.arith(false, size, a, b)?;
                         FlagKind::Add
                     }
                     AluOp::Sub | AluOp::Cmp => {
-                        self.arith(true, size, A, B)?;
+                        self.arith(true, size, a, b)?;
                         FlagKind::Sub
                     }
                     AluOp::Adc => {
@@ -1291,7 +1341,7 @@ impl Translator {
                         self.a.shift_imm(Shift::Lsl, Width::X, T1, FLAGS, 29)?;
                         self.a.logic_imm(Logic::And, Width::X, T1, T1, 1 << 29)?;
                         self.a.write_flags(T1);
-                        self.a.adc(w, R, A, B, true);
+                        self.a.adc(w, R, a, b, true);
                         FlagKind::Add
                     }
                     AluOp::Sbb => {
@@ -1300,7 +1350,7 @@ impl Translator {
                         self.a.logic_imm(Logic::Eor, Width::X, T1, T1, 1 << 29)?;
                         self.a.logic_imm(Logic::And, Width::X, T1, T1, 1 << 29)?;
                         self.a.write_flags(T1);
-                        self.a.sbc(w, R, A, B, true);
+                        self.a.sbc(w, R, a, b, true);
                         FlagKind::Sub
                     }
                     AluOp::And | AluOp::Or | AluOp::Xor => {
@@ -1309,24 +1359,24 @@ impl Translator {
                             AluOp::Or => Logic::Orr,
                             _ => Logic::Eor,
                         };
-                        self.a.logic(logic, false, w, R, A, B, Shift::Lsl, 0)?;
+                        self.a.logic(logic, false, w, R, a, b, Shift::Lsl, 0)?;
                         FlagKind::Logic
                     }
                 };
                 if matches!(op, AluOp::Adc | AluOp::Sbb) {
-                    self.flags(kind, A, B, STATUS_FLAGS)?;
+                    self.flags(kind, a, b, STATUS_FLAGS)?;
                 } else {
-                    self.defer(kind, size, A, B, STATUS_FLAGS);
+                    self.defer(kind, size, a, b, STATUS_FLAGS);
                 }
                 if op != AluOp::Cmp {
                     self.write_destination(dst, size, R)?;
                 }
             }
             Op::Test { a, b } => {
-                self.read_operand(A, a, size, at, &mut slow)?;
-                self.read_operand(B, b, size, at, &mut slow)?;
-                self.a.logic(Logic::And, false, w, R, A, B, Shift::Lsl, 0)?;
-                self.defer(FlagKind::Logic, size, A, B, STATUS_FLAGS);
+                let a = self.operand_in(A, a, size, at, &mut slow)?;
+                let b = self.operand_in(B, b, size, at, &mut slow)?;
+                self.a.logic(Logic::And, false, w, R, a, b, Shift::Lsl, 0)?;
+                self.defer(FlagKind::Logic, size, a, b, STATUS_FLAGS);
             }
             Op::Unary { op, dst } => {
                 self.read_destination(dst, size, at, &mut slow, true)?;
@@ -1551,18 +1601,28 @@ impl Translator {
                 // when nothing moves.
                 self.read_operand(B, src, size, at, &mut slow)?;
                 self.load_reg(A, dst, size)?;
-                let (reg, bit, when_set) = self.condition_bit(cond)?;
-                self.a.logic_imm(Logic::Ands, Width::X, ZR, reg, 1 << bit)?;
-                let moves = if when_set { Cond::Ne } else { Cond::Eq };
+                let moves = match self.host_condition_now(cond)? {
+                    Some(host) => host,
+                    None => {
+                        let (reg, bit, when_set) = self.condition_bit(cond)?;
+                        self.a.logic_imm(Logic::Ands, Width::X, ZR, reg, 1 << bit)?;
+                        if when_set { Cond::Ne } else { Cond::Eq }
+                    }
+                };
                 self.a.csel(Select::Csel, w, R, B, A, moves);
                 self.store_reg(dst, size, R)?;
             }
             Op::Setcc { cond, dst } => {
-                let (reg, bit, when_set) = self.condition_bit(cond)?;
-                self.a.shift_imm(Shift::Lsr, Width::X, B, reg, bit)?;
-                self.a.logic_imm(Logic::And, Width::X, B, B, 1)?;
-                if !when_set {
-                    self.a.logic_imm(Logic::Eor, Width::X, B, B, 1)?;
+                match self.host_condition_now(cond)? {
+                    Some(host) => self.a.cset(Width::X, B, host),
+                    None => {
+                        let (reg, bit, when_set) = self.condition_bit(cond)?;
+                        self.a.shift_imm(Shift::Lsr, Width::X, B, reg, bit)?;
+                        self.a.logic_imm(Logic::And, Width::X, B, B, 1)?;
+                        if !when_set {
+                            self.a.logic_imm(Logic::Eor, Width::X, B, B, 1)?;
+                        }
+                    }
                 }
                 self.write_operand(dst, Size::B8, B, at, &mut slow)?;
             }
@@ -1628,6 +1688,15 @@ impl Translator {
             Op::Jmp { rel } => {
                 self.exit_direct(target(next, rel, size))?;
                 return Ok(false);
+            }
+            // Inside the block, the taken side leaves out of line and the
+            // block goes on: the flags stay as they are for what follows.
+            Op::Jcc { cond, rel } if !self.last => {
+                let taken = self.a.new_label();
+                self.branch_if(cond, taken)?;
+                self.side_exits
+                    .push((taken, target(next, rel, size), self.lazy));
+                return Ok(true);
             }
             Op::Jcc { cond, rel } => {
                 let taken = self.a.new_label();
@@ -3089,7 +3158,7 @@ impl Translator {
     /// Loads (`load`) or stores the guest registers kept in host
     /// registers from or to `Cpu::regs`, in pairs.
     fn guest_registers(&mut self, load: bool) -> Emit {
-        for (first, second) in [(0, 1), (2, 3), (4, 5), (6, 7), (12, 13), (14, 15)] {
+        for (first, second) in [(0, 1), (2, 3), (4, 5), (6, 7), (10, 11), (12, 13), (14, 15)] {
             let (a, b) = (GUEST[first], GUEST[second]);
             let (a, b) = (a.expect("mapped"), b.expect("mapped"));
             self.a.pair(
@@ -3137,6 +3206,42 @@ impl Translator {
                 Ok(())
             }
         }
+    }
+
+    /// The host register holding `operand` at `size` without a copy: the
+    /// guest register itself when it is mapped whole and `size` is 32 or
+    /// 64 bits (a W operation reads only the low half), otherwise `rt`
+    /// after `read_operand`.
+    fn operand_in(
+        &mut self,
+        rt: HostReg,
+        operand: Operand,
+        size: Size,
+        at: Site,
+        slow: &mut Option<Label>,
+    ) -> Emit<HostReg> {
+        if let Some(h) = whole_register(operand, size) {
+            return Ok(h);
+        }
+        self.read_operand(rt, operand, size, at, slow)?;
+        Ok(rt)
+    }
+
+    /// `read_destination`, or the mapped register itself as in
+    /// `operand_in`.
+    fn destination_in(
+        &mut self,
+        dst: Operand,
+        size: Size,
+        at: Site,
+        slow: &mut Option<Label>,
+        writes: bool,
+    ) -> Emit<HostReg> {
+        if let Some(h) = whole_register(dst, size) {
+            return Ok(h);
+        }
+        self.read_destination(dst, size, at, slow, writes)?;
+        Ok(A)
     }
 
     /// Writes `rt` to a register or memory operand (see `store_reg`).
@@ -3566,11 +3671,18 @@ impl Translator {
             return;
         }
         self.flags_emitted |= mask;
+        // A W move zero-extends: a 32-bit operand may be a mapped guest
+        // register with other bits above (`operand_in`).
+        let w = if size == Size::B64 {
+            Width::X
+        } else {
+            Width::W
+        };
         if kind == FlagKind::Logic {
             self.a.mov(Width::X, FA, R);
         } else {
-            self.a.mov(Width::X, FA, a);
-            self.a.mov(Width::X, FB, b);
+            self.a.mov(w, FA, a);
+            self.a.mov(w, FB, b);
         }
         self.lazy = Lazy::Static(Pending { kind, size, mask });
     }
@@ -3602,7 +3714,16 @@ impl Translator {
                     CONTEXT,
                     field(offset_of!(Context, flags_routine)),
                 )?;
+                // x30 holds a guest register (r11): kept on the stack
+                // around the call, which overwrites it with the return
+                // address.
+                // (`R` goes with it to make a pair: the routine clobbers it
+                // anyway.)
+                self.a
+                    .pair(false, PairMode::PreIndex, HostReg::new(30), R, SP, -16)?;
                 self.a.blr(T1);
+                self.a
+                    .pair(true, PairMode::PostIndex, HostReg::new(30), R, SP, 16)?;
                 self.a.bind(skip);
                 return Ok(());
             }
@@ -3638,6 +3759,28 @@ impl Translator {
     }
 
     /// Branches to `target` if the x86 condition holds on `FLAGS`.
+    /// For `cmov` and `setcc`: with flags pending from a known operation,
+    /// redoes it for the host NZCV and returns the host condition, leaving
+    /// the flags pending (as `branch_if`); otherwise materializes them and
+    /// returns `None`, for `condition_bit`. Uses `R` and `T3`, not `A` or
+    /// `B`.
+    fn host_condition_now(&mut self, cond: X86Cond) -> Emit<Option<Cond>> {
+        if let Lazy::Static(p) = self.lazy
+            && let Some(host) = host_condition(p, cond)
+        {
+            match p.kind {
+                FlagKind::Logic => {
+                    self.a.mov(Width::X, R, FA);
+                    self.test_result(p.size)?;
+                }
+                kind => self.arith(kind == FlagKind::Sub, p.size, FA, FB)?,
+            }
+            return Ok(Some(host));
+        }
+        self.materialize()?;
+        Ok(None)
+    }
+
     fn branch_if(&mut self, cond: X86Cond, target: Label) -> Emit {
         // Flags pending from a known operation: redo it for the host NZCV
         // and branch on the matching host condition, leaving the flags

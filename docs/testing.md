@@ -12,7 +12,7 @@ Not implemented yet: golden files, random instruction sequences compared with qe
 ## Verification chain
 It runs in full before every commit, and every step must end with result 0:
 ```bash
-cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace && cargo xtask difftest && cargo xtask decoder-check target/guest/c/* target/guest/busybox/busybox target/guest/rootfs/usr/bin/ls target/guest/rootfs/usr/lib/x86_64-linux-gnu/libm.so.6 target/guest/rootfs/usr/lib/x86_64-linux-gnu/libcrypto.so.3 /usr/i686-linux-gnu/lib/libc.so.6 /usr/i686-linux-gnu/lib/libm.so.6 && cargo xtask encoder-check && cargo xtask gl-gen --check && cargo xtask progress --check && cargo xtask coverage --check && cargo xtask sandbox-check && (cd gui && cargo fmt --check && cargo clippy --target-dir ../target/gui --all-targets -- -D warnings && cargo test --target-dir ../target/gui)
+cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace && cargo xtask difftest && cargo xtask decoder-check target/guest/c/* target/guest/busybox/busybox target/guest/rootfs/usr/bin/ls target/guest/rootfs/usr/lib/x86_64-linux-gnu/libm.so.6 target/guest/rootfs/usr/lib/x86_64-linux-gnu/libcrypto.so.3 /usr/i686-linux-gnu/lib/libc.so.6 /usr/i686-linux-gnu/lib/libm.so.6 && cargo xtask encoder-check && cargo xtask gl-gen --check && cargo xtask matrix --check && cargo xtask progress --check && cargo xtask coverage --check && cargo xtask sandbox-check && (cd gui && cargo fmt --check && cargo clippy --target-dir ../target/gui --all-targets -- -D warnings && cargo test --target-dir ../target/gui)
 ```
 When the hardware oracle is available, `cargo xtask difftest --oracle` is added (ADR-0025).
 
@@ -277,6 +277,18 @@ What these hosts found in armor, fixed on 2026-10-15: shared mappings smaller th
 ## Other distributions (ADR-0043, since 2026-10-15)
 **`cargo xtask distro-check`** builds the package and its archive (`cargo xtask package`) and, in podman containers on this machine, installs the archive with its `install.sh` and uses armor as a user would: Debian's Python (x86-64) and coreutils' `sort` (i386) must print what they print here, `armor install` of Debian's `hello` `.deb` (pinned SHA-256) takes its libraries from Debian's archive with the keyring armor carries, and `armor engine fetch` downloads the Windows engine, whose Wine runs `cmd /c ver`. Fedora 42 comes from Fedora's registry; Arch Linux ARM from its official root archive, checked against its build key's fingerprint before `podman import`. 2026-10-15: every check passes on both.
 
+## Real applications (ADR-0045, since 2026-10-15)
+**`cargo xtask app-check [--report] [id…]`** (`xtask/src/app_check.rs`) installs real applications as a user would and checks them without anyone at the screen. Each installer is pinned by SHA-256 (downloaded into `target/apps/downloads/` when missing; Friday Night Funkin' has no public URL and is skipped when its zip is absent). Each application gets a throwaway data directory (`target/app-check/<id>/`, `XDG_DATA_HOME`, `XDG_CONFIG_HOME`, `XDG_CACHE_HOME`, `TMPDIR`, with the user's Windows engine linked in, never modified), `armor install`, then `armor run` on its own Xvfb display (`:91`, 1280×800):
+- **level 1** when a window whose title names the application appears (`xwininfo -root -tree`): Notepad++, KeePass 2 (.NET), Friday Night Funkin', XnView MP (`.deb`), KeePassXC (AppImage), Spotify (`.deb`, Chromium);
+- **level 3** for 7-Zip: the `.7z` archive it makes of `tests/guest/` with fixed options is byte-for-byte the one the native ARM64 build makes of the same files (the Linux `7zz` under armor; the Windows x64 and x86 builds under Hangover against the ARM64 Windows build).
+
+Every process left in the data directory is stopped afterwards (found by its environment, `/proc/<pid>/environ`), and the directory removed. What needs an account or a desktop session (Steam, Proton games, sign-ins, Sublime Text, whose window appears on the desktop but not under Xvfb) is checked by hand and recorded in `docs/results/by-hand.tsv`.
+
+## Recorded results and the matrix (ADR-0045, since 2026-10-15)
+`difftest`, `app-check`, `distro-check` and `bench` take **`--report`**: each result becomes one line of `docs/results/<machine>.tsv` (`xtask/src/results.rs`), the file of the machine the command ran on. The machine is named from what it reports: CPU (`lscpu`), page size, system (`/etc/os-release`) and place (native, KVM virtual machine or container: the GitHub runner's chain runs in one), and the file starts with those facts and the kernel. A line has eight tab-separated fields: kind (`suite`, `application`, `performance`), name, engine, reference (qemu, saved results, the Xeon, the native build), result, date, commit (with `+` when the tree had changes) and the command that reproduces it. A new run of the same kind, name, engine and reference replaces its line. The GitHub runner's chain records its own results and publishes the file as the `results` artifact; it is downloaded and committed by hand (CI never pushes).
+
+**`cargo xtask matrix`** writes the generated tables of `COMPATIBILITY_MATRIX.md` (between `<!-- matrix:start -->` and `<!-- matrix:end -->`: machines, suites per machine and engine, applications per engine and machine, performance, results by hand) and the summary in `README.md`; `--check` fails when they differ from the results files, and the chain runs it.
+
 ## Golden files
 By default `difftest` **runs qemu at every test**: it is the simplest solution. Since 2026-10-15 `--save` and `--expected` keep and use qemu's results in a directory (above, "Other page sizes"); they are not versioned in the repository.
 
@@ -306,6 +318,9 @@ cargo xtask package                        # target/package/armor_<version>_arm6
 cargo xtask coverage                       # coverage badges in the README (conventions.md)
 cargo xtask fuzz                           # long fuzzing of the decoder, the ELF parser and the syscall arguments
 cargo xtask bench                          # benchmarks against qemu and native (tech/performance.md)
+cargo xtask app-check [id…]                # real applications installed and checked under Xvfb (ADR-0045)
+cargo xtask matrix [--check]               # compatibility matrix from docs/results/ (ADR-0045)
+cargo xtask difftest --report              # … any of difftest, app-check, distro-check, bench: record the result
 # x87 transcendentals against an independent reference (ADR-0030):
 ARMOR_X87_CASES=/tmp/x87-cases.txt cargo test --release -p armor-cpu write_cases -- --ignored
 python3 -I tests/x87/reference.py /tmp/x87-cases.txt   # "N cases, 0 mismatches"

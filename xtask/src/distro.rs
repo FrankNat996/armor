@@ -66,6 +66,7 @@ const DISTRIBUTIONS: &[Distribution] = &[
 /// roots) and `/debs` are mounted read-only.
 const CHECKS: &str = r#"
 set -u
+. /etc/os-release && echo "system $PRETTY_NAME"
 check() { if [ "$2" = "$3" ]; then echo "ok $1"; else echo "FAIL $1: got [$2], want [$3]"; fi; }
 cd /tmp && tar -xzf /armor.tar.gz && sh armor_*/install.sh >/dev/null
 A=$HOME/.local/bin/armor
@@ -161,7 +162,7 @@ fn arch_image(dir: &Path) -> Result<(), String> {
     Ok(())
 }
 
-pub fn check(paths: &Paths) -> Result<(), String> {
+pub fn check(paths: &Paths, report: bool) -> Result<(), String> {
     let root = &paths.root;
     let amd64 = rootfs::dir_of(paths, rootfs::Arch::Amd64);
     let i386 = rootfs::dir_of(paths, rootfs::Arch::I386);
@@ -236,6 +237,24 @@ pub fn check(paths: &Paths) -> Result<(), String> {
         if fails > 0 || oks != 5 || !output.status.success() {
             failed += 1;
             eprint!("{}", String::from_utf8_lossy(&output.stderr));
+        }
+        if report {
+            let mut machine = crate::results::Machine::here();
+            machine.place = "container".to_string();
+            if let Some(system) = text.lines().find_map(|l| l.strip_prefix("system ")) {
+                machine.system = system.trim().to_string();
+            }
+            let passed: Vec<&str> = text.lines().filter_map(|l| l.strip_prefix("ok ")).collect();
+            let record = crate::results::Record::now(
+                "suite",
+                "distro-check",
+                "armor from its archive; Hangover 11.16 (Debian 13 build)",
+                "the outputs on the development machine; the checks' own expectations",
+                &format!("{}/5 ({})", passed.len(), passed.join(", ")),
+                "cargo xtask distro-check",
+            );
+            let file = crate::results::record(root, &machine, &[record])?;
+            println!("recorded in {}", file.display());
         }
     }
     if failed == 0 {

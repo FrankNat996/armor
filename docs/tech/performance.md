@@ -75,6 +75,13 @@ perf report -i /tmp/perf.data --no-children --percent-limit 1.5 --stdio
 ```
 `perf_event_paranoid` is 2 on the host: you can profile your own processes in user space.
 
+### Profiling the translated code (since 2026-10-15)
+With **`ARMOR_PERF_MAP=1`** armor appends one line per translated block to `/tmp/perf-<pid>.map`, the file `perf report` reads for code without symbols: host address, size, and the block's guest address and length (`x86 0x77ae75c3e0 (16 instructions)`). The guest address minus the program's load address (`/proc/<pid>/maps`, or the first block of the program) is the offset to disassemble with `x86_64-linux-gnu-objdump -d --start-address=…`. ✅ 2026-10-15, on 7-Zip (below). Limits: when the code buffer fills up and is flushed, new blocks reuse old addresses and the older lines stay in the file; the file is never removed.
+```bash
+ARMOR_PERF_MAP=1 perf record -F 2000 -o /tmp/perf.data target/release/armor --jit --root target/guest/rootfs-games target/bench/7zip-x64/7zz a -txz -mx=9 -mmt=1 -so -an "$PWD/target/bench/7zip-input.bin" > /dev/null
+perf report -i /tmp/perf.data --no-children --sort sym --stdio
+```
+
 ## Interpreter: what it cost and what changed (2026-10-12)
 Profile of the traceback of a python exception (the heaviest case in the tests):
 
@@ -465,3 +472,23 @@ The translated code checks for denormal operands (DE) and corrects underflow at 
 
 ## Comparison with box64 (2026-10-14)
 `cargo xtask bench --box64` (and `--fex`) adds the column of another engine, from the binary in `ARMOR_BOX64` (`ARMOR_FEX`); an output different from qemu's or a failure is marked in the cell. First measurement (Pi 5, 16K): box64 v0.4.4 2 to 3 times faster than armor on computation (python-int 507 ms against 1572 ms, simd 87 against 221), armor faster on static startup, box64 fails on the `threads` workload. Table and reading in `tech/engines.md`.
+
+## 7-Zip: where the JIT loses time, and three changes (M10, 2026-10-15)
+The `7zip` workload of `cargo xtask bench` (7-Zip 26.04's Linux `7zz` compressing 12 MB with LZMA2 at `-mx=9`, one thread, against its native ARM64 build) is the first real program in the benchmark. Before the changes below (`bench --box64 --fex`, median of 5, Pi 5 with 4K pages): native 6.10 s, box64 6.81 s (1.1×), FEX 8.51 s (1.4×), **armor 19.51 s (3.2×)**, qemu 28.78 s.
+
+**Profile** (`ARMOR_PERF_MAP`, above): 97% of the time in translated code, only about a thousand instructions interpreted. The hottest block (18%) is the binary-tree match finder (`7zz` at `0x22c3e0`), a loop of loads and compares on r9–r11, r14 and r15. Three overheads showed in its translation:
+- **Tiny blocks.** Every conditional jump ended the block, so the match finder ran as blocks of 1 to 3 instructions; a block that starts with a flag reader (`jb` right after `je`) finds the flags pending from the previous block and calls the generic flag routine, which took 6% of the run.
+- **Copies.** Every ALU operand went through the temporaries `A`/`B`: `add rdi, rcx` was six instructions; `movzx` a load, a move and another move.
+- **r10 and r11 in memory**, read and written at every use in this loop.
+
+**Changes** (each checked by the random JIT tests against the interpreter and the archive's SHA-256; times are single runs of the command above, `date` around it, with the run-to-run spread under 1%):
+1. r10 and r11 in host registers `x18` and `x30` (`jit.md`, "Host registers"); ALU, `test` and `mov` read and write mapped registers in place; `cmov`/`setcc` use the host condition when the flags are pending, as `jcc` does: 19.5 → 18.6 s.
+2. **Side exits:** a conditional jump inside a block leaves it only when taken, out of line, and the block goes on (`ends_block` no longer stops at `jcc`), with its registers and the pending flags known: 18.6 → 16.8 s.
+3. `movzx`/`movsx` load straight into a mapped destination: 16.8 → 16.6 s.
+
+Together 19.5 → **16.6 s**, from 3.2× to 2.7× native; the output is identical throughout. The `bench` table after the changes is recorded in `docs/results/` and shown in `COMPATIBILITY_MATRIX.md`.
+
+**What is left**, measured on the same run:
+- the software permission check (`tech/memory.md`) costs **9%**: the same build without it took 16.9 s instead of 18.6 s (an experiment, not a mode of armor). On 4K hosts the host's MMU could check instead, as FEX does; it is a change of ADR-0009's design, not yet proposed;
+- the flag routine still takes 5%: `inc`/`dec` keep CF, so after a block boundary with flags pending they need the previous flags (the match loop at `0x22c4e0` starts with `inc rsi`). Knowing that the jump's target overwrites CF before reading it would avoid it;
+- copies left in the address computation (`[r9 + rbx*8]` copies the index), in `neg`/`not`/`inc`/`dec` and in shifts.

@@ -31,4 +31,13 @@ jobs:
           # Ubuntu restricts unprivileged user namespaces, which --sandbox
           # needs (docs/tech/security.md).
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
-          docker run --rm --privileged -v "$PWD:/src:ro" debian:trixie bash /src/.github/ci-chain.sh
+          mkdir -p results
+          docker run --rm --privileged -v "$PWD:/src:ro" -v "$PWD/results:/out" \
+            debian:trixie bash /src/.github/ci-chain.sh
+
+      - name: Results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: results
+          path: results/

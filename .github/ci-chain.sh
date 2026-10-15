@@ -26,6 +26,7 @@ done
 grep -E "interpreter|flags" /proc/sys/fs/binfmt_misc/qemu-x86_64 /proc/sys/fs/binfmt_misc/qemu-i386
 useradd -m builder
 cp -a /src /home/builder/armor
+mkdir -p /out && chmod 777 /out
 chown -R builder: /home/builder/armor
 runuser -u builder -- bash -c '
   set -u
@@ -36,12 +37,13 @@ runuser -u builder -- bash -c '
   for step in "cargo fmt --all --check" \
       "cargo clippy --workspace --all-targets -- -D warnings" \
       "cargo test --workspace" \
+      "cargo xtask matrix --check" \
       "cargo xtask fetch-busybox" "cargo xtask fetch-rootfs" "cargo xtask fetch-rootfs --i386" \
       "cargo xtask build-guest" \
-      "cargo xtask difftest" \
-      "cargo xtask difftest --lockstep" \
-      "env ARMOR_HOST_FEATURES=baseline cargo xtask difftest" \
-      "cargo xtask difftest --native" \
+      "cargo xtask difftest --report" \
+      "cargo xtask difftest --lockstep --report" \
+      "env ARMOR_HOST_FEATURES=baseline cargo xtask difftest --report" \
+      "cargo xtask difftest --native --report" \
       "cargo xtask encoder-check" \
       "cargo xtask sandbox-check"; do
     echo "::group::$step"
@@ -51,5 +53,7 @@ runuser -u builder -- bash -c '
     echo "=== $step: exit $rc"
     [ $rc -ne 0 ] && failed=1
   done
+  # The results of this machine (ADR-0045), for the workflow to publish.
+  cp docs/results/*.tsv /out/ 2>/dev/null
   exit $failed
 '

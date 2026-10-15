@@ -2,7 +2,7 @@
 
 **Goal** (ADR-0034, 2026-10-14): a single application that makes it simple for anyone with an ARM64 computer to use any x86 software — Linux programs, Windows programs and games — without knowing what happens underneath; and a measured reference for development on ARM. Priorities, in order: ease for everyone, any x86 program, any ARM64 CPU, the best existing component for each layer, reproducible measurements. What it takes to get there: `analysis.md`.
 
-**State:** M0–M6 (the engine) completed on 2026-10-12 and 2026-10-13. Since 2026-10-14 the milestones are, in order of priority, **M7** (the installer for everyone, completed on 2026-10-14), **M8** (games and Steam, completed on 2026-10-15), **M9** (every ARM64, completed on 2026-10-15), **M10** (the reference); M10 is open.
+**State:** M0–M6 (the engine) completed on 2026-10-12 and 2026-10-13. Since 2026-10-14 the milestones are, in order of priority, **M7** (the installer for everyone, completed on 2026-10-14), **M8** (games and Steam, completed on 2026-10-15), **M9** (every ARM64, completed on 2026-10-15), **M10** (the reference, completed on 2026-10-15 and always active).
 
 Milestones M7–M10 were rewritten on 2026-10-14 (ADR-0034). Where the previous items ended up, for reading the earlier ADRs:
 
@@ -154,19 +154,22 @@ Where external components do not reach, armor is the engine or the solution.
 Not a milestone: done between M9 and M10 so that no x86-64 syscall stops armor.
 - [x] Every syscall of the kernel headers answered (ADR-0044, 2026-10-15): 375 of 375, by the host kernel with the arguments converted, emulated (`seccomp`), or as a real kernel configuration answers (io_uring absent, `ptrace` refused, …), each family with a C test against the Xeon, qemu or the native oracle (`tech/syscalls.md`, "Every syscall")
 
-## M10 — The reference (priority 5, always active)
+## M10 — The reference (priority 5, always active) ✅
 Whoever develops or uses software on ARM finds on the project page, for an application or a CPU, what works, with which engine and how to reproduce it.
 - [x] Test bench: `difftest` against qemu and against a real x86 CPU (Xeon X5675), JIT lockstep, the same cases under box64 and FEX (`--engine`), `bench` with the box64 and FEX columns (2026-10-14: armor 427/427, FEX 345/397 on 4K pages, box64 218/397 on 16K pages)
-- [ ] The compatibility matrix generated from the measurements (application × engine × CPU), not written by hand, and prominent on the project page
-- [ ] Performance: FEX and box64 measured on 4K pages; the armor engine closer to FEX on Linux programs (today 2.6× native time on 7-Zip, FEX 1.1×)
-- [ ] A guide for developers: how to test an application on ARM with `armor inspect`, `--diagnose`, `difftest` and the matrix
+- [x] The compatibility matrix generated from the measurements (application × engine × CPU), not written by hand, and prominent on the project page (2026-10-15, ADR-0045: `difftest`, `app-check`, `distro-check` and `bench` record their results with `--report` in `docs/results/<machine>.tsv`, with the date, the commit and the command; `cargo xtask matrix` renders the matrix's tables and the README's summary from them, and the chain checks that they are current. `cargo xtask app-check` installs nine real applications from pinned installers and checks them under Xvfb: 7-Zip for Linux and Windows x64 and x86 byte-identical to their ARM64 builds, a window for Notepad++, KeePass 2, Friday Night Funkin', XnView MP, KeePassXC and Spotify. What needs an account is in `docs/results/by-hand.tsv`)
+- [x] Performance: FEX and box64 measured on 4K pages; the armor engine closer to FEX on Linux programs (2026-10-15: `bench --box64 --fex` on the Pi 5 with 4K pages, with a new 7-Zip workload; a profile of the translated code (`ARMOR_PERF_MAP`) led to three JIT changes, r10 and r11 in host registers, operands in place and side exits at conditional jumps, which take armor on 7-Zip from 3.2 to 2.7 times native; FEX 1.4, box64 1.1. What is left, measured, is in `tech/performance.md`)
+- [x] A guide for developers: how to test an application on ARM with `armor inspect`, `--diagnose`, `difftest` and the matrix (2026-10-15: `docs/guide.md`)
 
 **Criterion:** for each application and CPU of the matrix there is the result, the engine, the date and the command to reproduce it.
+
+**Completed on 2026-10-15.** Every entry of the generated matrix comes from a results file with its machine, engine, date, commit and command: the Pi 5 (Cortex-A76, 4K pages), its 16K and 64K virtual machines and GitHub's runner (Neoverse-N2), plus the entries checked by hand with how and when. The milestone stays "always active": each new measurement adds or replaces its line. armor's engine is still well behind FEX and box64 on compute-heavy programs; the next steps are measured in `tech/performance.md`.
 
 ## Open items of closed milestones
 Items that did not block their milestone's criterion and are still to do. They are not counted in the percentages.
 - [ ] A real ARMv8.0 CPU without LSE (a Raspberry Pi 4) in the matrix, with `difftest`, `--lockstep` and the M7 applications (from M9, closed on 2026-10-15 with two real CPUs; the ARMv8.0 paths are checked today by forcing them, `ARMOR_HOST_FEATURES=baseline`)
 - [ ] Chromium-based applications (moved from M7 on 2026-10-14, ADR-0037; open when M8 closed on 2026-10-15): the Epic Games Launcher up to sign-in (2026-10-14: it installs, updates itself and opens the sign-in window, but the login page is not drawn: the Chromium process that draws it terminates under FEX) and Spotify usable (2026-10-14: it installs and starts; its renderer processes exit with status 0, then the main process stops on purpose. 2026-10-15: with V8's 32 GiB reservations and `shmctl(IPC_INFO)` fixed in armor, Spotify opens its window and reaches its sign-in screen, to sign in with an account; the Epic Games Launcher with Steam's ARM64 Proton installs and updates itself, then does not start again after its update (its updater service waits, and the launcher started directly writes no log: Proton's DXVK 3.1 skips llvmpipe as a software driver, so on the Pi Direct3D 11 has no renderer under Proton); with `PROTON_USE_WINED3D=1` it starts its Direct3D renderer on wined3d and stops on an access violation at address 0 in its own code. Later on 2026-10-15, with `close_range` and `SIOCGIFINDEX` in armor and the host system's scripts run with the host's interpreter, Spotify's Log in button opens its sign-in page in the host's Chromium; with a cache left by earlier runs Spotify ended about 35 s after starting, with an empty one it does not)
+- [ ] armor's engine closer to FEX and box64 on compute-heavy programs (from M10, closed on 2026-10-15 with 7-Zip at 2.7 times native, FEX 1.4, box64 1.1): the permission checks by the host's MMU on 4K hosts (a change of ADR-0009, to propose first), pending flags across block boundaries, the copies left (`tech/performance.md`, "7-Zip")
 
 ## Beyond
 Other guest architectures (beyond x86) or hosts (beyond ARM64), AVX and AVX-512: only at the request of real applications.
