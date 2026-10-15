@@ -52,7 +52,7 @@ Every significant decision has its own file `NNNN-title.md`. ADRs are never dele
 | [0039](0039-armor-updates-itself.md) | armor updates itself from its releases (a notice and a button, pre-releases included) | Accepted (2026-10-15) |
 | [0040](0040-steam-proton-for-windows-programs.md) | Windows programs run with Steam's ARM64 Proton when Steam is installed | Accepted (2026-10-15) |
 | [0041](0041-host-opengl-for-x86-programs.md) | OpenGL of x86 Linux programs through the host's libGL (GLX with shared X ids, generated stubs) | Accepted (2026-10-15) |
-| [0042](0042-hosts-with-16k-and-64k-pages.md) | Hosts with 16K and 64K pages: armor and Hangover as they are, Steam on a 4K kernel | Proposed |
+| [0042](0042-hosts-with-16k-and-64k-pages.md) | Hosts with 16K and 64K pages: armor and Hangover as they are, Steam on a 4K kernel | Accepted (2026-10-15) |
 | [0043](0043-other-distributions.md) | Other distributions: one archive of armor, Debian's libraries and Hangover's Debian build everywhere | Accepted (2026-10-15) |
 
 ## Template

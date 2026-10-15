@@ -189,11 +189,12 @@ HODLL=wowbox64.dll WINEPREFIX=$P/test32 $H/bin/wine wineboot -u
 With `armor install` (2026-10-14) the same installation of 7-Zip x64 is done with `armor install --name 7zip 7z2604-x64.exe` (or `7z2604-x64.msi`): a prefix in `~/.local/share/armor/apps/7zip`, the entries in the desktop menu, `7zFM.exe` opened from the menu ✅ (`gio launch` of the entry, 2026-10-14).
 ⚠️ The order of the files on the command line and the exact paths used for each build were not recorded; to verify, redo the archive with the line above and compare the SHA-256 with those in this section. The test scripts are not in the repository.
 
-### On 16K pages (2026-10-15)
+### On 16K and 64K pages (2026-10-15)
 Measured in the 16K virtual machine of `testing.md` ("Other page sizes": Debian 13, kernel `6.12.111+deb13-arm64-16k`), with `armor engine fetch` and Xvfb:
 - ✅ **Hangover's FEX runs there, unlike FEX for Linux:** Wine warns `You are running with the wrong page size, expect problems!` (and points to Hangover's wiki), then works. FEX inside Wine is a DLL (`libarm64ecfex.dll`, `libwow64fex.dll`) that does not use jemalloc, which is what stops FEX for Linux on 16K pages (above).
 - ✅ **7-Zip 26.04 x64:** its installer (`7z2604-x64.exe /S`) installs it; `7z a -t7z -mx=9 -mmt=1` on the same files gives an archive byte-for-byte identical (SHA-256 `5c95bd10…`) to the native Windows ARM64 build's (`7z2604-arm64.exe`, installed in the same prefix), and `7z t` says `Everything is Ok`.
 - ✅ **Notepad++ 8.9.8.1:** `armor install npp.8.9.8.1.Installer.x64.exe` (its installer is 32-bit, so through WoW64 and `libwow64fex.dll`) creates the menu entry, and `armor run Notepad++` opens its window (screen capture of the Xvfb display).
+- ✅ **On 64K pages too** (the 64K virtual machine: Ubuntu 24.04, `6.8.0-147-generic-64k`, Hangover's build for noble): the same warning, then 7-Zip x64 and ARM64 install, and their archives of the same files are byte-for-byte identical (SHA-256 `29bea77b…`). Creating the first prefix took several minutes there.
 - So Windows programs are not limited to 4K pages; Valve's ARM64 Steam client still is (below, "Valve's native ARM64 Steam client").
 
 ### Epic Games Launcher (2026-10-14)
