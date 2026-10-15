@@ -12,6 +12,8 @@ armor is installed from the `.deb` of its GitHub releases. Without an update mec
 2. **The window** checks at most once a day when it opens (a time stamp in `$XDG_CACHE_HOME/armor/update-checked`), silently; if a newer armor exists it shows a notice with **Update**; nothing is installed without that click and the password. Its menu has **Check for updates**, which says the result either way. After the update the notice offers **Restart** (the new window).
 3. Installed applications are never touched by an update.
 
+**Tried (2026-10-15):** with `0.3.0~git…` installed and release `v0.3.0` published, the window's Check for updates showed the notice, Update downloaded and verified the package and installed it after the system's password dialog, and Restart opened the new window.
+
 ## Alternatives considered
 - **Fully automatic updates:** they would still need the administrator's password (or a privileged service), and would change armor without the user knowing. Not chosen.
 - **Only a command:** the user would have to remember it. Not chosen.
