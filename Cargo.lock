@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "armor"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "armor-cpu",
  "armor-elf",
@@ -16,7 +16,7 @@ dependencies = [
 
 [[package]]
 name = "armor-cpu"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "armor-mem",
  "armor-x86",
@@ -24,11 +24,11 @@ dependencies = [
 
 [[package]]
 name = "armor-elf"
-version = "0.5.0"
+version = "0.6.0"
 
 [[package]]
 name = "armor-jit"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "armor-cpu",
  "armor-mem",
@@ -38,7 +38,7 @@ dependencies = [
 
 [[package]]
 name = "armor-linux"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "armor-cpu",
  "armor-elf",
@@ -49,14 +49,14 @@ dependencies = [
 
 [[package]]
 name = "armor-mem"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "libc",
 ]
 
 [[package]]
 name = "armor-x86"
-version = "0.5.0"
+version = "0.6.0"
 
 [[package]]
 name = "libc"
@@ -66,7 +66,7 @@ checksum = "ce5d3ddc6d3fa000eb1536d85e147bfe31aacaba692ed6a876f95cb7c855be78"
 
 [[package]]
 name = "xtask"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "armor-jit",
  "armor-linux",
