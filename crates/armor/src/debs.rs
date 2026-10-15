@@ -178,7 +178,32 @@ pub struct Archive {
     pub mirror: &'static str,
     pub suite: String,
     pub components: &'static [&'static str],
-    pub keyring: &'static str,
+    /// Where the distribution's keyring package puts the archive keyring.
+    pub host_keyring: &'static str,
+}
+
+/// Debian's stable release: the archive of hosts that are neither Debian
+/// nor Ubuntu (ADR-0043).
+const DEBIAN_STABLE: &str = "trixie";
+
+impl Archive {
+    /// The archive keyring: the host's, else the copy armor carries in
+    /// `share/armor/keyrings/` next to its `bin/` (ADR-0043: Fedora and Arch
+    /// have no Debian keyring by default).
+    fn keyring(&self) -> PathBuf {
+        let host = PathBuf::from(self.host_keyring);
+        if host.is_file() {
+            return host;
+        }
+        std::env::current_exe()
+            .ok()
+            .and_then(|exe| {
+                let name = host.file_name()?;
+                let own = exe.parent()?.join("../share/armor/keyrings").join(name);
+                own.is_file().then_some(own)
+            })
+            .unwrap_or(host)
+    }
 }
 
 pub fn archive_for(os_release: &str) -> Result<Archive, String> {
@@ -191,26 +216,27 @@ pub fn archive_for(os_release: &str) -> Result<Archive, String> {
             mirror: "http://archive.ubuntu.com/ubuntu",
             suite,
             components: &["main", "universe"],
-            keyring: "/usr/share/keyrings/ubuntu-archive-keyring.gpg",
+            host_keyring: "/usr/share/keyrings/ubuntu-archive-keyring.gpg",
         });
     }
+    let debian = |suite: String| Archive {
+        mirror: "https://deb.debian.org/debian",
+        suite,
+        components: &["main"],
+        host_keyring: "/usr/share/keyrings/debian-archive-keyring.gpg",
+    };
     if id == "debian" || like.split_whitespace().any(|l| l == "debian") {
         if !matches!(codename.as_str(), "bookworm" | "trixie" | "forky") {
             return Err(format!(
                 "Debian {codename:?}: armor knows the amd64 archive of bookworm, trixie and forky"
             ));
         }
-        return Ok(Archive {
-            mirror: "https://deb.debian.org/debian",
-            suite: codename,
-            components: &["main"],
-            keyring: "/usr/share/keyrings/debian-archive-keyring.gpg",
-        });
+        return Ok(debian(codename));
     }
-    Err(format!(
-        "{id}: installing x86-64 .deb packages needs a Debian or Ubuntu host (the libraries come \
-         from their amd64 archive)"
-    ))
+    // Any other distribution (Fedora, Arch, ...): the libraries live in
+    // the application's own root, so Debian's stable archive serves it as
+    // well (ADR-0043).
+    Ok(debian(DEBIAN_STABLE.to_string()))
 }
 
 fn curl(url: &str, file: &Path) -> Result<(), String> {
@@ -243,7 +269,7 @@ fn verified_release(archive: &Archive, dir: &Path, base: &str) -> Result<String,
     // gpgv prints the signed text only when the signature is good.
     let verified = Command::new("gpgv")
         .arg("--keyring")
-        .arg(archive.keyring)
+        .arg(archive.keyring())
         .args(["--output", "-"])
         .arg(&in_release)
         .output()
@@ -252,7 +278,7 @@ fn verified_release(archive: &Archive, dir: &Path, base: &str) -> Result<String,
         let _ = fs::remove_file(&in_release);
         return Err(format!(
             "{base}/InRelease: the signature does not verify with {}: {}",
-            archive.keyring,
+            archive.keyring().display(),
             String::from_utf8_lossy(&verified.stderr).trim()
         ));
     }
@@ -575,7 +601,15 @@ usr/bin/usb-devices                                admin/usbutils
         );
         let mint = "ID=linuxmint\nID_LIKE=\"ubuntu debian\"\nVERSION_CODENAME=xia\nUBUNTU_CODENAME=noble\n";
         assert_eq!(archive_for(mint).unwrap().suite, "noble");
-        assert!(archive_for("ID=fedora\n").is_err());
+        let fedora = archive_for("ID=fedora\nVERSION_ID=42\n").unwrap();
+        assert_eq!(
+            (fedora.mirror, fedora.suite.as_str()),
+            ("https://deb.debian.org/debian", DEBIAN_STABLE)
+        );
+        assert_eq!(
+            archive_for("ID=archarm\nID_LIKE=arch\n").unwrap().suite,
+            DEBIAN_STABLE
+        );
         assert!(archive_for("ID=debian\nVERSION_CODENAME=buster\n").is_err());
     }
 }

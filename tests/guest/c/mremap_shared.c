@@ -4,7 +4,8 @@
  * one-page mapping grown to three with MREMAP_MAYMOVE; the old bytes stay,
  * new writes reach the file (pread), and a child forked afterwards shares
  * the grown mapping. Without MREMAP_MAYMOVE and another mapping right after
- * it, growing fails with ENOMEM. The same source runs as x86-64 and i386.
+ * it, growing fails with ENOMEM. The same source runs as x86-64 and i386,
+ * and on hosts with 4K, 16K and 64K pages.
  */
 #define _GNU_SOURCE
 #include <errno.h>
@@ -55,11 +56,14 @@ int main(void) {
     int mfd = memfd_create("armor-mremap", 0);
     grow("memfd", mfd);
 
-    /* No room after it and no MREMAP_MAYMOVE: ENOMEM. */
-    char *area = mmap(NULL, 2 * 4096, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    munmap(area, 4096);
-    char *shared = mmap(area, 4096, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, mfd, 0);
-    char *stuck = mremap(shared, 4096, 2 * 4096, 0);
+    /* No room after it and no MREMAP_MAYMOVE: ENOMEM. In 64 KiB blocks,
+       so that on a host with 16K or 64K pages the shared mapping and the
+       private one after it are in different host pages (ADR-0022). */
+    long block = 65536;
+    char *area = mmap(NULL, 3 * block, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    char *aligned = (char *)(((unsigned long)area + block - 1) & ~(block - 1));
+    char *shared = mmap(aligned, block, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, mfd, 0);
+    char *stuck = mremap(shared, block, 2 * block, 0);
     printf("grow into a mapping without MAYMOVE: %s\n", stuck == MAP_FAILED ? strerror(errno) : "ok");
     close(mfd);
     return 0;

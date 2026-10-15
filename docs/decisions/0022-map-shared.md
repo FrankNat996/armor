@@ -41,6 +41,9 @@ The constraint is the same as in ADR-0005 and ADR-0012: the guest sees 4K pages,
   - a private mapping with `MAP_FIXED` over shared host pages replaces them if no other guest page uses them, otherwise it is "not supported";
   - `MAP_SHARED_VALIDATE` counts as `MAP_SHARED`, with unknown flags rejected.
 
+## Update of 2026-10-15: growing on 16K and 64K hosts
+Measured in virtual machines with 16K and 64K pages (roadmap M9): growing a shared mapping smaller than a host page, or not ending on one, stopped armor ("growing a shared mapping not on host-page boundaries"). Since a shared mapping's host pages are its own, `remap_shared` now grows it inside its last host page by giving the guest the pages it asks for, and beyond it by extending or moving the host mapping from its first host page, with the same offset inside that page (`tech/memory.md`). The last case of `c/mremap_shared` (ENOMEM when another mapping follows and the guest does not allow a move) now lays its mappings out in 64 KiB blocks: in 4K blocks it put a shared page and a private one in one 16K host page, the case this ADR leaves unsupported, which the test was not about.
+
 ## Alternatives considered
 - **Copy with write-back** (`msync`/`munmap` write the file back): no coherence between processes nor with whoever writes the file while it is mapped.
 - **4K host pages:** the Pi 5 kernel uses 16K pages (ADR-0005).

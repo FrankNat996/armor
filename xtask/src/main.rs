@@ -12,6 +12,7 @@ mod coverage;
 mod deb;
 mod decoder_check;
 mod difftest;
+mod distro;
 mod encoder_check;
 mod fuzz;
 mod gl;
@@ -39,13 +40,18 @@ commands:
                                  qemu-x86_64 (or armor: --armor interpreted,
                                  --jit with the JIT, --lockstep checking the
                                  JIT against the interpreter)
-  difftest [--oracle] [--interpreter|--jit|--lockstep] [name...]
+  difftest [--oracle | --save DIR | --expected DIR]
+           [--interpreter|--jit|--lockstep] [name...]
                                  run guest programs, busybox applets and
                                  coreutils under qemu-x86_64 and armor and
                                  compare stdout and exit status (default: all
                                  programs, armor with each engine); --oracle:
                                  a real x86-64 machine instead of qemu, static
-                                 programs only (ARMOR_ORACLE, ARMOR_ORACLE_KEY)
+                                 programs only (ARMOR_ORACLE, ARMOR_ORACLE_KEY);
+                                 --save: also keep qemu's results in DIR;
+                                 --expected: compare with results kept in DIR
+                                 instead of running qemu (hosts with 16K or
+                                 64K pages)
   bench [--runs N] [--interpreter] [name...]
                                  time benchmarks under armor --jit, qemu-x86_64
                                  and natively; print the environment and a
@@ -80,7 +86,11 @@ commands:
   gl-check                       draw with OpenGL under armor, with the guest's
                                  Mesa and with the host's GPU (--host-gl), and
                                  compare the pixels (needs an X display and
-                                 fetch-rootfs --games)";
+                                 fetch-rootfs --games)
+  distro-check                   the package's archive installed and used in
+                                 podman containers of Fedora and Arch Linux
+                                 ARM: x86-64 and i386 programs, an x86-64
+                                 .deb, the Windows engine (ADR-0043)";
 
 const GUEST_CC: &str = "x86_64-linux-gnu-gcc";
 const QEMU: &str = "qemu-x86_64";
@@ -214,6 +224,7 @@ fn main() -> ExitCode {
             _ => Err(format!("usage: cargo xtask gl-gen [--check]\n\n{USAGE}")),
         },
         Some("gl-check") => gl::check(&Paths::new()),
+        Some("distro-check") => distro::check(&Paths::new()),
         Some("coverage") => match &args[1..] {
             [] => coverage::run(false),
             [flag] if flag == "--check" => coverage::run(true),

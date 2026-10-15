@@ -8,7 +8,15 @@
 //! desktop asks for the administrator's password), or says which `sudo`
 //! command to run where `pkexec` is missing. Pre-releases count: every
 //! release so far is one. The installed applications are not touched.
+//!
+//! armor installed from its archive (`armor_<version>_arm64.tar.gz` and its
+//! `install.sh`, on distributions other than Debian and Ubuntu: ADR-0043)
+//! is updated from the newest release's archive instead, checked the same
+//! way and installed by its own `install.sh` into the same place, without
+//! the administrator. Versions are compared as dpkg does, in armor itself
+//! (`compare_versions`), since only Debian and Ubuntu have dpkg.
 
+use std::cmp::Ordering;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -200,6 +208,25 @@ fn json_string(bytes: &[u8], at: &mut usize) -> Option<String> {
     }
 }
 
+/// How armor was installed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Kind {
+    /// The `.deb`, with apt.
+    Package,
+    /// The archive's `install.sh` (ADR-0043).
+    Archive,
+}
+
+impl Kind {
+    /// The release asset this kind of installation is updated from.
+    fn asset(self, version: &str) -> String {
+        match self {
+            Kind::Package => format!("armor_{version}_arm64.deb"),
+            Kind::Archive => format!("armor_{version}_arm64.tar.gz"),
+        }
+    }
+}
+
 /// The newest release of armor that carries an arm64 package.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Release {
@@ -210,9 +237,10 @@ pub struct Release {
     pub sha256: String,
 }
 
-/// The newest non-draft release in GitHub's list (newest first) with an
-/// `armor_<version>_arm64.deb` asset and its SHA-256 digest.
-pub fn newest_release(releases: &Json) -> Option<Release> {
+/// The newest non-draft release in GitHub's list (newest first) with the
+/// asset for `kind` (`armor_<version>_arm64.deb` or `.tar.gz`) and its
+/// SHA-256 digest.
+pub fn newest_release(releases: &Json, kind: Kind) -> Option<Release> {
     let Json::Array(releases) = releases else {
         return None;
     };
@@ -222,7 +250,7 @@ pub fn newest_release(releases: &Json) -> Option<Release> {
         }
         let tag = release.get("tag_name")?.text()?;
         let version = tag.strip_prefix('v').unwrap_or(tag);
-        let file = format!("armor_{version}_arm64.deb");
+        let file = kind.asset(version);
         let Json::Array(assets) = release.get("assets")? else {
             return None;
         };
@@ -243,9 +271,16 @@ pub fn newest_release(releases: &Json) -> Option<Release> {
     })
 }
 
-/// The version of the installed `armor` package, if armor was installed
-/// from it.
-fn installed_version() -> Option<String> {
+/// The installed armor: how, which version, and for an archive the
+/// prefix `install.sh` used (`~/.local` by default).
+struct Installed {
+    kind: Kind,
+    version: String,
+    prefix: Option<PathBuf>,
+}
+
+/// The `armor` package's version, if armor was installed from it.
+fn package_version() -> Option<String> {
     let output = Command::new("dpkg-query")
         .args(["-W", "-f=${Version}", "armor"])
         .output()
@@ -254,25 +289,119 @@ fn installed_version() -> Option<String> {
     (output.status.success() && !version.is_empty()).then_some(version)
 }
 
-/// Whether Debian version `a` is newer than `b` (`dpkg --compare-versions`).
-fn newer(a: &str, b: &str) -> bool {
-    Command::new("dpkg")
-        .args(["--compare-versions", a, "gt", b])
-        .status()
-        .is_ok_and(|s| s.success())
+/// The version in an archive installation's `share/armor/installed`
+/// (written by `install.sh`: lines `key=value`).
+pub fn archive_version(installed: &str) -> Option<String> {
+    installed
+        .lines()
+        .find_map(|line| line.strip_prefix("version="))
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
+/// How this armor was installed: the package, else an archive
+/// installation whose `bin/armor` this is.
+fn installed() -> Option<Installed> {
+    if let Some(version) = package_version() {
+        return Some(Installed {
+            kind: Kind::Package,
+            version,
+            prefix: None,
+        });
+    }
+    let exe = std::env::current_exe().ok()?;
+    let prefix = exe.parent()?.parent()?.to_path_buf();
+    let text = std::fs::read_to_string(prefix.join("share/armor/installed")).ok()?;
+    Some(Installed {
+        kind: Kind::Archive,
+        version: archive_version(&text)?,
+        prefix: Some(prefix),
+    })
+}
+
+/// Compares two Debian versions as dpkg does (`[epoch:]upstream[-revision]`;
+/// in each part runs of non-digits compare character by character, with
+/// `~` before everything, even the end, and letters before other
+/// characters, and runs of digits compare as numbers).
+pub fn compare_versions(a: &str, b: &str) -> Ordering {
+    fn split(v: &str) -> (u64, &str, &str) {
+        let (epoch, rest) = match v.split_once(':') {
+            Some((e, rest)) if e.bytes().all(|c| c.is_ascii_digit()) => {
+                (e.parse().unwrap_or(0), rest)
+            }
+            _ => (0, v),
+        };
+        match rest.rsplit_once('-') {
+            Some((upstream, revision)) => (epoch, upstream, revision),
+            None => (epoch, rest, ""),
+        }
+    }
+    fn order(c: Option<u8>) -> i32 {
+        match c {
+            None => 0,
+            Some(c) if c.is_ascii_digit() => 0,
+            Some(c) if c.is_ascii_alphabetic() => i32::from(c),
+            Some(b'~') => -1,
+            Some(c) => i32::from(c) + 256,
+        }
+    }
+    fn part(a: &[u8], b: &[u8]) -> Ordering {
+        let (mut i, mut j) = (0, 0);
+        while i < a.len() || j < b.len() {
+            while (i < a.len() && !a[i].is_ascii_digit()) || (j < b.len() && !b[j].is_ascii_digit())
+            {
+                let (x, y) = (order(a.get(i).copied()), order(b.get(j).copied()));
+                if x != y {
+                    return x.cmp(&y);
+                }
+                i += 1;
+                j += 1;
+            }
+            while a.get(i) == Some(&b'0') {
+                i += 1;
+            }
+            while b.get(j) == Some(&b'0') {
+                j += 1;
+            }
+            let mut first_difference = Ordering::Equal;
+            while i < a.len() && a[i].is_ascii_digit() && j < b.len() && b[j].is_ascii_digit() {
+                if first_difference == Ordering::Equal {
+                    first_difference = a[i].cmp(&b[j]);
+                }
+                i += 1;
+                j += 1;
+            }
+            if i < a.len() && a[i].is_ascii_digit() {
+                return Ordering::Greater;
+            }
+            if j < b.len() && b[j].is_ascii_digit() {
+                return Ordering::Less;
+            }
+            if first_difference != Ordering::Equal {
+                return first_difference;
+            }
+        }
+        Ordering::Equal
+    }
+    let (ea, ua, ra) = split(a);
+    let (eb, ub, rb) = split(b);
+    ea.cmp(&eb)
+        .then_with(|| part(ua.as_bytes(), ub.as_bytes()))
+        .then_with(|| part(ra.as_bytes(), rb.as_bytes()))
 }
 
 /// What `armor update --check` found.
 struct Check {
-    installed: String,
+    installed: Installed,
     release: Release,
     available: bool,
 }
 
 fn check() -> Result<Check, String> {
-    let installed = installed_version().ok_or(
-        "armor was not installed from its package (`apt install ./armor_…_arm64.deb`), so it \
-         cannot update itself; build it again from the source instead",
+    let installed = installed().ok_or(
+        "armor was not installed from its package (`apt install ./armor_…_arm64.deb`) or its \
+         archive (`install.sh`), so it cannot update itself; build it again from the source \
+         instead",
     )?;
     let output = Command::new("curl")
         .args([
@@ -291,8 +420,11 @@ fn check() -> Result<Check, String> {
     }
     let releases = parse_json(&String::from_utf8_lossy(&output.stdout))
         .ok_or("GitHub's answer is not valid JSON")?;
-    let release = newest_release(&releases).ok_or("no release of armor has an arm64 package")?;
-    let available = newer(&release.version, &installed);
+    let release = newest_release(&releases, installed.kind).ok_or(match installed.kind {
+        Kind::Package => "no release of armor has an arm64 package",
+        Kind::Archive => "no release of armor has an arm64 archive",
+    })?;
+    let available = compare_versions(&release.version, &installed.version) == Ordering::Greater;
     Ok(Check {
         installed,
         release,
@@ -317,18 +449,18 @@ pub fn main(args: &[std::ffi::OsString], data_home: &Path) -> Result<(), String>
         println!(
             "update\t{}\t{}\t{}",
             if found.available { "yes" } else { "no" },
-            found.installed,
+            found.installed.version,
             found.release.version
         );
         return Ok(());
     }
     if !found.available {
-        eprintln!("armor: armor {} is up to date", found.installed);
+        eprintln!("armor: armor {} is up to date", found.installed.version);
         return Ok(());
     }
     eprintln!(
         "armor: armor {} is available (installed: {})",
-        found.release.version, found.installed
+        found.release.version, found.installed.version
     );
     if check_only {
         return Ok(());
@@ -344,7 +476,49 @@ pub fn main(args: &[std::ffi::OsString], data_home: &Path) -> Result<(), String>
         &found.release.sha256,
     )?;
     std::fs::rename(&partial, &file).map_err(|e| format!("{}: {e}", file.display()))?;
-    install(&file, &found.release.version)
+    match &found.installed.prefix {
+        Some(prefix) => install_archive(&file, &found.release.version, prefix, &dir),
+        None => install(&file, &found.release.version),
+    }
+}
+
+/// Installs the downloaded archive with its own `install.sh` into
+/// `prefix`, where the running armor was installed, as this user.
+fn install_archive(file: &Path, version: &str, prefix: &Path, dir: &Path) -> Result<(), String> {
+    let unpacked = dir.join(format!("armor_{version}_arm64.unpacked"));
+    if unpacked.exists() {
+        std::fs::remove_dir_all(&unpacked).map_err(|e| format!("{}: {e}", unpacked.display()))?;
+    }
+    std::fs::create_dir_all(&unpacked).map_err(|e| format!("{}: {e}", unpacked.display()))?;
+    let status = Command::new("tar")
+        .arg("-xzf")
+        .arg(file)
+        .arg("-C")
+        .arg(&unpacked)
+        .status()
+        .map_err(|e| format!("tar: {e}"))?;
+    if !status.success() {
+        return Err(format!("cannot unpack {} ({status})", file.display()));
+    }
+    let script = unpacked.join(format!("armor_{version}_arm64/install.sh"));
+    eprintln!(
+        "armor: installing armor {version} into {}",
+        prefix.display()
+    );
+    let status = Command::new("sh")
+        .arg(&script)
+        .env("PREFIX", prefix)
+        .status()
+        .map_err(|e| format!("{}: {e}", script.display()))?;
+    let _ = std::fs::remove_dir_all(&unpacked);
+    if !status.success() {
+        return Err(format!(
+            "the installation did not finish ({status}); the verified archive is {}",
+            file.display()
+        ));
+    }
+    eprintln!("armor: armor updated to {version}");
+    Ok(())
 }
 
 /// Installs the downloaded package as the administrator.
@@ -413,7 +587,7 @@ mod tests {
         ]"#;
         let json = parse_json(text).unwrap();
         assert_eq!(
-            newest_release(&json),
+            newest_release(&json, Kind::Package),
             Some(Release {
                 version: "0.2.0".to_string(),
                 file: "armor_0.2.0_arm64.deb".to_string(),
@@ -423,6 +597,48 @@ mod tests {
                 sha256: "7d79d0de".to_string(),
             })
         );
-        assert_eq!(newest_release(&parse_json("[]").unwrap()), None);
+        assert_eq!(
+            newest_release(&parse_json("[]").unwrap(), Kind::Package),
+            None
+        );
+        // An archive installation looks for the archive, which v0.2.0 lacks.
+        assert_eq!(newest_release(&json, Kind::Archive), None);
+    }
+
+    #[test]
+    fn versions_compare_as_dpkg_does() {
+        use Ordering::*;
+        // Each pair checked with `dpkg --compare-versions` on Debian 13.
+        let cases = [
+            ("0.4.0", "0.3.0", Greater),
+            ("0.4.0", "0.4.0~git20261015101027.4172c8d", Greater),
+            ("0.5.0~git20261015.e8550c1", "0.4.0", Greater),
+            (
+                "0.4.0~git20261015050406.da651a9",
+                "0.4.0~git20261015101027.4172c8d",
+                Less,
+            ),
+            ("0.10.0", "0.9.9", Greater),
+            ("1.0", "1.0", Equal),
+            ("1.0-1", "1.0", Greater),
+            ("1:0.1", "2.0", Greater),
+            ("1.0a", "1.0", Greater),
+            ("1.0~rc1", "1.0", Less),
+            ("1.0+b1", "1.0a", Greater),
+            ("1.01", "1.1", Equal),
+        ];
+        for (a, b, expected) in cases {
+            assert_eq!(compare_versions(a, b), expected, "{a} vs {b}");
+            assert_eq!(compare_versions(b, a), expected.reverse(), "{b} vs {a}");
+        }
+    }
+
+    #[test]
+    fn the_archive_installation_records_its_version() {
+        assert_eq!(
+            archive_version("kind=archive\nversion=0.5.0\n"),
+            Some("0.5.0".to_string())
+        );
+        assert_eq!(archive_version("kind=archive\n"), None);
     }
 }

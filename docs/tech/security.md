@@ -52,7 +52,7 @@ Host facts it relies on (✅ Raspberry Pi 5, kernel 6.18, 2026-10-13):
 ```
 armor --sandbox [--allow PATH]... [--allow-ro PATH]... [--allow-net] program [args]
 ```
-Or in the profile (ADR-0028): `sandbox = yes`, `allow = PATH`, `allow-ro = PATH`, `allow-net = yes`. A native program or a native script interpreter inside the sandbox must be in a permitted path. The file of `--diagnose=FILE` is created beforehand and made writable. If unprivileged user namespaces are disabled, `--sandbox` fails with a message; it does not open silently.
+Or in the profile (ADR-0028): `sandbox = yes`, `allow = PATH`, `allow-ro = PATH`, `allow-net = yes`. A native program or a native script interpreter inside the sandbox must be in a permitted path. The file of `--diagnose=FILE` is created beforehand and made writable. If unprivileged user namespaces are disabled, `--sandbox` fails with a message; it does not open silently. ✅ That is the case on Ubuntu 24.04, whose AppArmor restricts unprivileged user namespaces (`kernel.apparmor_restrict_unprivileged_userns = 1`): armor stops with `--sandbox: /proc/self/setgroups: Permission denied` (2026-10-15, Ubuntu 24.04 with its 64K kernel in a virtual machine, `testing.md`); with the restriction lifted (`sysctl -w kernel.apparmor_restrict_unprivileged_userns=0`) every `sandbox-check` probe passes there. ⚠️ An AppArmor profile for armor that allows user namespaces (`userns,`), shipped with the package, would make `--sandbox` work there without lifting the restriction for everyone: not done, to try on Ubuntu.
 
 ## How it is verified
 For each control, two tests:

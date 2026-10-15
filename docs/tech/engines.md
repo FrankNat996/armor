@@ -189,6 +189,13 @@ HODLL=wowbox64.dll WINEPREFIX=$P/test32 $H/bin/wine wineboot -u
 With `armor install` (2026-10-14) the same installation of 7-Zip x64 is done with `armor install --name 7zip 7z2604-x64.exe` (or `7z2604-x64.msi`): a prefix in `~/.local/share/armor/apps/7zip`, the entries in the desktop menu, `7zFM.exe` opened from the menu ✅ (`gio launch` of the entry, 2026-10-14).
 ⚠️ The order of the files on the command line and the exact paths used for each build were not recorded; to verify, redo the archive with the line above and compare the SHA-256 with those in this section. The test scripts are not in the repository.
 
+### On 16K pages (2026-10-15)
+Measured in the 16K virtual machine of `testing.md` ("Other page sizes": Debian 13, kernel `6.12.111+deb13-arm64-16k`), with `armor engine fetch` and Xvfb:
+- ✅ **Hangover's FEX runs there, unlike FEX for Linux:** Wine warns `You are running with the wrong page size, expect problems!` (and points to Hangover's wiki), then works. FEX inside Wine is a DLL (`libarm64ecfex.dll`, `libwow64fex.dll`) that does not use jemalloc, which is what stops FEX for Linux on 16K pages (above).
+- ✅ **7-Zip 26.04 x64:** its installer (`7z2604-x64.exe /S`) installs it; `7z a -t7z -mx=9 -mmt=1` on the same files gives an archive byte-for-byte identical (SHA-256 `5c95bd10…`) to the native Windows ARM64 build's (`7z2604-arm64.exe`, installed in the same prefix), and `7z t` says `Everything is Ok`.
+- ✅ **Notepad++ 8.9.8.1:** `armor install npp.8.9.8.1.Installer.x64.exe` (its installer is 32-bit, so through WoW64 and `libwow64fex.dll`) creates the menu entry, and `armor run Notepad++` opens its window (screen capture of the Xvfb display).
+- So Windows programs are not limited to 4K pages; Valve's ARM64 Steam client still is (below, "Valve's native ARM64 Steam client").
+
 ### Epic Games Launcher (2026-10-14)
 Installed with `armor install` (prefix in `~/.local/share/armor/apps/epic`) on the Pi with 4K pages; measured on 2026-10-14.
 - ✅ **Installation:** the installer downloaded from Epic (`EpicGamesLauncherInstaller.msi`, that is `EpicInstaller-20.3.3.msi`, SHA-256 in ADR-0033) installs in 39 s; the launcher updates itself from 20.3.3 to 20.3.5 (671.7 MB, after a click on its update button).

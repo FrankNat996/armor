@@ -18,6 +18,18 @@ Required by the guiding document (§7). **Source:** reproducible results only. A
 - **armor:** cargo profile `difftest` (optimised, with overflow checks); each case runs twice, interpreted and with `--jit` (since 2026-10-12), and must match qemu in both; `difftest --lockstep` also runs them with every translated instruction checked against the interpreter.
 - **Oracle:** `qemu-x86_64` 10.0.13 with `-cpu qemu64,-svm,+ssse3,+sse4.1,+sse4.2,+popcnt` (ADR-0010; until 2026-10-13 `qemu64,-sse3,-svm`) and `-L <root>`; armor with the same root (`ARMOR_ROOT`, ADR-0013). The root is `/usr/x86_64-linux-gnu` for the test programs and busybox, `target/guest/rootfs` for coreutils, the tools of `tools.txt`, perl and python. For i386 programs (since 2026-10-14) the oracle is `qemu-i386` 10.0.13 with `-cpu qemu32,+sse3,+ssse3,+sse4.1,+sse4.2,+popcnt`, plus the Xeon X5675 (`difftest --oracle`), which decides where qemu-i386 is wrong (`testing.md`).
 
+## Machines (roadmap M9, since 2026-10-15)
+What runs where, and how it was checked (`testing.md`, "Other page sizes" and "Other distributions"):
+
+| Machine | CPU | Pages | System | x86 Linux programs (armor) | Windows programs (Hangover 11.16) | Steam ARM64 client |
+|---|---|---|---|---|---|---|
+| Raspberry Pi 5 | Cortex-A76 (ARMv8.2, LSE, LRCPC) | 4K | Debian 13 | ✅ 467/467 `difftest` against qemu with every engine, 267 against the Xeon | ✅ the entries below | ✅ |
+| Raspberry Pi 5, JIT forced to ARMv8.0 | the same, without LSE and `LDAPR` | 4K | Debian 13 | ✅ 467/467 | — | — |
+| KVM virtual machine on the Pi 5 | Cortex-A76 | 16K | Debian 13, kernel `6.12.111+deb13-arm64-16k` | ✅ 454/454 against the 4K results, every engine and the ARMv8.0 paths | ✅ 7-Zip x64 (archive identical to its ARM64 build), Notepad++ | ❌ needs 4K pages |
+| KVM virtual machine on the Pi 5 | Cortex-A76 | 64K | Ubuntu 24.04, kernel `6.8.0-147-generic-64k` | ✅ 454/454 against the 4K results, every engine and the ARMv8.0 paths | ✅ 7-Zip x64 (archive identical to its ARM64 build) | ❌ needs 4K pages |
+| podman container on the Pi 5 | Cortex-A76 | 4K | Fedora 42 | ✅ `distro-check`: Python (x86-64), `sort` (i386), a `.deb` | ✅ Wine starts (`cmd /c ver`) | not tried |
+| podman container on the Pi 5 | Cortex-A76 | 4K | Arch Linux ARM | ✅ `distro-check`: Python (x86-64), `sort` (i386), a `.deb` | ✅ Wine starts (`cmd /c ver`) | not tried |
+
 ## Applications
 | Application | Version, architecture | Dependencies | Level | Functions tested | Known problems | Performance |
 |---|---|---|---|---|---|---|

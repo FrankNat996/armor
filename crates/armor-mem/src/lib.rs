@@ -368,8 +368,10 @@ pub struct AddressSpace {
     /// of host pages, that mappings may take; 0 for no limit. Counted by
     /// armor, so not a security boundary (docs/tech/security.md).
     limit: AtomicU64,
-    /// For a 32-bit guest (ADR-0029): mappings whose place armor chooses
-    /// end at or below this address; 0 for none (`set_ceiling`).
+    /// Mappings whose place armor chooses end at or below this address; 0
+    /// for none (`set_ceiling`): 4 GiB for a 32-bit guest (ADR-0029), 2^47
+    /// less a page on a host that places mappings above what an x86-64
+    /// guest addresses.
     ceiling: AtomicU64,
 }
 
@@ -528,6 +530,37 @@ impl PageTable {
     }
 }
 
+/// The end of an x86-64 guest's user addresses: 47 bits less the last
+/// page, which x86-64 Linux never gives to user space (`TASK_SIZE`), and
+/// which armor's syscalls refuse as EFAULT (`USER_END`).
+const GUEST_ADDRESS_LIMIT: u64 = PAGE_TABLE_ENTRIES * GUEST_PAGE_SIZE - GUEST_PAGE_SIZE;
+
+/// Whether the host puts a mapping whose place it chooses at or above
+/// `limit`: kernels with more than 47 bits of user addresses do (Ubuntu's
+/// kernel with 64K pages gives 48 bits, and its first mappings land above
+/// 2^47), those of the Raspberry Pi (39 bits with 4K pages, 47 with 16K)
+/// do not.
+fn host_places_above(limit: u64) -> bool {
+    let len = host_page_size() as usize;
+    // SAFETY: an anonymous inaccessible mapping, unmapped right away.
+    let ptr = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            len,
+            libc::PROT_NONE,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+            -1,
+            0,
+        )
+    };
+    if ptr == libc::MAP_FAILED {
+        return false;
+    }
+    // SAFETY: the mapping just made.
+    unsafe { libc::munmap(ptr, len) };
+    ptr as u64 + len as u64 > limit
+}
+
 /// The host's page size, in bytes.
 pub fn host_page_size() -> u64 {
     // SAFETY: sysconf has no preconditions.
@@ -549,7 +582,11 @@ impl AddressSpace {
             concurrent: AtomicBool::new(false),
             writers_waiting: AtomicU32::new(0),
             limit: AtomicU64::new(0),
-            ceiling: AtomicU64::new(0),
+            ceiling: AtomicU64::new(if host_places_above(GUEST_ADDRESS_LIMIT) {
+                GUEST_ADDRESS_LIMIT
+            } else {
+                0
+            }),
         }
     }
 
@@ -628,7 +665,9 @@ impl AddressSpace {
     /// shared mapping without a fixed address) below `addr`, for a guest
     /// that can only address 4 GiB (ADR-0029). They are placed top-down
     /// from there, the first free range, as the kernel lays out a 32-bit
-    /// process.
+    /// process. A new address space already has 2^47 less a page as its
+    /// ceiling when the host would place mappings above it
+    /// (`host_places_above`).
     pub fn set_ceiling(&self, addr: u64) {
         self.ceiling.store(addr, Ordering::Relaxed);
     }
@@ -1073,11 +1112,16 @@ impl AddressSpace {
     /// Grows the shared mapping `[old, old + old_len)` (ADR-0022) to
     /// `new_len` bytes, as mremap(2) does: the host remaps its own mapping,
     /// which stays the same memory (the same file pages, or the same
-    /// shared anonymous memory). In place when the pages after it are
-    /// free, else (with `may_move`) at a place chosen like any other
-    /// mapping (below the ceiling), which the host's mremap moves it to.
-    /// The range must start and end on host page boundaries and hold only
-    /// shared guest pages with one protection. Returns the new address.
+    /// shared anonymous memory). The mapping's host pages are its own
+    /// (ADR-0022), so on a host with pages larger than the guest's it may
+    /// start inside its first host page and end inside its last one:
+    /// growing within those host pages only gives the guest more of them;
+    /// beyond, the host extends its mapping in place when the host pages
+    /// after it are free, else (with `may_move`) moves it to a place
+    /// chosen like any other mapping (below the ceiling), with the same
+    /// offset inside the first host page. The range must hold only shared
+    /// guest pages with one protection, and the guest pages it grows into
+    /// inside its last host page must be unmapped. Returns the new address.
     pub fn remap_shared(
         &self,
         old: u64,
@@ -1086,12 +1130,22 @@ impl AddressSpace {
         may_move: bool,
     ) -> Result<u64, MapError> {
         let host = self.host_page_size;
-        if !old.is_multiple_of(host) || !old_len.is_multiple_of(host) || new_len <= old_len {
+        if !old.is_multiple_of(GUEST_PAGE_SIZE)
+            || !old_len.is_multiple_of(GUEST_PAGE_SIZE)
+            || !new_len.is_multiple_of(GUEST_PAGE_SIZE)
+            || old_len == 0
+            || new_len <= old_len
+        {
             return Err(MapError::SharedPlacement(
-                "growing a shared mapping needs host-page boundaries",
+                "growing a shared mapping needs guest-page boundaries",
             ));
         }
-        let new_host_len = round_up(new_len, host).ok_or(MapError::OutOfRange)?;
+        // The mapping's host pages: from the one holding `old`, `delta`
+        // bytes before it.
+        let base = old - old % host;
+        let delta = old - base;
+        let old_host_len = round_up(delta + old_len, host).ok_or(MapError::OutOfRange)?;
+        let new_host_len = round_up(delta + new_len, host).ok_or(MapError::OutOfRange)?;
         let mut tables = self.tables_mut();
         let first_page = old / GUEST_PAGE_SIZE;
         let Some(prot) = tables.pages.get(first_page) else {
@@ -1106,7 +1160,7 @@ impl AddressSpace {
                 "pages with different permissions",
             ));
         }
-        let host_range = old / host..(old + old_len) / host;
+        let host_range = base / host..(base + old_host_len) / host;
         let Some(&writable) = tables.shared.get(&host_range.start) else {
             return Err(MapError::SharedPlacement("not a shared mapping"));
         };
@@ -1116,30 +1170,41 @@ impl AddressSpace {
         {
             return Err(MapError::SharedPlacement("mixed shared pages"));
         }
-        self.admit(&tables, (new_host_len - old_len) / host)?;
+        // The rest of the last host page belongs to this mapping only
+        // while the guest has nothing there.
+        let tail = old_pages.end..(base + old_host_len) / GUEST_PAGE_SIZE;
+        if tail.clone().any(|page| tables.pages.get(page).is_some()) {
+            return Err(MapError::SharedPlacement(
+                "other guest pages in the mapping's last host page",
+            ));
+        }
+        self.admit(&tables, (new_host_len - old_host_len) / host)?;
         let limit = PAGE_TABLE_ENTRIES * GUEST_PAGE_SIZE;
-        let grow_end = old + new_host_len;
-        // In place: the host extends the mapping only into free pages.
-        let in_place = grow_end <= limit
-            && !tables
-                .host_pages
-                .range(host_range.end..grow_end / host)
-                .any(|_| true)
-            && {
-                // SAFETY: old is this address space's shared mapping; without
-                // MREMAP_MAYMOVE the host only extends it into free pages.
-                let got = unsafe {
-                    libc::mremap(
-                        old as *mut libc::c_void,
-                        old_len as usize,
-                        new_host_len as usize,
-                        0,
-                    )
-                };
-                got as u64 == old
-            };
-        let new = if in_place {
-            old
+        let grow_end = base + new_host_len;
+        // In place: within the host pages the mapping has, or the host
+        // extends it only into free pages.
+        let in_place = new_host_len == old_host_len
+            || (grow_end <= limit
+                && !tables
+                    .host_pages
+                    .range(host_range.end..grow_end / host)
+                    .any(|_| true)
+                && {
+                    // SAFETY: base is this address space's shared mapping;
+                    // without MREMAP_MAYMOVE the host only extends it into
+                    // free pages.
+                    let got = unsafe {
+                        libc::mremap(
+                            base as *mut libc::c_void,
+                            old_host_len as usize,
+                            new_host_len as usize,
+                            0,
+                        )
+                    };
+                    got as u64 == base
+                });
+        let new_base = if in_place {
+            base
         } else {
             if !may_move {
                 return Err(MapError::Host(io::Error::from_raw_os_error(libc::ENOMEM)));
@@ -1164,12 +1229,12 @@ impl AddressSpace {
                     Ok(ptr as u64)
                 }
             })?;
-            // SAFETY: old is this address space's shared mapping and target
-            // the placeholder just made, which MREMAP_FIXED replaces.
+            // SAFETY: base is this address space's shared mapping and
+            // target the placeholder just made, which MREMAP_FIXED replaces.
             let got = unsafe {
                 libc::mremap(
-                    old as *mut libc::c_void,
-                    old_len as usize,
+                    base as *mut libc::c_void,
+                    old_host_len as usize,
                     new_host_len as usize,
                     libc::MREMAP_MAYMOVE | libc::MREMAP_FIXED,
                     target as *mut libc::c_void,
@@ -1183,7 +1248,8 @@ impl AddressSpace {
             }
             target
         };
-        if new != old {
+        let new = new_base + delta;
+        if new_base != base {
             for page in old_pages {
                 tables.pages.remove(page);
             }
@@ -1192,11 +1258,11 @@ impl AddressSpace {
                 tables.shared.remove(&page);
             }
         }
-        for page in new / host..(new + new_host_len) / host {
+        for page in new_base / host..(new_base + new_host_len) / host {
             tables.host_pages.insert(page);
             tables.shared.insert(page, writable);
         }
-        set_pages(&mut tables, new, new + new_host_len, prot);
+        set_pages(&mut tables, new, new + new_len, prot);
         // Moved code, or code that grew: translations are stale either way.
         self.code_changed();
         Ok(new)
@@ -2003,6 +2069,51 @@ mod tests {
         let private = mem.map_anywhere(host, Prot::READ).unwrap();
         assert!(mem.remap_shared(private, host, 2 * host, true).is_err());
         assert!(mem.remap_shared(grown, host / 2, host, true).is_err());
+        drop(file);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A shared mapping of one guest page grown to three (on a host with
+    /// 16K pages, inside its host page) and then to five (into a second
+    /// host page there): the bytes and the file stay the same.
+    #[test]
+    fn shared_mappings_smaller_than_a_host_page_grow() {
+        let mem = AddressSpace::new();
+        let host = mem.host_page_size();
+        let path = std::env::temp_dir().join(format!("armor-remap-small-{}", std::process::id()));
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&path)
+            .unwrap();
+        file.set_len(8 * host).unwrap();
+        use std::os::fd::AsRawFd;
+        let source = SharedSource::File {
+            fd: file.as_raw_fd(),
+            offset: 0,
+        };
+        let page = GUEST_PAGE_SIZE;
+        let addr = mem
+            .map_shared(None, page, Prot::READ | Prot::WRITE, source, true)
+            .unwrap();
+        mem.write(addr, b"first").unwrap();
+        let three = mem.remap_shared(addr, page, 3 * page, true).unwrap();
+        assert_eq!(mem.prot(three + 2 * page), Some(Prot::READ | Prot::WRITE));
+        assert_eq!(mem.prot(three + 3 * page), None);
+        mem.write(three + 2 * page, b"third").unwrap();
+        let five = mem.remap_shared(three, 3 * page, 5 * page, true).unwrap();
+        let mut buf = [0u8; 5];
+        mem.read(five, &mut buf).unwrap();
+        assert_eq!(&buf, b"first");
+        mem.read(five + 2 * page, &mut buf).unwrap();
+        assert_eq!(&buf, b"third");
+        mem.write(five + 4 * page, b"fifth").unwrap();
+        use std::os::unix::fs::FileExt;
+        file.read_exact_at(&mut buf, 4 * page).unwrap();
+        assert_eq!(&buf, b"fifth");
+        assert_eq!(mem.prot(five + 5 * page), None);
         drop(file);
         let _ = std::fs::remove_file(&path);
     }

@@ -64,6 +64,8 @@ How verified: `--version` of each tool, `dpkg -L qemu-user`, `dpkg -L linux-libc
 
 Installed on 2026-10-14 (ADR-0032): `clang`, `lld`, `llvm` 19, `cmake` 3.31.6, `ninja-build` 1.12.1 and `python3-pkg-resources` (to build FEX and box64); `libgtk2.0-0t64`, `libibus-1.0-5`, `libpipewire-0.3-0t64` (host libraries that the ARM64 Steam client asks for); `xvfb`, `x11-apps` (`xwd`), `netpbm` (virtual display and captures); then the desktop, `rpi-connect` and `grim` (above, "Desktop and remote screen"). box64 and FEX are built in `~/src` (versions and options in `tech/engines.md`), not installed in the system: no binfmt and no files in `/etc`.
 
+Installed on 2026-10-15 (roadmap M9): `qemu-system-arm` 10.0.13 and `qemu-efi-aarch64` (KVM virtual machines with 16K and 64K pages, in `target/vm/`, `testing.md` "Other page sizes"), `cloud-image-utils` (their cloud-init seeds), `podman` 5.4.2 (containers of Fedora 42 and Arch Linux ARM for `cargo xtask distro-check`, ADR-0043; the downloads are in `target/distros/`).
+
 Not installed (available if needed): `qemu-user-static`, the Debian `rustc`/`cargo` 1.85.1 packages, Debian's `box64` 0.3.4 (older than the releases used).
 Miri (dynamic checking of `unsafe` code) requires the nightly toolchain: not installed. `unsafe` code has existed since M1 (`armor-mem`, `armor-linux`, `armor-jit`); installing it is a choice still to make.
 

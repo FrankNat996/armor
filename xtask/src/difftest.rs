@@ -6,7 +6,11 @@
 //! `--jit` or `--lockstep` picks one. With `--oracle` the expected output
 //! comes from a real x86-64 machine instead (`oracle.rs`, ADR-0025), for
 //! the static programs only; a few cases where qemu is known to be wrong
-//! run only then (`HARDWARE_ONLY`). See docs/testing.md.
+//! run only then (`HARDWARE_ONLY`). `--save DIR` also writes qemu's result
+//! of every case into DIR, and `--expected DIR` compares with those saved
+//! results instead of running qemu: on hosts with 16K or 64K pages, where
+//! qemu-user itself fails some cases, armor is compared with the results
+//! qemu gives on a 4K host (roadmap M9). See docs/testing.md.
 
 use std::fs::File;
 use std::os::unix::process::ExitStatusExt;
@@ -63,6 +67,28 @@ const ENVIRONMENT_DEPENDENT: [(&str, &str); 10] = [
         "iopl depends on privileges and kernel configuration",
     ),
     ("busybox/ls-long", "files owned by a different user"),
+];
+
+/// Cases whose output depends on the machine they run on, compared with
+/// results saved on another one: skipped with `--expected`.
+const OTHER_MACHINE: [(&str, &str); 14] = [
+    ("c/drm_version", "the GPU of the machine"),
+    ("c-pie/drm_version", "the GPU of the machine"),
+    ("c-dyn/drm_version", "the GPU of the machine"),
+    ("busybox/ls", "different files"),
+    ("busybox/ls-long", "files owned by a different user"),
+    ("busybox/find", "a different /etc"),
+    ("busybox/pwd", "a different directory"),
+    ("busybox/id", "a different user"),
+    ("coreutils/pwd", "a different directory"),
+    ("coreutils/ls-long", "files owned by a different user"),
+    ("coreutils32/pwd", "a different directory"),
+    ("coreutils32/ls-long", "files owned by a different user"),
+    ("tools/tar-list", "dates shown in another time zone"),
+    (
+        "tools/tar-list-closed-stdout",
+        "dates shown in another time zone",
+    ),
 ];
 
 /// Cases where qemu is known to differ from the hardware, so that only
@@ -152,11 +178,64 @@ fn hardware_only(name: &str) -> Option<&'static str> {
     })
 }
 
+/// Saved reference results (`--save`, `--expected`).
+enum Saved {
+    Write(PathBuf),
+    Read(PathBuf),
+}
+
+/// The files of a saved result: stdout, and how the process ended.
+fn saved_files(dir: &Path, name: &str) -> (PathBuf, PathBuf) {
+    (
+        dir.join(format!("{name}.stdout")),
+        dir.join(format!("{name}.status")),
+    )
+}
+
+fn save(dir: &Path, name: &str, output: &Output) -> Result<(), String> {
+    let (stdout, status) = saved_files(dir, name);
+    if let Some(parent) = stdout.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
+    }
+    let ending = match termination(output.status) {
+        Some(Termination::Exit(code)) => format!("exit {code}\n"),
+        Some(Termination::Signal(signal)) => format!("signal {signal}\n"),
+        None => return Err(format!("{name}: the reference has no exit status")),
+    };
+    std::fs::write(&stdout, &output.stdout).map_err(|e| format!("{}: {e}", stdout.display()))?;
+    std::fs::write(&status, ending).map_err(|e| format!("{}: {e}", status.display()))
+}
+
+fn load(dir: &Path, name: &str) -> Result<Output, String> {
+    let (stdout, status) = saved_files(dir, name);
+    let read = |p: &Path| std::fs::read(p).map_err(|e| format!("no saved result for {name}: {e}"));
+    let ending = String::from_utf8_lossy(&read(&status)?).trim().to_string();
+    let raw = match ending.split_once(' ') {
+        Some(("exit", code)) => code.parse::<i32>().map(|c| (c & 0xff) << 8),
+        Some(("signal", signal)) => signal.parse::<i32>(),
+        _ => return Err(format!("{}: not `exit N` or `signal N`", status.display())),
+    }
+    .map_err(|e| format!("{}: {e}", status.display()))?;
+    Ok(Output {
+        status: ExitStatus::from_raw(raw),
+        stdout: read(&stdout)?,
+        stderr: Vec::new(),
+    })
+}
+
 pub fn run(args: &[String]) -> Result<(), String> {
     let (oracle, args) = match args {
         [flag, rest @ ..] if flag == "--oracle" => (Some(Oracle::from_env()?), rest),
         _ => (None, args),
     };
+    let (saved, args) = match args {
+        [flag, dir, rest @ ..] if flag == "--save" => (Some(Saved::Write(dir.into())), rest),
+        [flag, dir, rest @ ..] if flag == "--expected" => (Some(Saved::Read(dir.into())), rest),
+        _ => (None, args),
+    };
+    if oracle.is_some() && saved.is_some() {
+        return Err("--oracle cannot be combined with --save or --expected".to_string());
+    }
     let (engines, filter): (&[Engine], _) = match args {
         [flag, rest @ ..] if flag == "--interpreter" => (&[Engine::Interpreter], rest),
         [flag, rest @ ..] if flag == "--jit" => (&[Engine::Jit], rest),
@@ -174,7 +253,11 @@ pub fn run(args: &[String]) -> Result<(), String> {
         build_armor(&paths)?;
     }
     let mut runs = collect(&paths, filter)?;
-    let reference = if oracle.is_some() { "hardware" } else { "qemu" };
+    let reference = match (&oracle, &saved) {
+        (Some(_), _) => "hardware",
+        (None, Some(Saved::Read(_))) => "saved",
+        _ => "qemu",
+    };
     if let Some(oracle) = &oracle {
         // Only static programs run there: the dynamic ones need the guest
         // root, and a closed stdout cannot cross ssh.
@@ -203,6 +286,17 @@ pub fn run(args: &[String]) -> Result<(), String> {
         let names: Vec<String> = runs.iter().map(|run| run.name.clone()).collect();
         oracle.prepare(&busybox::data_dir(&paths), &names)?;
     } else {
+        if let Some(Saved::Read(_)) = &saved {
+            runs.retain(
+                |run| match OTHER_MACHINE.iter().find(|(name, _)| *name == run.name) {
+                    Some((_, why)) => {
+                        println!("SKIP {} (saved on another machine: {why})", run.name);
+                        false
+                    }
+                    None => true,
+                },
+            );
+        }
         runs.retain(|run| match hardware_only(&run.name) {
             Some(why) => {
                 println!("SKIP {} (hardware oracle only: {why})", run.name);
@@ -228,7 +322,15 @@ pub fn run(args: &[String]) -> Result<(), String> {
                 let stdin = run.data.as_ref().map(|dir| dir.join(busybox::STDIN_FILE));
                 oracle.run(remote, &run.args, run.data.is_some(), stdin.as_deref())?
             }
-            None => execute(Runner::Qemu, &paths, run)?,
+            None => match &saved {
+                Some(Saved::Read(dir)) => load(dir, &run.name)?,
+                Some(Saved::Write(dir)) => {
+                    let output = execute(Runner::Qemu, &paths, run)?;
+                    save(dir, &run.name, &output)?;
+                    output
+                }
+                None => execute(Runner::Qemu, &paths, run)?,
+            },
         };
         let mut failed = Vec::new();
         for &engine in engines {

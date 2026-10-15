@@ -71,16 +71,18 @@ int main(void) {
     alias[PAGE + 5] = 'T';
     printf("first mapping sees: %.13s\n", file + 2 * PAGE + 5);
 
-    /* MAP_FIXED inside a reserved range, over whole 16K pages (ADR-0022:
-     * on a 16K-page host a shared mapping cannot share a host page with
-     * other guest pages, the reservation's included). */
-    char *area = mmap(NULL, 16 * PAGE, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    char *fixed = mmap(area + 4 * PAGE, 4 * PAGE, PROT_READ, MAP_SHARED | MAP_FIXED, fd, 0);
-    check("MAP_FIXED shared file", fixed == area + 4 * PAGE ? 0 : -1);
+    /* MAP_FIXED inside a reserved range, over whole 64 KiB blocks (ADR-0022:
+     * on a host with 16K or 64K pages a shared mapping cannot share a host
+     * page with other guest pages, the reservation's included). */
+    long block = 65536;
+    char *area = mmap(NULL, 3 * block, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    char *aligned = (char *)(((unsigned long)area + block) & ~(block - 1));
+    char *fixed = mmap(aligned, block, PROT_READ, MAP_SHARED | MAP_FIXED, fd, 0);
+    check("MAP_FIXED shared file", fixed == aligned ? 0 : -1);
     printf("fixed sees: %.14s\n", fixed + PAGE + 10);
-    check("mprotect of the reservation", mprotect(area, 4 * PAGE, PROT_READ | PROT_WRITE));
-    area[0] = 1;
-    munmap(area, 16 * PAGE);
+    check("mprotect of the reservation", mprotect(aligned + block, 4 * PAGE, PROT_READ | PROT_WRITE));
+    aligned[block] = 1;
+    munmap(area, 3 * block);
 
     /* MADV_DONTNEED keeps what the file holds. */
     check("madvise DONTNEED", madvise(file, 3 * PAGE, MADV_DONTNEED));

@@ -8,7 +8,10 @@
 //! before anything is extracted. Hangover's Debian packages are unpacked,
 //! never installed: no root, no maintainer scripts, nothing outside the
 //! engines directory. The build is chosen from `/etc/os-release`, since
-//! Hangover's Wine links the distribution's own libraries.
+//! Hangover's Wine links the distribution's own libraries; a distribution
+//! that is neither Debian nor Ubuntu gets the Debian 13 build, whose Wine
+//! starts on Fedora 42 and Arch Linux ARM with their own libraries
+//! (ADR-0043).
 
 use std::ffi::OsString;
 use std::fs::{self, File};
@@ -199,7 +202,8 @@ pub fn os_release_value(text: &str, key: &str) -> Option<String> {
 
 /// The build for the host described by `os_release`: a distribution based
 /// on Ubuntu by its `UBUNTU_CODENAME`, else Debian or Ubuntu by `ID` (or
-/// `ID_LIKE`) and `VERSION_CODENAME`.
+/// `ID_LIKE`) and `VERSION_CODENAME`; any other distribution, the Debian 13
+/// build (ADR-0043).
 pub fn build_for(os_release: &str) -> Result<&'static Build, String> {
     let get = |key| os_release_value(os_release, key).unwrap_or_default();
     let (distribution, codename) = if !get("UBUNTU_CODENAME").is_empty() {
@@ -207,14 +211,16 @@ pub fn build_for(os_release: &str) -> Result<&'static Build, String> {
     } else {
         let id = get("ID");
         let like = get("ID_LIKE");
-        let family = if id == "debian" || id == "ubuntu" {
-            id
-        } else if like.split_whitespace().any(|l| l == "debian") {
-            "debian".to_string()
+        if id == "debian" || id == "ubuntu" {
+            (id, get("VERSION_CODENAME"))
+        } else if like
+            .split_whitespace()
+            .any(|l| l == "debian" || l == "ubuntu")
+        {
+            ("debian".to_string(), get("VERSION_CODENAME"))
         } else {
-            id
-        };
-        (family, get("VERSION_CODENAME"))
+            ("debian".to_string(), "trixie".to_string())
+        }
     };
     BUILDS
         .iter()
@@ -474,7 +480,12 @@ mod tests {
         let derivative = "ID=raspbian\nID_LIKE=debian\nVERSION_CODENAME=bookworm\n";
         assert_eq!(build_for(derivative).unwrap().codename, "bookworm");
         let fedora = "ID=fedora\nVERSION_ID=43\n";
-        assert!(build_for(fedora).unwrap_err().contains("debian trixie"));
+        assert_eq!(build_for(fedora).unwrap().codename, "trixie");
+        let arch = "ID=archarm\nID_LIKE=arch\n";
+        assert_eq!(build_for(arch).unwrap().distribution, "debian");
+        // A Debian derivative of a release Hangover has no build for.
+        let old = "ID=raspbian\nID_LIKE=debian\nVERSION_CODENAME=bullseye\n";
+        assert!(build_for(old).unwrap_err().contains("debian trixie"));
         assert_eq!(
             os_release_value("ID='arch'\n", "ID").as_deref(),
             Some("arch")

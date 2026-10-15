@@ -59,9 +59,12 @@ int main(void) {
     printf("parent sees: %s\n", p + 100);
 
     /* A given address: rounded down with SHM_RND; taken without REMAP. */
-    char *area = mmap(NULL, 8 * 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    char *base = area + 4 * 4096;
-    munmap(base, 4 * 4096);
+    /* In 64 KiB blocks: on a host with 16K or 64K pages the segment needs
+       host pages of its own (ADR-0022). */
+    long block = 65536;
+    char *area = mmap(NULL, 3 * block, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    char *base = (char *)(((unsigned long)area + block) & ~(block - 1));
+    munmap(base, block);
     char *again = shmat(id, base + 100, SHM_RND | SHM_RDONLY);
     printf("shmat rounded down: %d\n", again == base);
     printf("  same contents: %d\n", again != (void *)-1 && strcmp(again, "parent wrote") == 0);

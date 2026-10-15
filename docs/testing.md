@@ -247,8 +247,30 @@ Every JIT increment has its own mutation tests (`tech/jit.md`). When a mutation 
 Many instructions leave some flags **architecturally undefined**: qemu, the hardware and armor may legitimately produce different values.
 Every test compares RFLAGS through a **mask** that contains only the flags defined for that instruction (`FLAGS_STATUS`, `FLAGS_NO_AF`, …). Examples and sources in `tech/x86-64-flags.md`.
 
+## Other page sizes (roadmap M9, since 2026-10-15)
+armor runs on hosts with 4K, 16K and 64K pages. The Pi 5 boots one kernel at a time, so the other sizes are measured in KVM virtual machines on it (QEMU 10.0.13, `-cpu host`, 4 CPUs, 3 GiB):
+- **16K:** Debian 13's cloud image (`debian-13-genericcloud-arm64.qcow2`, SHA-512 checked against Debian's list) with Debian's own 16K kernel, `linux-image-arm64-16k` (`6.12.111+deb13-arm64-16k`, `getconf PAGESIZE` = 16384);
+- **64K:** Ubuntu 24.04's cloud image (`noble-server-cloudimg-arm64.img`, SHA-256 checked) with `linux-generic-64k` (`6.8.0-147-generic-64k`, 65536, 48-bit addresses).
+
+cloud-init installs the kernel and the build tools; the repository is shared read-only with 9p and copied in, the guest programs and roots of this machine with it.
+
+On those hosts qemu-user itself is not a reliable reference: on 16K `qemu-i386` crashes or fails `mmap` in 6 cases; on 64K `qemu-x86_64` 8.2 crashes in dozens (grep, gawk, xz). So **`difftest --save DIR`** keeps qemu's result of every case (stdout and how the process ended) on the 4K host, where qemu matches the Xeon, and **`difftest --expected DIR`** compares armor with those saved results instead of running qemu; the cases whose output depends on the machine (user, directory, files of `/etc`, time zone, GPU: `OTHER_MACHINE` in `difftest.rs`) are skipped. The results, 2026-10-15:
+
+| Host | Rust tests | `difftest` (interpreter and JIT) | `--lockstep` | ARMv8.0 paths (`ARMOR_HOST_FEATURES=baseline`) | `sandbox-check` |
+|---|---|---|---|---|---|
+| Pi 5, 4K (the reference) | 267 | 467/467 against qemu (results saved with `--save`) | 467/467 | 467/467 | ✅ |
+| Debian 13, 16K | 267 | 454/454 against the saved results (13 machine-dependent cases skipped) | 454/454 | 454/454 | ✅ |
+| Ubuntu 24.04, 64K | 267 | 454/454 against the saved results | 454/454 | 454/454 | ✅ after lifting Ubuntu's AppArmor restriction on user namespaces (`tech/security.md`) |
+
+Against qemu run on the same host, before the saved results existed: on 16K 461/467, the other 6 being qemu-i386's own failures (armor's output there equals the 4K run's in all three engines); on 64K 400/467, almost all qemu-x86_64 8.2 crashing.
+
+What these hosts found in armor, fixed on 2026-10-15: shared mappings smaller than a host page could not grow (`mremap`, `tech/memory.md`); on the 48-bit host armor placed memory above 2^47 and then the guest stack in the last page below it (`tech/memory.md`, "Address space"). Three tests laid shared and private pages out in 4K or 16K steps, which on bigger host pages share a host page, the case ADR-0022 leaves unsupported; `mremap_shared`, `shared_memory` and `sysv_shm` now use 64 KiB blocks for those cases.
+
+## Other distributions (ADR-0043, since 2026-10-15)
+**`cargo xtask distro-check`** builds the package and its archive (`cargo xtask package`) and, in podman containers on this machine, installs the archive with its `install.sh` and uses armor as a user would: Debian's Python (x86-64) and coreutils' `sort` (i386) must print what they print here, `armor install` of Debian's `hello` `.deb` (pinned SHA-256) takes its libraries from Debian's archive with the keyring armor carries, and `armor engine fetch` downloads the Windows engine, whose Wine runs `cmd /c ver`. Fedora 42 comes from Fedora's registry; Arch Linux ARM from its official root archive, checked against its build key's fingerprint before `podman import`. 2026-10-15: every check passes on both.
+
 ## Golden files
-Today `difftest` **runs qemu at every test**: it is the simplest solution. Alternatively qemu's output could be saved in versioned golden files, so the tests would run without qemu too. The decision stays open: the structure of `difftest` suits both.
+By default `difftest` **runs qemu at every test**: it is the simplest solution. Since 2026-10-15 `--save` and `--expected` keep and use qemu's results in a directory (above, "Other page sizes"); they are not versioned in the repository.
 
 ## Commands
 ```bash
