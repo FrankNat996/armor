@@ -295,15 +295,26 @@ fn random_instruction(rng: &mut Rng, out: &mut Vec<u8>) {
             }
         }
         8 => {
-            // lea reg, [rbx + index * scale + disp8].
+            // lea reg, [rbx + index * scale + disp8], [index * scale +
+            // disp32] without a base, or [r9 + index * scale + disp8] (a
+            // base kept in the `Cpu`).
             let index = rng.pick(&[0u8, 1, 2, 5, 6, 7, 8, 9, 12, 13, 14, 15]);
+            let form = rng.below(3);
+            let base_r9 = u8::from(form == 2);
             out.extend([
-                0x40 | (w << 3) | ((reg >> 3) << 2) | ((index >> 3) << 1),
+                0x40 | (w << 3) | ((reg >> 3) << 2) | ((index >> 3) << 1) | base_r9,
                 0x8d,
             ]);
-            out.push(0x44 | ((reg & 7) << 3));
-            out.push(((rng.below(4) as u8) << 6) | ((index & 7) << 3) | 3);
-            out.push(rng.next() as u8);
+            let scale = (rng.below(4) as u8) << 6;
+            if form == 1 {
+                out.push(0x04 | ((reg & 7) << 3));
+                out.push(scale | ((index & 7) << 3) | 5);
+                out.extend_from_slice(&(rng.next() as u32).to_le_bytes());
+            } else {
+                out.push(0x44 | ((reg & 7) << 3));
+                out.push(scale | ((index & 7) << 3) | if form == 2 { 1 } else { 3 });
+                out.push(rng.next() as u8);
+            }
         }
         9 => {
             // movzx, movsx from a register or memory; movsxd.
@@ -1835,4 +1846,87 @@ fn dump_translation() {
         block.len(),
         words.len()
     );
+}
+
+/// The flags that wait as operands and are computed by whoever observes
+/// them (shifts, multiplications), or that pass through (counts of 0,
+/// rotates, bit tests and scans, inc and dec): every condition after each,
+/// in the same block, in the next one, after an earlier comparison whose
+/// flags must survive, and at a fault right after (the interpreter sees
+/// the exact flags).
+#[test]
+fn conditions_after_deferred_and_partial_flags() {
+    let guest = Guest::new();
+    let mut rng = Rng(47);
+    let mut ops: Vec<Vec<u8>> = Vec::new();
+    // Shifts and rotates of rax/eax/ax/al by cl, 1 and 5.
+    for ext in [4u8, 5, 7, 0, 1] {
+        let modrm = 0xc0 | ext << 3;
+        for prefix in [&[0x48u8][..], &[], &[0x66], &[0xff]] {
+            let (cl, one, imm) = if prefix == [0xff] {
+                (0xd2, 0xd0, 0xc0)
+            } else {
+                (0xd3, 0xd1, 0xc1)
+            };
+            let p: &[u8] = if prefix == [0xff] { &[] } else { prefix };
+            ops.push([p, &[cl, modrm]].concat());
+            ops.push([p, &[one, modrm]].concat());
+            ops.push([p, &[imm, modrm, 5]].concat());
+        }
+    }
+    for p in [&[0x48u8][..], &[]] {
+        ops.push([p, &[0x0f, 0xaf, 0xc1]].concat()); // imul rax, rcx
+        ops.push([p, &[0x6b, 0xc1, 0x07]].concat()); // imul rax, rcx, 7
+        ops.push([p, &[0xf7, 0xe1]].concat()); // mul rcx
+        ops.push([p, &[0xf7, 0xe9]].concat()); // imul rcx
+        ops.push([p, &[0x0f, 0xa3, 0xc8]].concat()); // bt rax, rcx
+        ops.push([p, &[0x0f, 0xbc, 0xc1]].concat()); // bsf rax, rcx
+        ops.push([p, &[0xff, 0xc0]].concat()); // inc rax
+        ops.push([p, &[0xff, 0xc8]].concat()); // dec rax
+    }
+    let values = [
+        0u64,
+        1,
+        5,
+        31,
+        32,
+        63,
+        64,
+        0x7f,
+        0x80,
+        0xffff_ffff,
+        0x8000_0000,
+        i64::MAX as u64,
+        i64::MIN as u64,
+        u64::MAX,
+    ];
+    for op in &ops {
+        for cc in 0..16u8 {
+            for form in 0..7 {
+                let mut code = Vec::new();
+                if (3..5).contains(&form) {
+                    // cmp rcx, rdx first: its flags pass through some.
+                    code.extend([0x48, 0x39, 0xd1]);
+                }
+                code.extend(op);
+                match form {
+                    0 | 3 => code.extend([0x70 | cc, 0x03, 0x48, 0xff, 0xc2]),
+                    1 => code.extend([0xeb, 0x00, 0x70 | cc, 0x03, 0x48, 0xff, 0xc2]),
+                    // setcc dl, then adc rsi, rdi, in the next block.
+                    2 => code.extend([0xeb, 0x00, 0x0f, 0x90 | cc, 0xc2, 0x48, 0x11, 0xfe]),
+                    // A load from address 0: the fault sees the flags.
+                    4 => code.extend([0x48, 0x8b, 0x14, 0x25, 0, 0, 0, 0]),
+                    // setcc dl and cmovcc rdi, rsi in the same block,
+                    // then xor esi, esi: only the condition's flags live.
+                    5 => code.extend([0x0f, 0x90 | cc, 0xc2, 0x31, 0xf6]),
+                    _ => code.extend([0x48, 0x0f, 0x40 | cc, 0xfe, 0x31, 0xf6]),
+                }
+                let mut cpu = guest.cpu(&mut rng);
+                cpu.regs[0] = rng.pick(&values);
+                cpu.regs[1] = rng.pick(&values);
+                cpu.regs[2] = rng.pick(&values);
+                guest.compare(&code, &cpu, 1);
+            }
+        }
+    }
 }

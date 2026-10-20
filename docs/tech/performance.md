@@ -511,3 +511,25 @@ Longer blocks cost translation time: python's startup translates for 124 ms inst
 - the software permission check (`tech/memory.md`) costs **9%**: the same build without it took 16.9 s instead of 18.6 s (an experiment, not a mode of armor). On 4K hosts the host's MMU could check instead, as FEX does; it is a change of ADR-0009's design, not yet proposed;
 - the flag routine still takes 5%: `inc`/`dec` keep CF, so after a block boundary with flags pending they need the previous flags (the match loop at `0x22c4e0` starts with `inc rsi`). Knowing that the jump's target overwrites CF before reading it would avoid it;
 - copies left in the address computation (`[r9 + rbx*8]` copies the index), in `neg`/`not`/`inc`/`dec` and in shifts.
+
+## Dead and deferred flags, operations in place (M11, 2026-10-20)
+Found in the translation of Python's dictionary lookup (`PyDict_Contains`, block at `0x530910` of Debian's `python3.13`, read with `dump_translation` as above): flags computed right away by shifts and multiplications before every memory access, and copies through the JIT's temporaries (`jit.md`, sections "Dead and deferred flags everywhere" and "Operations in place"). The block's main path, without its out-of-line code: 546 AArch64 instructions before, 439 after the flags, 352 after the copies.
+
+✅ `cargo xtask bench --runs 5`, Pi 5 with 4K pages, the three builds one after the other on the same day (9db884d; the flags; the operations in place). Median of 5:
+
+| Benchmark | before | flags | in place | change | qemu | native |
+|---|---|---|---|---|---|---|
+| start-static | 9.5 ms | 9.6 ms | 9.3 ms | −2% | 19.5 ms | 0.4 ms |
+| start-dynamic | 18.7 ms | 19.1 ms | 18.0 ms | −4% | 31.7 ms | 0.6 ms |
+| integer | 225 ms | 225 ms | 195 ms | −13% | 334 ms | 117 ms |
+| float | 265 ms | 254 ms | 253 ms | −5% | 719 ms | 51.0 ms |
+| simd | 213 ms | 217 ms | 205 ms | −4% | 359 ms | 33.6 ms |
+| syscall | 213 ms | 214 ms | 212 ms | 0% | 339 ms | 117 ms |
+| memory | 287 ms | 278 ms | 265 ms | −8% | 395 ms | 149 ms |
+| threads | 155 ms | 160 ms | 144 ms | −7% | 293 ms | 92.5 ms |
+| 7zip | 16545 ms | 16403 ms | 14942 ms | −10% | 28848 ms | 6180 ms |
+| python-start | 243 ms | 244 ms | 226 ms | −7% | 492 ms | 14.6 ms |
+| python-int | 1346 ms | 1255 ms | 1104 ms | −18% | 5052 ms | 226 ms |
+| python-float | 1196 ms | 1104 ms | 945 ms | −21% | 4387 ms | 183 ms |
+
+7-Zip goes from 2.7 to 2.4 times native (box64 1.1, FEX 1.4 on 2026-10-15); Python's loops from 6 to about 5 times. What is left in the same block: the permission check of every access (ADR-0046, proposed), r8 and r9 in the `Cpu` (a load and a store at each use), and the deferred operands of `cmp` saved even when the next instruction overwrites them.

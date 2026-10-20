@@ -22,7 +22,9 @@ State as of 2026-10-13: **design accepted** (ADR-0021). The JIT works (`armor --
 - increment 18: "next page too" bit in the page table, full check only near the page boundary (python loop −8–10%);
 - ADR-0023, steps 1–3: concurrent mode with ordered accesses (`LDAPR`/`STLR`), `mfence`/`lfence`/`sfence` barriers translated, guest threads in parallel (`bench threads` 933 → 546 ms; section "Memory ordering in concurrent mode");
 - ADR-0023, step 4: LSE atomics for `LOCK` instructions in concurrent mode (`bench threads` 546 → 428 ms);
-- increment 19: dead flags not computed, with a per-block liveness analysis (`bench integer` 398 → 318 ms, faster than qemu; `threads` 428 → 253 ms; python loop −7%).
+- increment 19: dead flags not computed, with a per-block liveness analysis (`bench integer` 398 → 318 ms, faster than qemu; `threads` 428 → 253 ms; python loop −7%);
+- M11, 2026-10-20: liveness per flag, dead flags for every instruction, shifts and multiplications with deferred flags, only CF for `inc`/`dec`/`adc`/`sbb` (`python-float` −8%, section "Dead and deferred flags everywhere");
+- M11, 2026-10-20: operations in place on mapped registers, addresses without copies (7-Zip −9%, section "Operations in place").
 
 Next steps: `roadmap.md`. Permission checks remain the largest item of the generated code: without any check the python loop would be 25% faster; increment 18 recovers about 10% of that (`tech/performance.md`).
 
@@ -59,12 +61,12 @@ Summary of the current code (`crates/armor-jit`). The per-increment sections, fu
 `x18` is free for programs on Linux (the platform register only elsewhere). `x30` is the link register only for the one call blocks make, to the flag routine (generated code, which touches neither): the block keeps it on the stack around that `blr`.
 
 **Lazy flags.**
-- Instructions that write all the flags by themselves (`add`, `sub`, `cmp`, `and`, `or`, `xor`, `test`, `neg`) and `inc`/`dec` save only the operands.
+- Instructions that write all the flags by themselves (`add`, `sub`, `cmp`, `and`, `or`, `xor`, `test`, `neg`), `inc`/`dec`, shifts of a 32- or 64-bit register and multiplications save only the operands (since 2026-10-20 also shifts and multiplications, whose kinds only the block itself knows: an exit computes them first).
 - `jcc` after a known operation redoes the operation and jumps with the host condition.
 - The other readers have the flags computed: inline when the operation is known, otherwise with the shared routine at the start of the buffer.
 - On the exit to another block only the code in `KIND` remains; the epilogue towards the engine always computes.
 - The computation uses `mrs nzcv` and a 16 KB table (`FLAG_TABLE`) for CF, PF, ZF, SF, OF, plus AF separately.
-- **Dead flags** (increment 19): a backward pass over the block (`live_flags`) finds the flags nobody will see. An instruction whose flags are all dead does not compute them; one that rewrites them all without reading them (`imul`, `mul`, constant shifts) does not first materialise the pending ones.
+- **Dead flags** (increment 19, per flag since 2026-10-20): a backward pass over the block (`live_flags`) finds the flags nobody will see. An instruction whose flags are all dead does not compute them; one that rewrites them all without reading them does not first materialise the pending ones; `inc`, `dec`, `adc` and `sbb` take only the pending CF.
 
 **Guest memory accesses:** address below 2^47, `ldrb` from the page table and `tbz` on the "readable" or "writable and not executable" bit. For multi-byte accesses the `tbz` looks at the bit that also holds for the next page: if it is missing, an out-of-line piece checks the page alone and the crossing. In every other case there is the **slow path**: the instruction goes to the interpreter, with the exact state from before the instruction (pending flags included). Writes to code always go that way, so old translations are thrown away.
 
@@ -538,6 +540,35 @@ Found with a profile of 7-Zip (`tech/performance.md`, "7-Zip"):
 - **Side exits.** `ends_block` no longer stops at `jcc`. Inside a block, `jcc` emits only the conditional branch (`branch_if`, with the host condition when the flags are pending) to a label whose code is out of line, after the body: the lazy-flags state of the jump (`side_exits`), then `exit_direct` to the target, chainable like any exit. The fall-through continues in the block with its registers and pending flags, instead of starting a block whose flags are `Lazy::Dynamic` (a `jb` after a `je` called the generic flag routine). Liveness (`live_flags`) needs no change: `jcc` already counts as reading every flag. A `jcc` that is the block's last instruction keeps both exits. The budget is subtracted at the block's start for every instruction, so a side exit counts instructions that did not run: the engine only gets control back a little earlier. Lockstep blocks are one instruction, so side exits are checked by the random tests (`jcc` over an `inc`) and by `difftest` with the JIT.
 - **Operands in place** (`operand_in`, `destination_in`, `whole_register`): a guest register mapped whole, read at 32 or 64 bits, is used directly by ALU operations, `test`, `mov` and as the destination of `movzx`/`movsx`, without a copy into `A`/`B`. A 32-bit operand may have other bits above in its host register, so the lazy flags save 32-bit operands with `mov w` (zero-extending), and a `mov` into a register kept in the `Cpu` still goes through `read_operand`, which zero-extends (the random tests found both).
 - **r10 and r11** in `x18` and `x30` (table above).
+
+## Dead and deferred flags everywhere (M11, 2026-10-20)
+**Problem**, seen in the hot block of Python's dictionary lookup (`PyDict_Contains`, `0x530910` in Debian's `python3.13`, with the `dump_translation` tool): every shift, rotate and multiplication computed its flags right away (15 to 25 instructions each, with an `mrs nzcv` and a table access) whenever the next instruction could take a slow path, and that is any memory access: liveness (`live_flags`) makes every flag live before an instruction that may hand the state to the interpreter. Shifts and rotates by `cl`, rotates by a constant, `bt*`, `bsf`/`bsr` and `comisd` were also treated as readers of every flag, so the instructions before them computed theirs too.
+
+**Changes:**
+- **Liveness per flag** (`live_flags`): before an instruction that stays in the block, the live flags are those live after it minus those it always writes (`flags_written`, which now also describes rotates by a constant: CF and OF; narrow shifts by a constant; `bt*`: CF; `bsf`/`bsr`: ZF; `comis*`: all), plus those it reads (`flags_read`: the condition's flags for `setcc` and `cmov`, CF for `adc`/`sbb`, all for `jcc`, which may leave the block). A shift or rotate by `cl` writes nothing for sure (a count of 0 leaves the flags), so the flags before it stay live while its own are.
+- **Dead flags for every instruction:** an instruction whose flags may all be dead (`flags_may_write`: for a count from `cl`, those of a non-zero count) computes none, and does not materialize the pending ones first: shifts and rotates by `cl` or by a constant, narrow shifts, `bt*`, `bsf`/`bsr` and `comis*` too.
+- **Deferred shifts and multiplications** (`FlagKind::Shift`, `FlagKind::Mul`): `shl`, `shr` and `sar` of a 32- or 64-bit register, two- and three-operand `imul` and one-operand `mul`/`imul` no longer compute their flags: their operands go to `FA`/`FB`, like `add` and `sub`, and whoever observes the flags redoes the operation (`shift_flags`, `mul_flags`). The flag routine does not know these kinds, so an exit computes them before it leaves (`publish_lazy`): on a slow path or a side exit, out of line. A shift by `cl` whose count is 0 must leave the flags as they were: out of line, the flags pending before it go into `FLAGS` (`zero_counts`), and its deferred flags, with a count of 0, then leave `FLAGS` as it is.
+- **inc, dec, adc and sbb need only CF** from the pending flags: when CF is live it alone goes into `FLAGS` (`materialize_carry`: the operation redone and one `cset`), not every flag; when CF is dead after `inc`/`dec`, they defer all six flags like `add`, CF included (a dead value).
+
+**Measured** (`cargo xtask bench --runs 5`, Pi 5 with 4K pages, before and after on the same day, `tech/performance.md`): `python-int` 1,346 → 1,255 ms, `python-float` 1,196 → 1,104 ms, `float` 265 → 254 ms; the rest within the noise. In the dictionary block above, the main path (without the out-of-line code) went from 546 to 439 instructions.
+
+**Verification:**
+- the new test `conditions_after_deferred_and_partial_flags`: every shift and rotate (8 to 64 bits, by `cl`, 1 and 5), `imul`, `mul`, `bt`, `bsf`, `inc`, `dec`, followed by every condition in the same block, in the next one, after an earlier `cmp` whose flags must survive, at a fault right after, and by `setcc`/`cmov` whose flags alone stay live; counts and operands at the edges (0, 31, 32, 63, 64);
+- the random JIT tests, in all four modes, and lockstep;
+- mutations, each caught: OF of `shr` from the result, the count not set back to 0 after the out-of-line path, the carry of `materialize_carry` inverted, `inc`/`dec` deferring CF while it is live, rotates declared as writers of every flag, the unsigned 32-bit overflow of `mul` tested as signed, `setle` declared as reading ZF alone, `seto` as reading nothing. Two were equivalent: the CF bit of `sar` by a constant taken with `lsr` (the same bit), and a 32-bit shift's value saved with all 64 bits (`shift_flags` reads only the low 32);
+- `difftest` with both engines, lockstep and the ARMv8.0 paths.
+
+## Operations in place (M11, 2026-10-20)
+The same block, after the flags: copies of operands through the temporaries `A`/`B`/`R`.
+- `add`, `sub`, `cmp`, `and`, `or`, `xor` on a guest register mapped whole, at 32 or 64 bits (`alu_in_place`): the instruction writes the register itself, an immediate that fits goes in the instruction (`sub rsp, 0x58`: from five instructions to three, two of them saving the deferred operands), and `cmp` emits only the deferred operands (`jcc` redoes the comparison).
+- `test` writes its result straight into `FA`; `jcc` after a logical operation tests `FA` (`redo_nzcv`).
+- Addresses (`address_into`): a mapped base and index are added in one instruction, base plus displacement too; `lea` into a mapped register computes there.
+- `push`, `pop` and `ret` take `rsp`'s register directly; `push` stores a mapped register without a copy, `pop` loads straight into a mapped destination (but `pop rsp` loads after the increment).
+- Shifts by a constant of a mapped register shift in place; a 64-bit `mov` into r8 or r9 (kept in the `Cpu`) stores the mapped source directly.
+
+Measured with the flags above (`tech/performance.md`): 7-Zip 16.4 → 14.9 s, `integer` 225 → 195 ms, `python-float` 1,104 → 945 ms; the block's main path from 439 to 352 instructions.
+
+Verification: the random tests now also generate addresses without a base and with a base kept in the `Cpu`; mutations caught: the sense of an immediate's sign, a negative displacement added, an index without a base left unscaled (caught only after the generator's new forms), the deferred operand taken after the register changed (logical and arithmetic), a 64-bit `mov` into a register in the `Cpu` widened to 32 bits. Surviving: a 32-bit stack pointer that wraps at 4 GiB in compatibility mode (`push`, `pop`; the same arithmetic as before, which the random tests do not reach), and the immediate of `test` at 64 bits instead of 32 (equivalent: the immediate has no higher bits).
 
 ## Postponed
 Traces, SMC through host protection, per-page invalidation. Done after this list: scalar SSE floating point (increment 17), parallelism with TSO (ADR-0023).
