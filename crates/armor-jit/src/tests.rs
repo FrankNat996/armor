@@ -43,7 +43,10 @@ impl Guest {
     }
 
     fn at(base: u64) -> Guest {
-        let mem = AddressSpace::new();
+        Guest::in_space(AddressSpace::new(), base)
+    }
+
+    fn in_space(mem: AddressSpace, base: u64) -> Guest {
         let (code, data, stack) = (base, base + 0x10_0000, base + 0x20_0000);
         mem.map_fixed(code, CODE_SIZE, Prot::READ | Prot::EXEC)
             .unwrap();
@@ -1195,6 +1198,44 @@ fn random_code_matches_the_interpreter_in_concurrent_mode() {
     }
 }
 
+/// ADR-0046: the random programs with host protection, where the host
+/// checks the JIT's reads and a fault resumes at the slow path; plain and
+/// in concurrent mode (unaligned ordered loads out of line). The guest's
+/// region must be free, so the test runs again in a process of its own.
+#[test]
+fn random_code_matches_the_interpreter_with_host_protection() {
+    const CHILD: &str = "ARMOR_HOST_PROTECTION_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::random_code_matches_the_interpreter_with_host_protection",
+                "--test-threads=1",
+            ])
+            .env(CHILD, "1")
+            .status()
+            .unwrap();
+        assert!(status.success(), "the test in its own process failed");
+        return;
+    }
+    let mut mem = AddressSpace::new();
+    let protected = mem.enable_host_protection();
+    assert_eq!(protected, armor_mem::host_page_size() == 4096);
+    let guest = Guest::in_space(mem, 0x30_0000_0000);
+    let mut rng = Rng(0x6a09_e667_f3bc_c908);
+    for case in 0..6000 {
+        if case == 3000 {
+            guest.mem.enter_concurrent_mode();
+        }
+        let mut code = Vec::new();
+        for _ in 0..1 + rng.below(24) {
+            random_instruction(&mut rng, &mut code);
+        }
+        let cpu = guest.cpu(&mut rng);
+        guest.compare(&code, &cpu, case + 1);
+    }
+}
+
 /// The same in concurrent mode with ARMv8.0 alone (ADR-0032): LDAR for
 /// LDAPR, exclusive loops for the LSE atomics (the generator's locked
 /// instructions on aligned memory take them).
@@ -1240,6 +1281,7 @@ fn concurrent_mode_emits_ordered_accesses() {
                 chain: false,
                 concurrent,
                 compat: false,
+                host_reads: None,
             },
         )
         .unwrap()
@@ -1276,6 +1318,7 @@ fn concurrent_mode_emits_lse_atomics() {
             chain: false,
             concurrent,
             compat: false,
+            host_reads: None,
         };
         translate(&block, end, options).unwrap()
     };
@@ -1332,6 +1375,7 @@ fn dead_flags_are_not_computed() {
         chain: true,
         concurrent: false,
         compat: false,
+        host_reads: None,
     };
     let words = translate(&block, BlockEnd::Continue(0x1000 + at as u64), options).unwrap();
     let is_mrs_nzcv = |w: &u32| w & 0xFFFF_FFE0 == 0xD53B_4200;
@@ -1576,7 +1620,7 @@ fn conditions_after_every_lazy_flag_operation() {
     for (wide, narrow) in ops {
         for size in 0..4 {
             for cc in 0..16u8 {
-                for form in 0..3 {
+                for form in 0..4 {
                     let mut code = Vec::new();
                     match size {
                         0 => code.extend(narrow),
@@ -1588,7 +1632,10 @@ fn conditions_after_every_lazy_flag_operation() {
                         0 => code.extend([0x70 | cc, 0x03, 0x48, 0xff, 0xc2]),
                         1 => code.extend([0xeb, 0x00, 0x70 | cc, 0x03, 0x48, 0xff, 0xc2]),
                         // setcc dl, then adc rsi, rdi, in the next block.
-                        _ => code.extend([0xeb, 0x00, 0x0f, 0x90 | cc, 0xc2, 0x48, 0x11, 0xfe]),
+                        2 => code.extend([0xeb, 0x00, 0x0f, 0x90 | cc, 0xc2, 0x48, 0x11, 0xfe]),
+                        // jcc over nothing, then cmovcc rdx, [rbx + 0x40]:
+                        // the load's check changes the host's flags.
+                        _ => code.extend([0x70 | cc, 0x00, 0x48, 0x0f, 0x40 | cc, 0x53, 0x40]),
                     }
                     let mut cpu = guest.cpu(&mut rng);
                     cpu.regs[0] = rng.pick(&values);
@@ -1890,7 +1937,8 @@ fn packed_float_operations_on_special_values() {
 /// Translates the block in the hex bytes of `ARMOR_DUMP_HEX`, at guest
 /// address `ARMOR_DUMP_RIP` (hex), and writes the AArch64 code to
 /// `ARMOR_DUMP_OUT`, for `objdump -D -b binary -m aarch64`;
-/// `ARMOR_DUMP_CONCURRENT` translates for concurrent mode.
+/// `ARMOR_DUMP_CONCURRENT` translates for concurrent mode,
+/// `ARMOR_DUMP_HOST_READS=bits` with host protection (ADR-0046).
 #[test]
 #[ignore]
 fn dump_translation() {
@@ -1905,9 +1953,19 @@ fn dump_translation() {
     let mut block = Vec::new();
     let mut at = 0;
     while at < bytes.len() {
-        let insn = armor_x86::decode(&bytes[at..]).unwrap();
+        let mode = if std::env::var_os("ARMOR_DUMP_COMPAT").is_some() {
+            Mode::Compat32
+        } else {
+            Mode::Long
+        };
+        let Ok(insn) = armor_x86::decode_in(&bytes[at..], mode) else {
+            break;
+        };
+        if !crate::translator::supported(&insn) {
+            break;
+        }
         block.push(GuestInstruction { rip, insn });
-        at += insn.len as usize;
+        at += insn.len;
         rip += insn.len as u64;
         if ends_block(&insn) {
             break;
@@ -1924,7 +1982,10 @@ fn dump_translation() {
             },
             chain: true,
             concurrent,
-            compat: false,
+            compat: std::env::var_os("ARMOR_DUMP_COMPAT").is_some(),
+            host_reads: std::env::var("ARMOR_DUMP_HOST_READS")
+                .ok()
+                .map(|b| b.parse().unwrap()),
         },
     )
     .unwrap();
@@ -1991,7 +2052,7 @@ fn conditions_after_deferred_and_partial_flags() {
     ];
     for op in &ops {
         for cc in 0..16u8 {
-            for form in 0..7 {
+            for form in 0..8 {
                 let mut code = Vec::new();
                 if (3..5).contains(&form) {
                     // cmp rcx, rdx first: its flags pass through some.
@@ -2008,7 +2069,10 @@ fn conditions_after_deferred_and_partial_flags() {
                     // setcc dl and cmovcc rdi, rsi in the same block,
                     // then xor esi, esi: only the condition's flags live.
                     5 => code.extend([0x0f, 0x90 | cc, 0xc2, 0x31, 0xf6]),
-                    _ => code.extend([0x48, 0x0f, 0x40 | cc, 0xfe, 0x31, 0xf6]),
+                    6 => code.extend([0x48, 0x0f, 0x40 | cc, 0xfe, 0x31, 0xf6]),
+                    // A jcc as the block's last instruction (the syscall
+                    // after it is not translated): both exits.
+                    _ => code.extend([0x70 | cc, 0x00]),
                 }
                 let mut cpu = guest.cpu(&mut rng);
                 cpu.regs[0] = rng.pick(&values);

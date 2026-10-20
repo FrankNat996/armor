@@ -18,7 +18,7 @@ impl Reg {
         Reg(n)
     }
 
-    fn bits(self) -> u32 {
+    pub fn bits(self) -> u32 {
         u32::from(self.0)
     }
 }
@@ -205,6 +205,11 @@ impl Assembler {
     pub fn new_label(&mut self) -> Label {
         self.labels.push(None);
         Label(self.labels.len() - 1)
+    }
+
+    /// Where `label` is bound (in words), once it is.
+    pub fn position(&self, label: Label) -> Option<usize> {
+        self.labels[label.0]
     }
 
     pub fn bind(&mut self, label: Label) {

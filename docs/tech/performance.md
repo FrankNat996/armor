@@ -557,3 +557,25 @@ Found in the translation of Python's dictionary lookup (`PyDict_Contains`, block
 | python-float | 945 ms | 923 ms | −2% | 88.5 ms |
 
 The xmm registers alone (measured on the intermediate build, the first run): `float` 253 → 192 ms, `simd` 205 → 173 ms; Python's float loop does not change, as its floats live in objects in memory.
+
+## Reads checked by the host, held operands, r8 and r9 (M11, 2026-10-20)
+`jit.md`, sections "Reads checked by the host (ADR-0046)" and "Pending operands held, operations in place, r8 and r9"; `memory.md`, "Host protection". 7-Zip, single runs of the bench command (above) on the same build: with the table's checks (`ARMOR_PERMISSIONS=table`) 15.3 s, with the host's for reads 14.4 s (−6%); then `neg`/`cmov` in place and NZCV reused 13.9 s; r8/r9 in registers and the held operands within the noise (13.9–14.0 s), while the hot block's main path went from 46 to 40 AArch64 instructions. `perf stat` on that run: 120.8 billion instructions under armor against 26.2 for the native build (4.6 times), at 2.1 instructions per cycle against 1.2: the native build waits for memory (LZMA's match finder), so fewer instructions shorten armor's run less than in proportion.
+
+✅ `cargo xtask bench --runs 5 --box64 --fex`, Pi 5 with 4K pages, the machine otherwise idle (box64 v0.4.4, FEX-2610; FEX's times include about a second of its own startup, `start-static`). Median of 5, against the start of M11 (2026-10-15, 97f001d):
+
+| Benchmark | armor at M11's start | armor now | box64 | FEX | native |
+|---|---|---|---|---|---|
+| start-static | 9.7 ms | 8.3 ms | 25.8 ms | 1033 ms | 0.4 ms |
+| start-dynamic | 18.9 ms | 17.4 ms | 12.5 ms | 1057 ms | 0.6 ms |
+| integer | 225 ms | 195 ms | 167 ms | 1191 ms | 117 ms |
+| float | 265 ms | 190 ms | 136 ms | 1132 ms | 51.0 ms |
+| simd | 211 ms | 146 ms | 93.2 ms | 1074 ms | 32.7 ms |
+| syscall | 213 ms | 215 ms | 168 ms | 1205 ms | 116 ms |
+| memory | 268 ms | 282 ms | 274 ms | 1209 ms | 149 ms |
+| threads | 158 ms | 134 ms | fails (SIGSEGV) | 1145 ms | 92 ms |
+| 7zip | 16542 ms | 13924 ms | 6824 ms | 8471 ms | 6082 ms |
+| python-start | 243 ms | 199 ms | 104 ms | 1348 ms | 14.7 ms |
+| python-int | 1369 ms | 937 ms | 485 ms | 1752 ms | 222 ms |
+| python-float | 1146 ms | 792 ms | 452 ms | 1691 ms | 179 ms |
+
+armor is now faster than box64 on `start-static` and `threads` (where box64 fails), close on `memory`, and faster than FEX everywhere but 7-Zip; box64 stays ahead on computation, by 1.2× (`integer`) to 2× (7-Zip, Python). `memory` varies between runs (243–287 ms in the runs of this day).

@@ -373,6 +373,12 @@ pub struct AddressSpace {
     /// less a page on a host that places mappings above what an x86-64
     /// guest addresses.
     ceiling: AtomicU64,
+    /// ADR-0046, host protection: 0, or the end of the region reserved for
+    /// the guest's addresses (`enable_host_protection`). Then the host
+    /// pages of guest pages that allow no access are inaccessible on the
+    /// host too, so that translated code may load without checking the
+    /// permission table, and armor's own memory is outside the region.
+    region_end: u64,
 }
 
 /// The lowest address a mapping placed below the ceiling may start at:
@@ -587,7 +593,196 @@ impl AddressSpace {
             } else {
                 0
             }),
+            region_end: 0,
         }
+    }
+
+    /// ADR-0046: on a host with 4K pages, reserves the guest's part of the
+    /// address space (below 2^47 on hosts with 48 bits or more, the lower
+    /// half on smaller ones: below 2^38 with 39 bits) with an inaccessible
+    /// mapping, places every guest mapping inside it, and from then on
+    /// makes the host pages of guest pages that allow no access
+    /// inaccessible. armor's own later mappings, placed by the host, land
+    /// above the region. Call it before anything is mapped. Returns
+    /// whether host protection is on: not on hosts with larger pages, nor
+    /// when something of the host's is already in the region.
+    pub fn enable_host_protection(&mut self) -> bool {
+        let probe = 0u8;
+        let stack = std::ptr::addr_of!(probe) as u64;
+        let bits = 64 - stack.leading_zeros();
+        let end = if bits >= 48 {
+            GUEST_ADDRESS_LIMIT
+        } else {
+            1 << (bits - 1)
+        };
+        let tables = self.tables.get_mut().expect("page tables lock poisoned");
+        if self.host_page_size != GUEST_PAGE_SIZE || !tables.host_pages.is_empty() {
+            return false;
+        }
+        let len = end - PLACEMENT_FLOOR;
+        // SAFETY: an inaccessible reservation; MAP_FIXED_NOREPLACE fails
+        // instead of replacing anything.
+        let ptr = unsafe {
+            libc::mmap(
+                PLACEMENT_FLOOR as *mut libc::c_void,
+                len as usize,
+                libc::PROT_NONE,
+                libc::MAP_PRIVATE
+                    | libc::MAP_ANONYMOUS
+                    | libc::MAP_NORESERVE
+                    | libc::MAP_FIXED_NOREPLACE,
+                -1,
+                0,
+            )
+        };
+        if ptr == libc::MAP_FAILED {
+            return false;
+        }
+        if ptr as u64 != PLACEMENT_FLOOR {
+            // A kernel without MAP_FIXED_NOREPLACE took a hint.
+            // SAFETY: the mapping just made.
+            unsafe { libc::munmap(ptr, len as usize) };
+            return false;
+        }
+        self.region_end = end;
+        let ceiling = self.ceiling.get_mut();
+        if *ceiling == 0 || *ceiling > end {
+            *ceiling = end;
+        }
+        true
+    }
+
+    /// The end of the guest's region when host protection is on
+    /// (ADR-0046): translated code may then load from any address below it
+    /// without a table check, the host faulting where the guest may not.
+    pub fn host_protection(&self) -> Option<u64> {
+        (self.region_end != 0).then_some(self.region_end)
+    }
+
+    /// The end of the addresses guest mappings may use.
+    fn guest_limit(&self) -> u64 {
+        if self.region_end != 0 {
+            self.region_end
+        } else {
+            PAGE_TABLE_ENTRIES * GUEST_PAGE_SIZE
+        }
+    }
+
+    /// Before mapping host pages that nothing of this address space owns at
+    /// `[addr, addr + len)`: with host protection, the reservation there
+    /// goes, so that the host can map them (the callers map with
+    /// MAP_FIXED_NOREPLACE or attach, as without a reservation).
+    fn unreserve(&self, addr: u64, len: u64) {
+        if self.region_end != 0 && addr + len <= self.region_end {
+            // SAFETY: inside the guest's region, host pages this address
+            // space does not own: only the reservation is there.
+            unsafe { libc::munmap(addr as *mut libc::c_void, len as usize) };
+        }
+    }
+
+    /// Puts the reservation back over `[addr, addr + len)` after a failed
+    /// mapping (`unreserve`), replacing nothing.
+    fn reserve(&self, addr: u64, len: u64) {
+        if self.region_end != 0 && addr + len <= self.region_end {
+            // SAFETY: an inaccessible mapping that replaces nothing.
+            unsafe {
+                libc::mmap(
+                    addr as *mut libc::c_void,
+                    len as usize,
+                    libc::PROT_NONE,
+                    libc::MAP_PRIVATE
+                        | libc::MAP_ANONYMOUS
+                        | libc::MAP_NORESERVE
+                        | libc::MAP_FIXED_NOREPLACE,
+                    -1,
+                    0,
+                )
+            };
+        }
+    }
+
+    /// Returns host pages of this address space to the host: inside the
+    /// guest's region they become part of the reservation again (so that
+    /// nothing of the host's lands there), elsewhere they are unmapped.
+    fn release(&self, addr: u64, len: u64) {
+        if self.region_end != 0 && addr + len <= self.region_end {
+            // SAFETY: host pages this address space owned, which no guest
+            // page uses any more: replacing them clobbers nothing else.
+            unsafe {
+                libc::mmap(
+                    addr as *mut libc::c_void,
+                    len as usize,
+                    libc::PROT_NONE,
+                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE | libc::MAP_FIXED,
+                    -1,
+                    0,
+                )
+            };
+        } else {
+            // SAFETY: as above, outside the region.
+            unsafe { libc::munmap(addr as *mut libc::c_void, len as usize) };
+        }
+    }
+
+    /// With host protection, sets the host protection of the guest pages
+    /// in `[start, end)` (mapped, 4K: one host page each) from their guest
+    /// permissions: inaccessible for no access, read-only for a shared
+    /// page the host maps read-only, read-write otherwise.
+    fn apply_protection(&self, tables: &Tables, start: u64, end: u64) {
+        if self.region_end == 0 {
+            return;
+        }
+        let host_prot = |page: u64| match tables.pages.get(page) {
+            Some(Prot::NONE) | None => libc::PROT_NONE,
+            Some(_) if tables.shared.get(&page) == Some(&false) => libc::PROT_READ,
+            Some(_) => libc::PROT_READ | libc::PROT_WRITE,
+        };
+        let (first, last) = (start / GUEST_PAGE_SIZE, end.div_ceil(GUEST_PAGE_SIZE));
+        let mut page = first;
+        while page < last {
+            let prot = host_prot(page);
+            let mut next = page + 1;
+            while next < last && host_prot(next) == prot {
+                next += 1;
+            }
+            // SAFETY: host pages of this address space (4K: one per guest
+            // page); only their protection changes.
+            unsafe {
+                libc::mprotect(
+                    (page * GUEST_PAGE_SIZE) as *mut libc::c_void,
+                    ((next - page) * GUEST_PAGE_SIZE) as usize,
+                    prot,
+                )
+            };
+            page = next;
+        }
+    }
+
+    /// Runs `f` with the guest pages of `[addr, addr + len)` accessible on
+    /// the host: privileged accesses ignore the guest's permissions, and
+    /// with host protection a page that allows no access is inaccessible.
+    fn with_access<T>(&self, tables: &Tables, addr: u64, len: usize, f: impl FnOnce() -> T) -> T {
+        let end = addr + len as u64;
+        let hidden = self.region_end != 0
+            && (addr / GUEST_PAGE_SIZE..end.div_ceil(GUEST_PAGE_SIZE))
+                .any(|page| tables.pages.get(page) == Some(Prot::NONE));
+        if !hidden {
+            return f();
+        }
+        let start = addr - addr % GUEST_PAGE_SIZE;
+        let stop = round_up(end, GUEST_PAGE_SIZE).unwrap_or(end);
+        // SAFETY: mapped host pages of this address space; their
+        // protection is put back right after.
+        unsafe {
+            libc::mprotect(
+                start as *mut libc::c_void,
+                (stop - start) as usize,
+                libc::PROT_READ | libc::PROT_WRITE,
+            )
+        };
+        let result = f();
+        self.apply_protection(tables, start, stop);
+        result
     }
 
     /// The guest memory with the page tables locked for reading, for a run
@@ -700,17 +895,25 @@ impl AddressSpace {
                 end = owned * host;
                 continue;
             }
+            self.unreserve(start, len);
             match map(start, libc::MAP_FIXED_NOREPLACE) {
                 Ok(got) if got == start => return Ok(start),
                 Ok(got) => {
                     // A kernel without MAP_FIXED_NOREPLACE took a hint.
                     // SAFETY: the mapping just made, unused.
                     unsafe { libc::munmap(got as *mut libc::c_void, len as usize) };
+                    self.reserve(start, len);
                     end -= host;
                 }
                 // Something of the host's (not of this address space).
-                Err(e) if e.raw_os_error() == Some(libc::EEXIST) => end -= host,
-                Err(e) => return Err(MapError::Host(e)),
+                Err(e) if e.raw_os_error() == Some(libc::EEXIST) => {
+                    self.reserve(start, len);
+                    end -= host;
+                }
+                Err(e) => {
+                    self.reserve(start, len);
+                    return Err(MapError::Host(e));
+                }
             }
         }
         Err(MapError::Host(io::Error::from_raw_os_error(libc::ENOMEM)))
@@ -735,7 +938,7 @@ impl AddressSpace {
         }
         let end =
             round_up(addr.saturating_add(len), GUEST_PAGE_SIZE).ok_or(MapError::OutOfRange)?;
-        if end > PAGE_TABLE_ENTRIES * GUEST_PAGE_SIZE {
+        if end > self.guest_limit() {
             return Err(MapError::OutOfRange);
         }
         let host_start = addr / self.host_page_size;
@@ -790,10 +993,24 @@ impl AddressSpace {
         for host_page in existing {
             let from = (host_page * self.host_page_size).max(addr);
             let to = ((host_page + 1) * self.host_page_size).min(end);
+            if self.region_end != 0 {
+                // With host protection the page may be inaccessible; it gets
+                // its new protection below (`apply_protection`).
+                // SAFETY: a host page owned by this address space.
+                unsafe {
+                    libc::mprotect(
+                        (host_page * self.host_page_size) as *mut libc::c_void,
+                        self.host_page_size as usize,
+                        libc::PROT_READ | libc::PROT_WRITE,
+                    )
+                };
+            }
             // SAFETY: [from, to) lies in a host page owned by this address
-            // space, mapped read-write (invariant of `host_pages`).
+            // space, mapped read-write (invariant of `host_pages`; with host
+            // protection, made so above).
             unsafe { std::ptr::write_bytes(from as *mut u8, 0, (to - from) as usize) };
         }
+        self.apply_protection(&tables, addr, end);
         Ok(())
     }
 
@@ -837,6 +1054,7 @@ impl AddressSpace {
         if set_pages(&mut tables, addr, addr + guest_len, prot) {
             self.code_changed();
         }
+        self.apply_protection(&tables, addr, addr + guest_len);
         Ok(addr)
     }
 
@@ -879,14 +1097,12 @@ impl AddressSpace {
         // thread stack rather than one per page.
         let mut run: Option<(u64, u64)> = None;
         let flush = |run: (u64, u64)| {
-            // SAFETY: the host pages were mapped by this address space and
-            // no guest page refers to them any more.
-            unsafe {
-                libc::munmap(
-                    (run.0 * self.host_page_size) as *mut libc::c_void,
-                    ((run.1 - run.0) * self.host_page_size) as usize,
-                )
-            };
+            // The host pages were mapped by this address space and no
+            // guest page refers to them any more.
+            self.release(
+                run.0 * self.host_page_size,
+                (run.1 - run.0) * self.host_page_size,
+            );
         };
         for host_page in existing {
             let first = host_page * per_host;
@@ -997,7 +1213,7 @@ impl AddressSpace {
                 Ok(ptr as u64)
             }
         };
-        let limit = PAGE_TABLE_ENTRIES * GUEST_PAGE_SIZE;
+        let limit = self.guest_limit();
         let mut tables = self.tables_mut();
         // Counted whole, even where it replaces pages already there.
         self.admit(&tables, host_len / self.host_page_size)?;
@@ -1007,8 +1223,8 @@ impl AddressSpace {
                     host_map(hint, host_len, host_offset, extra)
                 })?;
                 if start + host_len > limit {
-                    // SAFETY: the mapping just made, unused.
-                    unsafe { libc::munmap(start as *mut libc::c_void, host_len as usize) };
+                    // The mapping just made, unused.
+                    self.release(start, host_len);
                     return Err(MapError::OutOfRange);
                 }
                 start
@@ -1042,6 +1258,7 @@ impl AddressSpace {
                         continue;
                     }
                     let at = first * host;
+                    self.unreserve(at, count * host);
                     match host_map(
                         at,
                         count * host,
@@ -1050,12 +1267,22 @@ impl AddressSpace {
                     ) {
                         Ok(got) if got == at => made.push((at, count * host)),
                         result => {
-                            if let Ok(got) = result {
-                                made.push((got, count * host));
+                            match result {
+                                Ok(got) => {
+                                    // SAFETY: a hint taken elsewhere, unused.
+                                    unsafe {
+                                        libc::munmap(
+                                            got as *mut libc::c_void,
+                                            (count * host) as usize,
+                                        )
+                                    };
+                                    self.reserve(at, count * host);
+                                }
+                                Err(_) => self.reserve(at, count * host),
                             }
                             for (at, len) in made {
-                                // SAFETY: mappings made just above, unused.
-                                unsafe { libc::munmap(at as *mut libc::c_void, len as usize) };
+                                // Mappings made just above, unused.
+                                self.release(at, len);
                             }
                             return Err(MapError::AddressInUse {
                                 addr: at,
@@ -1103,6 +1330,7 @@ impl AddressSpace {
         if set_pages(&mut tables, addr, addr + guest_len, prot) {
             self.code_changed();
         }
+        self.apply_protection(&tables, addr, addr + guest_len);
         if writable {
             self.enter_concurrent_mode();
         }
@@ -1179,7 +1407,7 @@ impl AddressSpace {
             ));
         }
         self.admit(&tables, (new_host_len - old_host_len) / host)?;
-        let limit = PAGE_TABLE_ENTRIES * GUEST_PAGE_SIZE;
+        let limit = self.guest_limit();
         let grow_end = base + new_host_len;
         // In place: within the host pages the mapping has, or the host
         // extends it only into free pages.
@@ -1190,6 +1418,8 @@ impl AddressSpace {
                     .range(host_range.end..grow_end / host)
                     .any(|_| true)
                 && {
+                    let grown = base + old_host_len;
+                    self.unreserve(grown, new_host_len - old_host_len);
                     // SAFETY: base is this address space's shared mapping;
                     // without MREMAP_MAYMOVE the host only extends it into
                     // free pages.
@@ -1201,6 +1431,9 @@ impl AddressSpace {
                             0,
                         )
                     };
+                    if got as u64 != base {
+                        self.reserve(grown, new_host_len - old_host_len);
+                    }
                     got as u64 == base
                 });
         let new_base = if in_place {
@@ -1242,10 +1475,12 @@ impl AddressSpace {
             };
             if got == libc::MAP_FAILED {
                 let error = io::Error::last_os_error();
-                // SAFETY: the placeholder, unused.
-                unsafe { libc::munmap(target as *mut libc::c_void, new_host_len as usize) };
+                // The placeholder, unused.
+                self.release(target, new_host_len);
                 return Err(MapError::Host(error));
             }
+            // The old place is empty now: back into the reservation.
+            self.reserve(base, old_host_len);
             target
         };
         let new = new_base + delta;
@@ -1263,6 +1498,7 @@ impl AddressSpace {
             tables.shared.insert(page, writable);
         }
         set_pages(&mut tables, new, new + new_len, prot);
+        self.apply_protection(&tables, new, new + new_len);
         // Moved code, or code that grew: translations are stale either way.
         self.code_changed();
         Ok(new)
@@ -1299,7 +1535,7 @@ impl AddressSpace {
                 Ok(ptr as u64)
             }
         };
-        let limit = PAGE_TABLE_ENTRIES * GUEST_PAGE_SIZE;
+        let limit = self.guest_limit();
         let mut tables = self.tables_mut();
         self.admit(&tables, host_len / host)?;
         let start = match fixed {
@@ -1339,6 +1575,7 @@ impl AddressSpace {
                 // a mapping of the process (Linux needs SHM_REMAP for that;
                 // the caller checks it).
                 self.unmap_locked(&mut tables, addr, end);
+                self.unreserve(addr, host_len);
                 match attach(addr) {
                     Ok(got) if got == addr => addr,
                     Ok(got) => {
@@ -1349,7 +1586,10 @@ impl AddressSpace {
                             len: host_len,
                         });
                     }
-                    Err(e) => return Err(MapError::Host(e)),
+                    Err(e) => {
+                        self.reserve(addr, host_len);
+                        return Err(MapError::Host(e));
+                    }
                 }
             }
         };
@@ -1364,14 +1604,12 @@ impl AddressSpace {
         if exec {
             prot = prot | Prot::EXEC;
         }
-        if set_pages(
-            &mut tables,
-            start,
-            start + round_up(len.max(1), GUEST_PAGE_SIZE).ok_or(MapError::OutOfRange)?,
-            prot,
-        ) {
+        let guest_end =
+            start + round_up(len.max(1), GUEST_PAGE_SIZE).ok_or(MapError::OutOfRange)?;
+        if set_pages(&mut tables, start, guest_end, prot) {
             self.code_changed();
         }
+        self.apply_protection(&tables, start, guest_end);
         if !read_only {
             self.enter_concurrent_mode();
         }
@@ -1579,6 +1817,7 @@ impl AddressSpace {
         if set_pages(&mut tables, addr, end, prot) {
             self.code_changed();
         }
+        self.apply_protection(&tables, addr, end);
         Ok(())
     }
 
@@ -1588,8 +1827,11 @@ impl AddressSpace {
         let tables = self.tables();
         let executable = check(&tables, addr, data.len(), Access::Write, |_| true)?;
         // SAFETY: `check` verified that every byte is in a mapped guest page,
-        // backed by a read-write host page owned by this address space.
-        unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), addr as *mut u8, data.len()) };
+        // backed by a host page owned by this address space, read-write
+        // inside `with_access`.
+        self.with_access(&tables, addr, data.len(), || unsafe {
+            std::ptr::copy_nonoverlapping(data.as_ptr(), addr as *mut u8, data.len())
+        });
         if executable {
             self.code_changed();
         }
@@ -1601,9 +1843,13 @@ impl AddressSpace {
     pub fn read_privileged(&self, addr: u64, buf: &mut [u8]) -> Result<(), MemFault> {
         let tables = self.tables();
         check(&tables, addr, buf.len(), Access::Read, |_| true)?;
+        let len = buf.len();
         // SAFETY: `check` verified that every byte is in a mapped guest page,
-        // backed by a host page of this address space; the lock keeps it.
-        unsafe { std::ptr::copy_nonoverlapping(addr as *const u8, buf.as_mut_ptr(), buf.len()) };
+        // backed by a host page of this address space, accessible inside
+        // `with_access`; the lock keeps it.
+        self.with_access(&tables, addr, len, || unsafe {
+            std::ptr::copy_nonoverlapping(addr as *const u8, buf.as_mut_ptr(), len)
+        });
         Ok(())
     }
 
@@ -1622,6 +1868,7 @@ impl AddressSpace {
         self.admit(tables, count)?;
         let addr = first * self.host_page_size;
         let len = count * self.host_page_size;
+        self.unreserve(addr, len);
         // SAFETY: MAP_FIXED_NOREPLACE never replaces existing mappings, so
         // this cannot clobber memory in use; failure is reported as EEXIST.
         let ptr = unsafe {
@@ -1639,6 +1886,7 @@ impl AddressSpace {
         };
         if ptr == libc::MAP_FAILED {
             let err = io::Error::last_os_error();
+            self.reserve(addr, len);
             return Err(if err.raw_os_error() == Some(libc::EEXIST) {
                 MapError::AddressInUse { addr, len }
             } else {
@@ -1649,6 +1897,7 @@ impl AddressSpace {
             // A kernel without MAP_FIXED_NOREPLACE treats the address as a hint.
             // SAFETY: unmapping the region we were just given.
             unsafe { libc::munmap(ptr, len as usize) };
+            self.reserve(addr, len);
             return Err(MapError::AddressInUse { addr, len });
         }
         tables.host_pages.extend(first..first + count);
@@ -1846,6 +2095,11 @@ impl MemView<'_> {
     /// The one place a host pointer leaves this crate.
     pub fn page_table(&self) -> *const u8 {
         self.tables.pages.base.as_ptr()
+    }
+
+    /// `AddressSpace::host_protection`.
+    pub fn host_protection(&self) -> Option<u64> {
+        self.space.host_protection()
     }
 }
 

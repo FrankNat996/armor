@@ -31,7 +31,7 @@ use crate::translator::flags_routine;
 use crate::translator::{
     BlockEnd, CHAINED_ENTRY, Context, EXIT_CHAIN, EXIT_INTERPRET, FLAG_TABLE, GuestInstruction,
     HostFeatures, MAX_BLOCK_INSTRUCTIONS, Options, TARGET_ENTRIES, ends_block, supported,
-    supported_concurrent, target_slot, translate, uses_mxcsr_control,
+    supported_concurrent, target_slot, translate_block, uses_mxcsr_control,
 };
 
 /// Clears FPSR, the host's cumulative floating-point exception flags, so
@@ -79,6 +79,62 @@ fn forks() -> u64 {
         assert_eq!(registered, 0, "armor: pthread_atfork failed");
     });
     FORKS.load(Ordering::Relaxed)
+}
+
+thread_local! {
+    /// The fault table of the `Jit` that runs translated code on this
+    /// thread (`Jit::faults`), for `on_fault`.
+    static FAULTS: std::cell::Cell<*const Vec<(u64, u64)>> =
+        const { std::cell::Cell::new(std::ptr::null()) };
+}
+
+/// ADR-0046: SIGSEGV and SIGBUS from a guest load of translated code that
+/// the host checks resume at that instruction's slow path, where the
+/// interpreter runs it again (and raises the guest's signal, or does the
+/// access); the guest state is exactly as before the instruction, since
+/// translated code changes nothing before its loads. Any other fault is
+/// armor's own: the default action, as without the handler.
+extern "C" fn on_fault(
+    signal: libc::c_int,
+    _info: *mut libc::siginfo_t,
+    context: *mut libc::c_void,
+) {
+    let table = FAULTS.with(|faults| faults.get());
+    // SAFETY: the kernel passes the interrupted context; `table` is the
+    // running `Jit`'s fault table, which nothing changes while translated
+    // code runs on this thread (the engine is not running).
+    unsafe {
+        let context = &mut *context.cast::<libc::ucontext_t>();
+        let pc = context.uc_mcontext.pc;
+        if !table.is_null() {
+            let faults = &*table;
+            if let Ok(i) = faults.binary_search_by_key(&pc, |&(load, _)| load) {
+                context.uc_mcontext.pc = faults[i].1;
+                return;
+            }
+        }
+        // Not translated code: the fault happens again, with the default
+        // action.
+        libc::signal(signal, libc::SIG_DFL);
+    }
+}
+
+/// Installs `on_fault` for SIGSEGV and SIGBUS, once per process.
+fn install_fault_handler() {
+    static INSTALL: Once = Once::new();
+    INSTALL.call_once(|| {
+        for signal in [libc::SIGSEGV, libc::SIGBUS] {
+            // SAFETY: an all-zero sigaction is valid; the handler only
+            // reads the thread's fault table and edits the context.
+            unsafe {
+                let mut action: libc::sigaction = std::mem::zeroed();
+                action.sa_sigaction = on_fault as *const () as usize;
+                action.sa_flags = libc::SA_SIGINFO;
+                libc::sigemptyset(&mut action.sa_mask);
+                libc::sigaction(signal, &action, std::ptr::null_mut());
+            }
+        }
+    });
 }
 
 /// Code buffer per thread: address space reserved, memory used as filled.
@@ -161,6 +217,11 @@ pub struct Jit {
     mode: Mode,
     /// The host CPU's extensions the translations may use (ADR-0032).
     features: HostFeatures,
+    /// ADR-0046: the guest loads of the translated code that the host
+    /// checks, as (executable address of the load, of its slow path),
+    /// sorted (the buffer only grows within an epoch). The fault handler
+    /// reads it (`on_fault`, through `FAULTS`).
+    faults: Vec<(u64, u64)>,
     /// How many times the interpreter runs a block before it is
     /// translated: code that runs only a few times (a program's startup)
     /// costs less interpreted than translated. 0 translates at once.
@@ -198,6 +259,7 @@ impl Jit {
             mode: Mode::Long,
             features: HostFeatures::detect(),
             warm_up: 0,
+            faults: Vec::new(),
         })
         .map(|mut jit| {
             jit.context.targets = jit.targets.as_ptr() as u64;
@@ -388,6 +450,8 @@ impl Jit {
         );
         self.context.budget = budget;
         self.calls += 1;
+        // For a fault in this thread's translated code (ADR-0046).
+        FAULTS.with(|faults| faults.set(&self.faults));
         // SAFETY: `code` comes from `entry`, which published it in the
         // current code generation (the view keeps the mappings, hence the
         // generation, from changing), so it is a complete function
@@ -427,6 +491,7 @@ impl Jit {
         self.blocks.clear();
         self.recent.fill((NO_RIP, Entry::Interpret));
         self.targets.fill([NO_RIP, 0]);
+        self.faults.clear();
         self.buffer.reset();
         self.publish_flags_routine();
     }
@@ -485,25 +550,38 @@ impl Jit {
         if block.is_empty() {
             return Entry::Interpret;
         }
+        let host_reads = mem.host_protection().map(|end| {
+            install_fault_handler();
+            64 - (end - 1).leading_zeros()
+        });
         let options = Options {
             features: self.features,
             chain: !self.lockstep,
             concurrent,
             compat: self.mode == Mode::Compat32,
+            host_reads,
         };
-        let words = translate(&block, end, options)
+        let translation = translate_block(&block, end, options)
             .unwrap_or_else(|e| panic!("armor bug: cannot encode the block at {rip:#x}: {e}"));
+        let words = &translation.words;
         crate::stats::record(block.len(), words.len(), start.elapsed());
-        let code = match self.buffer.publish(&words) {
+        let code = match self.buffer.publish(words) {
             Ok(code) => code,
             Err(_) => {
                 // Full: start over with an empty buffer.
                 self.flush();
                 self.buffer
-                    .publish(&words)
+                    .publish(words)
                     .expect("one block fits in an empty buffer")
             }
         };
+        let at = |offset: u32| code as u64 + 4 * u64::from(offset);
+        self.faults.extend(
+            translation
+                .faults
+                .iter()
+                .map(|&(load, slow)| (at(load), at(slow))),
+        );
         crate::stats::perf_map(code, words.len() * 4, rip, block.len());
         Entry::Code(code)
     }

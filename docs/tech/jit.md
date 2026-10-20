@@ -51,11 +51,12 @@ Summary of the current code (`crates/armor-jit`). The per-increment sections, fu
 |---|---|
 | `x0`, `x1`, `x2` | `Cpu`, page table, `Context` |
 | `x22`–`x29` | rax, rcx, rdx, rbx, rsp, rbp, rsi, rdi |
+| `x8`, `x21` | r8, r9 (since 2026-10-20) |
+| `x18`, `x30` | r10, r11 (since 2026-10-15) |
 | `x3`, `x9`, `x16`, `x17` | r12, r13, r14, r15 |
-| `x18`, `x30` | r10, r11 (since 2026-10-15; r8 and r9 stay in the `Cpu`) |
 | `x12`, `x13` | `rflags`, budget |
-| `x19`, `x20`, `x21` | lazy flags: operands (`FA`, `FB`) and code of the pending operation (`KIND`) |
-| `x4`–`x7`, `x8`, `x10`, `x11`, `x14`, `x15` | temporaries; `x7` is the guest address, `x8` also the exit `rip` |
+| `x19`, `x20` | lazy flags: operands (`FA`, `FB`); the code of the pending operation is `Context::kind` (in `x21` until 2026-10-20) |
+| `x4`–`x7`, `x10`, `x11`, `x14`, `x15` | temporaries; `x7` is the guest address, `x4` also the exit `rip` |
 | `v16`–`v31` | xmm0–xmm15 (since 2026-10-20), loaded by the prologue and stored by the epilogue |
 | `v1`, `v2` | temporaries for SSE operations |
 | `v3`, `v4` | the two MMX scratch registers inside one MMX instruction (the interpreter's `Cpu::mm_scratch`, which translated code leaves zero) |
@@ -598,6 +599,18 @@ With the xmm registers in vector registers, packed floating point is translated 
 The encoder gained the vector `FADD`, `FSUB`, `FMUL`, `FDIV`, `FSQRT`, `FCMEQ`, `FCMGE`, `FCMGT`, `SCVTF`, `FCVTZS`, `FCVTNS`, `FCVTL`, `FCVTN`, `SSHLL`, `XTN`, `NOT`, `UMINV`, `UMAXV`, `BSL`, `CMHI` and `DUP` (`encoder-check`: 12,630 samples, 0 differences).
 
 Verification: the new test `packed_float_operations_on_special_values` (4,000 rounds: every operation, predicate and conversion, with registers and memory, on lanes drawn from NaNs, infinities, denormals, zeros, products that underflow, values out of int32's range), with lockstep, which requires a slow path to leave the state as it was but for MXCSR flags the interpreter raises too. Mutations caught: `minps`'s operands exchanged, the negated predicates, lt as le, no check for 0x7fffffff, `cvtdq2pd` without the sign extension, no denormal check. Two survive and are equivalent in the results: a denormal limit one too high and a NaN check that also catches the largest finite values, which only send more cases to the interpreter.
+
+## Reads checked by the host (ADR-0046, 2026-10-20)
+With host protection (`tech/memory.md`), a read needs no table check: `check` emits only the test of the address against the region's end (`ands` and `b.ne` to the slow path: above it, the interpreter decides) and the next guest load records its offset and the instruction's slow path in the block's fault table (`mark_access`, `Translation::faults`). The engine keeps the table of every published block, sorted by address (`Jit::faults`), and a SIGSEGV or SIGBUS handler (`on_fault`, installed once) looks the faulting PC up there and resumes at the slow path: the interpreter runs the instruction again from the exact state, since translated code writes guest registers only after its last access that can fault, and raises the guest's signal. Any other fault is armor's own: the default action, as before. Writes keep the table check (next step: the host's protection for writes too, with code pages protected while they hold translations, ADR-0046 points 4 and 5). Concurrent mode's ordered loads out of line record their fault too.
+
+Verification: `difftest` (470 cases, `faults/*` included) and lockstep with host protection on; the new test `random_code_matches_the_interpreter_with_host_protection`, which runs in a process of its own (the region must be free) with the random programs, plain and in concurrent mode; mutations caught: a load not recorded in the fault table (armor crashes on the first fault), inaccessible guest pages left readable on the host.
+
+## Pending operands held, operations in place, r8 and r9 (M11, 2026-10-20)
+- **Held operands:** the pending flags of `add`, `sub`, `cmp`, the logical operations and `inc`/`dec` on a guest register mapped whole no longer copy their operands to `FA`/`FB`: `Pending` records where they are (`Held`: the guest register, a constant, `FA`/`FB`), and for an operation that wrote its destination in place, that the register holds the result (the first operand is then the result minus, or plus, the second). `redo` sets the host NZCV for a condition straight from there; `spill` copies them to `FA`/`FB` (the form the flag routine and `Context::kind` describe) only when needed: before an instruction that writes a held register and does not replace the pending flags with its own, at an exit, and in every slow path or side exit, out of line, where the registers still hold them (translated code writes guest registers only after its last slow path). A `jcc` that ends the block restores the flags state between its two exits, since the first one's copy is on its own path only (the new form of `conditions_after_deferred_and_partial_flags` found it).
+- **In place:** `neg`, `not`, `inc`, `dec` and `cmov` on a mapped register write it directly; a `jcc`, `setcc` or `cmov` right after another one reuses the host NZCV of the same pending operation (`nzcv_valid`), and a narrow comparison's redo no longer shifts the result back.
+- **r8 and r9** in `x8` and `x21`: the exit's `rip` moved to `x4` (an exit needs no operand any more) and `KIND` into the `Context` (`Context::kind`; one more instruction where an exit publishes a pending operation). Every epilogue leaves `kind` at 0, so the prologue does not clear it: `CHAINED_ENTRY` stays 96.
+
+Verification: the random tests in every mode, lockstep and `difftest`; mutations caught: a held operand of `neg` exchanged, `cmov`'s sense, the narrow redo's shift, CF kept wrong by `inc`, NZCV reused after a `setcc` to memory, NZCV reused by a `cmov` from memory (caught after a new form `jcc` + `cmov` from memory), r8 and r9 not stored by the epilogue, the restore of the flags state between a last `jcc`'s exits; the prologue's clear of `kind` turned out unnecessary (removed).
 
 ## Postponed
 Traces, SMC through host protection, per-page invalidation. Done after this list: scalar SSE floating point (increment 17), parallelism with TSO (ADR-0023).

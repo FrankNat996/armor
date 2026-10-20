@@ -84,6 +84,10 @@ pub struct Context {
     pub flag_table: u64,
     /// The exit status (`EXIT_*`) of the last block run.
     pub status: u64,
+    /// Lazy flags across blocks: 0 when `FLAGS` is current, otherwise the
+    /// pending operation (`Pending::code`) whose operands are in `FA`/`FB`
+    /// (in memory since 2026-10-20: its register holds r9).
+    pub kind: u64,
     /// Address of the indirect-jump table: `TARGET_ENTRIES` pairs (guest
     /// address, executable address of that block's `CHAINED_ENTRY`),
     /// indexed by `target_slot`. Kept by the engine.
@@ -113,6 +117,20 @@ pub struct Options {
     /// Compatibility mode (ADR-0029): the guest's addresses wrap at
     /// 4 GiB, after the segment base too.
     pub compat: bool,
+    /// ADR-0046, host protection on (`AddressSpace::host_protection`):
+    /// reads below 2^`host_reads` need no table check, the host faults
+    /// where the guest may not read, and the fault goes to the slow path
+    /// (`Translation::faults`). `None`: every access checks the table.
+    pub host_reads: Option<u32>,
+}
+
+/// A translated block: its words, and its guest loads that may fault on
+/// the host (with host protection, `Options::host_reads`): (word offset of
+/// the load, word offset of the instruction's slow path).
+#[derive(Debug, Default)]
+pub struct Translation {
+    pub words: Vec<u32>,
+    pub faults: Vec<(u32, u32)>,
 }
 
 /// The host CPU extensions the translator may use beyond ARMv8.0
@@ -161,6 +179,8 @@ enum Unaligned {
         signed: bool,
         size: Size,
         rt: HostReg,
+        /// The slow path of a load the host checks (`Translator::faults`).
+        fault: Option<Label>,
     },
     Store {
         size: Size,
@@ -181,10 +201,6 @@ const BUDGET: HostReg = HostReg::new(13);
 /// prologue saves them on the stack and the epilogue restores them.
 const FA: HostReg = HostReg::new(19);
 const FB: HostReg = HostReg::new(20);
-/// Lazy flags across blocks: 0 when `FLAGS` is current, otherwise the
-/// pending operation (`Pending::code`) whose operands are in `FA`/`FB`.
-/// Callee-saved, like `FA`/`FB`.
-const KIND: HostReg = HostReg::new(21);
 /// First operand, and destination value.
 const A: HostReg = HostReg::new(4);
 /// Second operand.
@@ -193,15 +209,13 @@ const B: HostReg = HostReg::new(5);
 const R: HostReg = HostReg::new(6);
 /// Guest address of the memory operand.
 const ADDR: HostReg = HostReg::new(7);
-/// Exit: the next guest rip (the status goes to `Context::status`).
-const EXIT_RIP: HostReg = HostReg::new(8);
+/// Exit: the next guest rip (the status goes to `Context::status`). The
+/// same register as `A`: an exit needs no operand any more.
+const EXIT_RIP: HostReg = A;
 const T1: HostReg = HostReg::new(10);
 const T2: HostReg = HostReg::new(11);
 const T3: HostReg = HostReg::new(14);
 const T4: HostReg = HostReg::new(15);
-/// A temporary inside an instruction; the same register as `EXIT_RIP`,
-/// which is only set on the way out.
-const T5: HostReg = EXIT_RIP;
 
 /// Guest registers kept in host registers (ADR-0021 §4), by guest number:
 /// rax..rdi in x22..x29, r12..r15 in x3, x9, x16, x17. r8..r11 stay in
@@ -222,8 +236,8 @@ const GUEST: [Option<HostReg>; 16] = {
         h(27),
         h(28),
         h(29),
-        None,
-        None,
+        h(8),
+        h(21),
         h(18),
         h(30),
         h(3),
@@ -569,6 +583,61 @@ fn lazy_shift(op: ShiftOp, dst: Operand, size: Size) -> bool {
         && matches!(size, Size::B32 | Size::B64)
 }
 
+/// The host registers (bit n: xn) of the guest registers `insn` may
+/// write; every mapped one for instructions not listed.
+fn registers_written(insn: &Instruction) -> u32 {
+    let reg = |o: &Operand| match o {
+        Operand::Reg(Reg::Gpr(n) | Reg::HighByte(n)) => {
+            GUEST[usize::from(*n)].map_or(0, |h| 1 << h.bits())
+        }
+        _ => 0,
+    };
+    let gpr = |n: usize| GUEST[n].map_or(0, |h| 1u32 << h.bits());
+    let r = |r: &Reg| reg(&Operand::Reg(*r));
+    match insn.op {
+        Op::Mov { dst, .. }
+        | Op::Setcc { dst, .. }
+        | Op::Unary { dst, .. }
+        | Op::Shift { dst, .. } => reg(&dst),
+        Op::Alu { op, dst, .. } => {
+            if op == AluOp::Cmp {
+                0
+            } else {
+                reg(&dst)
+            }
+        }
+        Op::BitTest { op, dst, .. } => {
+            if op == BitTestOp::Bt {
+                0
+            } else {
+                reg(&dst)
+            }
+        }
+        Op::Extend { dst, .. }
+        | Op::Lea { dst, .. }
+        | Op::Imul { dst, .. }
+        | Op::Cmov { dst, .. }
+        | Op::BitScan { dst, .. } => r(&dst),
+        Op::Bswap(dst) => r(&dst),
+        Op::Test { .. }
+        | Op::Jcc { .. }
+        | Op::Jmp { .. }
+        | Op::Nop
+        | Op::Fence
+        | Op::JmpIndirect(_) => 0,
+        Op::Xchg { a, b } => reg(&a) | reg(&b),
+        Op::Xadd { dst, src } => reg(&dst) | r(&src),
+        Op::Cmpxchg { dst, .. } => reg(&dst) | gpr(RAX),
+        Op::MulWide { .. } | Op::Div { .. } => gpr(RAX) | gpr(RDX),
+        Op::SignExtendAccumulator => gpr(RAX),
+        Op::SignExtendIntoRdx => gpr(RDX),
+        Op::Push(_) | Op::Call { .. } | Op::CallIndirect(_) | Op::Ret { .. } => gpr(RSP),
+        Op::Pop(dst) => reg(&dst) | gpr(RSP),
+        Op::Sse { dst, .. } => reg(&dst),
+        _ => u32::MAX,
+    }
+}
+
 /// The count of a shift masked as x86 masks it, when it is a constant.
 fn shift_constant(count: ShiftCount, size: Size) -> Option<u32> {
     let mask = if size == Size::B64 { 0x3f } else { 0x1f };
@@ -876,6 +945,15 @@ pub fn translate(
     end: BlockEnd,
     options: Options,
 ) -> Result<Vec<u32>, EncodeError> {
+    translate_block(block, end, options).map(|t| t.words)
+}
+
+/// `translate`, with the loads that may fault (`Translation::faults`).
+pub fn translate_block(
+    block: &[GuestInstruction],
+    end: BlockEnd,
+    options: Options,
+) -> Result<Translation, EncodeError> {
     let mut t = Translator {
         a: Assembler::new(),
         epilogue: None,
@@ -889,6 +967,10 @@ pub fn translate(
         underflows: Vec::new(),
         denormals: Vec::new(),
         zero_counts: Vec::new(),
+        nzcv_valid: false,
+        nzcv_now: false,
+        access_slow: None,
+        faults: Vec::new(),
         packed_underflows: Vec::new(),
         live: STATUS_FLAGS,
         skip_flags: false,
@@ -928,12 +1010,12 @@ pub fn translate(
         CONTEXT,
         field(offset_of!(Context, budget)),
     )?;
-    // From the engine, `FLAGS` is current.
-    t.a.mov(Width::X, KIND, ZR);
+    // From the engine, `FLAGS` is current and `Context::kind` 0: every
+    // epilogue leaves it so (`materialize`, whose flag routine clears it).
     assert_eq!(
         t.a.len() * 4,
         CHAINED_ENTRY,
-        "the prologue is twenty-one pairs, two loads and a move"
+        "the prologue is twenty-two pairs and two loads"
     );
     // The budget: when it runs out, back to the engine before this block.
     let start = block.first().expect("a block has an instruction").rip;
@@ -1079,7 +1161,17 @@ pub fn translate(
         field(offset_of!(Context, status)),
     )?;
     t.a.ret();
-    t.a.finish()
+    let faults = std::mem::take(&mut t.faults)
+        .into_iter()
+        .map(|(at, slow)| {
+            let target = t.a.position(slow).expect("slow paths are bound");
+            (at as u32, target as u32)
+        })
+        .collect();
+    Ok(Translation {
+        words: t.a.finish()?,
+        faults,
+    })
 }
 
 /// The routine that generated code calls (`blr`, address in
@@ -1101,6 +1193,10 @@ pub fn flags_routine() -> Result<Vec<u32>, EncodeError> {
         underflows: Vec::new(),
         denormals: Vec::new(),
         zero_counts: Vec::new(),
+        nzcv_valid: false,
+        nzcv_now: false,
+        access_slow: None,
+        faults: Vec::new(),
         packed_underflows: Vec::new(),
         live: STATUS_FLAGS,
         skip_flags: false,
@@ -1110,6 +1206,7 @@ pub fn flags_routine() -> Result<Vec<u32>, EncodeError> {
             chain: false,
             concurrent: false,
             compat: false,
+            host_reads: None,
         },
         lazy: Lazy::Current,
     };
@@ -1117,7 +1214,8 @@ pub fn flags_routine() -> Result<Vec<u32>, EncodeError> {
     // computed jump to the code for that operation.
     let table = t.a.new_label();
     let done = t.a.new_label();
-    t.a.logic_imm(Logic::And, Width::X, T1, KIND, 31)?;
+    t.a.ldr(MemSize::B64, T1, CONTEXT, field(offset_of!(Context, kind)))?;
+    t.a.logic_imm(Logic::And, Width::X, T1, T1, 31)?;
     t.a.adr(T2, table);
     t.a.add(Width::X, T2, T2, T1, Shift::Lsl, 2)?;
     t.a.br(T2);
@@ -1134,7 +1232,7 @@ pub fn flags_routine() -> Result<Vec<u32>, EncodeError> {
                 } else {
                     STATUS_FLAGS
                 };
-                let p = Pending { kind, size, mask };
+                let p = Pending::new(kind, size, mask);
                 let body = t.a.new_label();
                 targets[usize::from(p.code().expect("a routine kind"))] = body;
                 bodies.push((body, p));
@@ -1153,7 +1251,7 @@ pub fn flags_routine() -> Result<Vec<u32>, EncodeError> {
     }
     // KIND 0 (nothing pending) lands here directly.
     t.a.bind(done);
-    t.a.mov(Width::X, KIND, ZR);
+    t.clear_kind()?;
     t.a.ret();
     t.a.finish()
 }
@@ -1287,12 +1385,62 @@ struct Pending {
     size: Size,
     /// The flags the instruction sets (INC and DEC keep CF).
     mask: u64,
+    /// Where the operands are (for a logical operation, `a` is the
+    /// result): `FA` and `FB`, or still where the instruction found them,
+    /// a guest register mapped whole or a constant (`Translator::spill`
+    /// copies them to `FA`/`FB` when they are about to change or leave).
+    a: Held,
+    b: Held,
+    /// `a` holds the result of the addition or subtraction rather than
+    /// its first operand (`a` = result - b, or result + b): the
+    /// instruction wrote its destination in place.
+    result: bool,
+}
+
+/// Where a pending operand is (`Pending`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Held {
+    Fa,
+    Fb,
+    /// A guest register mapped whole, unchanged since the instruction.
+    Reg(HostReg),
+    /// A constant (zero-extended from the size).
+    Imm(u64),
 }
 
 impl Pending {
+    /// Operands in `FA` and `FB`.
+    fn new(kind: FlagKind, size: Size, mask: u64) -> Pending {
+        Pending {
+            kind,
+            size,
+            mask,
+            a: Held::Fa,
+            b: Held::Fb,
+            result: false,
+        }
+    }
+
+    /// Whether the operands are in `FA`/`FB`, as the flag routine and the
+    /// shift and multiplication kinds expect.
+    fn plain(self) -> bool {
+        self.a == Held::Fa && self.b == Held::Fb && !self.result
+    }
+
+    /// The guest registers holding operands.
+    fn held_registers(self) -> impl Iterator<Item = HostReg> {
+        [self.a, self.b].into_iter().filter_map(|h| match h {
+            Held::Reg(r) => Some(r),
+            _ => None,
+        })
+    }
+
     /// The value of `KIND` for this operation, never 0; `None` for the
     /// kinds `flags_routine` does not know, which exits compute first.
     fn code(self) -> Option<u16> {
+        if !self.plain() {
+            return None;
+        }
         let kind = match self.kind {
             FlagKind::Add => 1,
             FlagKind::Sub => 2,
@@ -1353,6 +1501,19 @@ struct Translator {
     /// flags before it): the pending flags into `FLAGS`, where the shift's
     /// deferred flags then find them (`lazy_shift`).
     zero_counts: Vec<(Label, Label, Lazy)>,
+    /// The host NZCV holds the pending operation's flags, redone for a
+    /// condition (`redo_nzcv`), up to the end of the current instruction.
+    nzcv_valid: bool,
+    /// For the current instruction: the host NZCV still holds the pending
+    /// operation's flags from the previous one (`nzcv_valid`), which a
+    /// jcc, setcc or cmov that reads registers only may use as they are.
+    nzcv_now: bool,
+    /// The slow path of the read `check` just let the host check
+    /// (`Options::host_reads`): the next guest load records it in
+    /// `faults` (`mark_access`).
+    access_slow: Option<Label>,
+    /// Guest loads the host checks: (word offset, slow path).
+    faults: Vec<(usize, Label)>,
     /// Out of line: UFC after packed floating point (entry, slow path;
     /// `slow_if_underflow`).
     packed_underflows: Vec<(Label, Label)>,
@@ -1373,6 +1534,18 @@ impl Translator {
         let next = g.rip.wrapping_add(insn.len as u64);
         let size = insn.size;
         let w = width(size);
+        // The NZCV of the pending flags survives only into a condition
+        // reader that emits nothing before reading it.
+        let valid = std::mem::take(&mut self.nzcv_valid);
+        self.nzcv_now = valid
+            && match insn.op {
+                Op::Jcc { .. } => true,
+                Op::Setcc { .. } => true,
+                Op::Cmov { dst, src, .. } => {
+                    !src.is_mem() && whole_register(Operand::Reg(dst), size).is_some()
+                }
+                _ => false,
+            };
         // Allocated lazily: only instructions that touch memory have one.
         let mut slow = None;
         let at = Site { rip: g.rip, next };
@@ -1391,6 +1564,29 @@ impl Translator {
         // the lazy flags in `FLAGS` first; inc and dec (which keep CF) and
         // adc and sbb (which read it) only the pending CF, and inc and dec
         // not even that when CF is dead.
+        // Pending operands held in a register this instruction writes:
+        // to `FA`/`FB` first, unless it replaces the pending flags with
+        // its own (its slow paths, before any write, still find them).
+        if let Lazy::Static(p) = self.lazy
+            && !p.plain()
+        {
+            let written_regs = registers_written(insn);
+            let replaces = lazy_flags(insn)
+                && !self.skip_flags
+                && !matches!(
+                    insn.op,
+                    Op::Unary {
+                        op: UnaryOp::Not,
+                        ..
+                    }
+                );
+            if !replaces
+                && p.held_registers()
+                    .any(|r| written_regs & (1 << r.bits()) != 0)
+            {
+                self.spill()?;
+            }
+        }
         let keeps_carry = matches!(
             insn.op,
             Op::Unary {
@@ -1569,6 +1765,10 @@ impl Translator {
                     }
                     self.defer_result(size);
                 }
+            }
+            Op::Unary { op, dst } if whole_register(dst, size).is_some() => {
+                let h = whole_register(dst, size).expect("checked by the guard");
+                self.unary_in_place(op, h, size)?;
             }
             Op::Unary { op, dst } => {
                 self.read_destination(dst, size, at, &mut slow, true)?;
@@ -1759,6 +1959,21 @@ impl Translator {
                 self.store_reg(dst, size, R)?;
                 self.defer_operation(FlagKind::Mul { signed: true }, size, A, Some(B));
             }
+            Op::Cmov { cond, dst, src } if whole_register(Operand::Reg(dst), size).is_some() => {
+                // Into the mapped destination: CSEL writes it whatever the
+                // condition, zero-extending a 32-bit one as x86 does.
+                let h = whole_register(Operand::Reg(dst), size).expect("checked by the guard");
+                let b = self.operand_in(B, src, size, at, &mut slow)?;
+                let moves = match self.host_condition_now(cond)? {
+                    Some(host) => host,
+                    None => {
+                        let (reg, bit, when_set) = self.condition_bit(cond)?;
+                        self.a.logic_imm(Logic::Ands, Width::X, ZR, reg, 1 << bit)?;
+                        if when_set { Cond::Ne } else { Cond::Eq }
+                    }
+                };
+                self.a.csel(Select::Csel, w, h, b, h, moves);
+            }
             Op::Cmov { cond, dst, src } => {
                 // The source is read (and may fault) whatever the
                 // condition; a 32-bit destination is zero-extended even
@@ -1789,6 +2004,10 @@ impl Translator {
                     }
                 }
                 self.write_operand(dst, Size::B8, B, at, &mut slow)?;
+                // A store's check changes the host NZCV.
+                if dst.is_mem() {
+                    self.nzcv_valid = false;
+                }
             }
             Op::SignExtendAccumulator => {
                 // cbw, cwde, cdqe: the lower half of the accumulator.
@@ -1875,8 +2094,13 @@ impl Translator {
             Op::Jcc { cond, rel } => {
                 let taken = self.a.new_label();
                 self.branch_if(cond, taken)?;
+                // Each exit publishes the flags from the state at the
+                // jump: the first one's code may change `lazy` (it
+                // computes or copies them), on its own path only.
+                let lazy = self.lazy;
                 self.exit_direct(next)?;
                 self.a.bind(taken);
+                self.lazy = lazy;
                 self.exit_direct(target(next, rel, size))?;
                 return Ok(false);
             }
@@ -1913,6 +2137,10 @@ impl Translator {
             _ => unreachable!("checked by supported"),
         }
         self.flags_done(insn, written);
+        debug_assert!(
+            self.access_slow.is_none(),
+            "{insn:?}: a checked read without its load"
+        );
         Ok(true)
     }
 
@@ -2000,11 +2228,7 @@ impl Translator {
             let kind = FlagKind::Shift(op, Some(n as u8));
             if !self.skip_flags {
                 self.flags_emitted |= STATUS_FLAGS;
-                self.lazy = Lazy::Static(Pending {
-                    kind,
-                    size,
-                    mask: STATUS_FLAGS,
-                });
+                self.lazy = Lazy::Static(Pending::new(kind, size, STATUS_FLAGS));
             }
             return Ok(());
         }
@@ -2124,28 +2348,28 @@ impl Translator {
             ShiftOp::Shl => {
                 self.a.shift_reg(Shift::Lsl, Width::X, R, A, T3);
                 // CF: the bit shifted to position `bits`.
-                self.a.shift_imm(Shift::Lsr, Width::X, T5, R, bits)?;
+                self.a.shift_imm(Shift::Lsr, Width::X, T1, R, bits)?;
             }
             ShiftOp::Shr => {
                 self.a.shift_reg(Shift::Lsr, Width::X, R, A, T3);
-                self.a.shift_reg(Shift::Lsr, Width::X, T5, A, T4);
+                self.a.shift_reg(Shift::Lsr, Width::X, T1, A, T4);
             }
             ShiftOp::Sar => {
                 self.a.bfm(true, Width::X, B, A, 0, bits - 1)?;
                 self.a.shift_reg(Shift::Asr, Width::X, R, B, T3);
-                self.a.shift_reg(Shift::Asr, Width::X, T5, B, T4);
+                self.a.shift_reg(Shift::Asr, Width::X, T1, B, T4);
             }
             ShiftOp::Rol => {
                 self.a.shift_reg(Shift::Lsl, Width::X, R, A, T4);
-                self.a.shift_reg(Shift::Lsr, Width::X, T5, A, B);
+                self.a.shift_reg(Shift::Lsr, Width::X, T1, A, B);
                 self.a
-                    .logic(Logic::Orr, false, Width::X, R, R, T5, Shift::Lsl, 0)?;
+                    .logic(Logic::Orr, false, Width::X, R, R, T1, Shift::Lsl, 0)?;
             }
             _ => {
                 self.a.shift_reg(Shift::Lsr, Width::X, R, A, T4);
-                self.a.shift_reg(Shift::Lsl, Width::X, T5, A, B);
+                self.a.shift_reg(Shift::Lsl, Width::X, T1, A, B);
                 self.a
-                    .logic(Logic::Orr, false, Width::X, R, R, T5, Shift::Lsl, 0)?;
+                    .logic(Logic::Orr, false, Width::X, R, R, T1, Shift::Lsl, 0)?;
             }
         }
         self.a.logic_imm(Logic::And, Width::X, R, R, mask)?;
@@ -2175,7 +2399,7 @@ impl Translator {
                 .logic(Logic::Orr, false, Width::X, T1, T1, T2, Shift::Lsl, 11)?;
             self.merge_flags(FLAG_CF | FLAG_OF)?;
         } else {
-            self.a.logic_imm(Logic::And, Width::X, T1, T5, 1)?;
+            self.a.logic_imm(Logic::And, Width::X, T1, T1, 1)?;
             match op {
                 // OF = sign(result) ^ CF.
                 ShiftOp::Shl => {
@@ -2295,6 +2519,7 @@ impl Translator {
                     let d = xreg(&dst);
                     self.address(&m, at.next, true)?;
                     self.check_xmm_access(Check::Read, aligned, at.rip, slow)?;
+                    self.mark_access();
                     self.a.ldr_q(d, ADDR, 0)
                 }
                 _ => {
@@ -2668,6 +2893,7 @@ impl Translator {
                     (Operand::Reg(_), Operand::Mem(m)) => {
                         self.address(&m, at.next, true)?;
                         self.check(Check::Read, bytes, at.rip, slow)?;
+                        self.mark_access();
                         self.a.load_store_fp(true, double, xreg(&dst), ADDR, 0)
                     }
                     (Operand::Mem(m), Operand::Reg(_)) => {
@@ -3034,6 +3260,7 @@ impl Translator {
             Operand::Mem(m) => {
                 self.address(&m, at.next, true)?;
                 self.check(Check::Read, 8, at.rip, slow)?;
+                self.mark_access();
                 self.a.load_store_fp(true, true, V1, ADDR, 0)?;
                 Ok(V1)
             }
@@ -3150,6 +3377,7 @@ impl Translator {
             Operand::Mem(m) => {
                 self.address(&m, at.next, true)?;
                 self.check(Check::Read, if double { 8 } else { 4 }, at.rip, slow)?;
+                self.mark_access();
                 self.a.load_store_fp(true, double, vt, ADDR, 0)?;
                 Ok(vt)
             }
@@ -3283,6 +3511,7 @@ impl Translator {
             Operand::Mem(m) => {
                 self.address(&m, at.next, true)?;
                 self.check_xmm_access(Check::Read, true, at.rip, slow)?;
+                self.mark_access();
                 self.a.ldr_q(vt, ADDR, 0)?;
                 Ok(vt)
             }
@@ -3379,15 +3608,35 @@ impl Translator {
         })
     }
 
+    /// Before a guest load at `ADDR`: if its read was left to the host
+    /// (`check`), records where it is, for the fault handler.
+    fn mark_access(&mut self) -> Option<Label> {
+        let slow = self.access_slow.take()?;
+        self.faults.push((self.a.len(), slow));
+        Some(slow)
+    }
+
     /// Loads `size` bytes of guest memory at `ADDR` (checked) into `rt`,
     /// zero- or sign-extended to 64 bits. In concurrent mode a load-acquire
     /// (LDAPR, ADR-0023), out of line with a barrier if `ADDR` is not
     /// aligned to the size.
     fn guest_load(&mut self, signed: bool, size: Size, rt: HostReg) -> Emit {
         if !self.options.concurrent {
+            self.mark_access();
             return self.load(signed, size, rt, ADDR, 0);
         }
-        let back = self.unaligned_test(size, Unaligned::Load { signed, size, rt });
+        let fault = self.access_slow.take();
+        let back = self.unaligned_test(
+            size,
+            Unaligned::Load {
+                signed,
+                size,
+                rt,
+                fault,
+            },
+        );
+        self.access_slow = fault;
+        self.mark_access();
         if self.options.features.rcpc {
             self.a.ldapr(mem_size(size), rt, ADDR);
         } else {
@@ -3440,7 +3689,14 @@ impl Translator {
     fn unaligned_access(&mut self, entry: Label, back: Label, access: Unaligned) -> Emit {
         self.a.bind(entry);
         match access {
-            Unaligned::Load { signed, size, rt } => {
+            Unaligned::Load {
+                signed,
+                size,
+                rt,
+                fault,
+            } => {
+                self.access_slow = fault;
+                self.mark_access();
                 self.load(signed, size, rt, ADDR, 0)?;
                 self.a.dmb(Barrier::IshLd);
             }
@@ -3517,7 +3773,16 @@ impl Translator {
     /// Loads (`load`) or stores the guest registers kept in host
     /// registers from or to `Cpu::regs`, in pairs.
     fn guest_registers(&mut self, load: bool) -> Emit {
-        for (first, second) in [(0, 1), (2, 3), (4, 5), (6, 7), (10, 11), (12, 13), (14, 15)] {
+        for (first, second) in [
+            (0, 1),
+            (2, 3),
+            (4, 5),
+            (6, 7),
+            (8, 9),
+            (10, 11),
+            (12, 13),
+            (14, 15),
+        ] {
             let (a, b) = (GUEST[first], GUEST[second]);
             let (a, b) = (a.expect("mapped"), b.expect("mapped"));
             self.a.pair(
@@ -4037,23 +4302,40 @@ impl Translator {
         let defer = !self.skip_flags;
         if arith {
             if defer {
-                self.a.mov(w, FA, h);
-                match (b, src) {
-                    (Some(b), _) => self.a.mov(w, FB, b),
-                    (None, Operand::Imm(imm)) => self.a.mov_imm64(FB, imm as u64 & size.mask()),
+                // The operands stay where they are (`Held`): the second a
+                // mapped register, a constant, or (from memory) `FB`; the
+                // first the destination, which holds the result after an
+                // addition or a subtraction. Unless the two are the same
+                // register: then nothing could give the first back.
+                let b_held = match (b, src) {
+                    (Some(B), _) => {
+                        self.a.mov(w, FB, B);
+                        Some(Held::Fb)
+                    }
+                    (Some(b), _) if b != h => Some(Held::Reg(b)),
+                    (Some(_), _) => None,
+                    (None, Operand::Imm(imm)) => Some(Held::Imm(imm as u64 & size.mask())),
                     _ => unreachable!("an immediate or a register"),
-                }
+                };
                 let kind = if op == AluOp::Add {
                     FlagKind::Add
                 } else {
                     FlagKind::Sub
                 };
                 self.flags_emitted |= STATUS_FLAGS;
-                self.lazy = Lazy::Static(Pending {
-                    kind,
-                    size,
-                    mask: STATUS_FLAGS,
-                });
+                let mut pending = Pending::new(kind, size, STATUS_FLAGS);
+                match b_held {
+                    Some(b) => {
+                        pending.a = Held::Reg(h);
+                        pending.b = b;
+                        pending.result = op != AluOp::Cmp;
+                    }
+                    None => {
+                        self.a.mov(w, FA, h);
+                        self.a.mov(w, FB, h);
+                    }
+                }
+                self.lazy = Lazy::Static(pending);
             }
             if op == AluOp::Cmp {
                 return Ok(());
@@ -4081,20 +4363,66 @@ impl Translator {
             (None, None) => unreachable!("an immediate or a register"),
         }
         if defer {
-            self.a.mov(Width::X, FA, h);
+            // The result stays in the destination.
             self.defer_result(size);
+            if let Lazy::Static(p) = &mut self.lazy {
+                p.a = Held::Reg(h);
+            }
         }
         Ok(())
+    }
+
+    /// inc, dec, neg and not of a guest register mapped whole, at 32 or 64
+    /// bits, in place; the flags deferred as `defer` does (the operands
+    /// copied before the register changes).
+    fn unary_in_place(&mut self, op: UnaryOp, h: HostReg, size: Size) -> Emit {
+        let w = width(size);
+        let defer = !self.skip_flags;
+        let pending = |kind, mask| Lazy::Static(Pending::new(kind, size, mask));
+        match op {
+            UnaryOp::Inc | UnaryOp::Dec => {
+                let sub = op == UnaryOp::Dec;
+                if defer {
+                    // As the generic path: CF kept while it is live.
+                    let mask = if self.live & FLAG_CF == 0 {
+                        STATUS_FLAGS
+                    } else {
+                        STATUS_FLAGS & !FLAG_CF
+                    };
+                    self.flags_emitted |= mask;
+                    let kind = if sub { FlagKind::Sub } else { FlagKind::Add };
+                    // The result in the register, and 1 (`Held`).
+                    self.lazy = pending(kind, mask);
+                    if let Lazy::Static(p) = &mut self.lazy {
+                        p.a = Held::Reg(h);
+                        p.b = Held::Imm(1);
+                        p.result = true;
+                    }
+                }
+                if sub {
+                    self.a.sub_imm(w, h, h, 1)
+                } else {
+                    self.a.add_imm(w, h, h, 1)
+                }
+            }
+            UnaryOp::Neg => {
+                // 0 - a.
+                if defer {
+                    self.a.mov(Width::X, FA, ZR);
+                    self.a.mov(w, FB, h);
+                    self.flags_emitted |= STATUS_FLAGS;
+                    self.lazy = pending(FlagKind::Sub, STATUS_FLAGS);
+                }
+                self.a.sub(w, h, ZR, h, Shift::Lsl, 0)
+            }
+            UnaryOp::Not => self.a.logic(Logic::Orr, true, w, h, ZR, h, Shift::Lsl, 0),
+        }
     }
 
     /// The flags of a logical result already in `FA` are pending.
     fn defer_result(&mut self, size: Size) {
         self.flags_emitted |= STATUS_FLAGS;
-        self.lazy = Lazy::Static(Pending {
-            kind: FlagKind::Logic,
-            size,
-            mask: STATUS_FLAGS,
-        });
+        self.lazy = Lazy::Static(Pending::new(FlagKind::Logic, size, STATUS_FLAGS));
     }
 
     /// `reg &= 0xffff_ffff`.
@@ -4125,6 +4453,19 @@ impl Translator {
     /// translated code (self-modifying code).
     fn check(&mut self, check: Check, bytes: u32, rip: u64, slow: &mut Option<Label>) -> Emit {
         let slow = self.slow_path(rip, slow);
+        // ADR-0046: the host checks reads below the guest's region's end;
+        // above it, the interpreter.
+        if let (Check::Read, Some(bits)) = (check, self.options.host_reads) {
+            self.a
+                .logic_imm(Logic::Ands, Width::X, ZR, ADDR, !((1u64 << bits) - 1))?;
+            self.a.b_cond(Cond::Ne, slow);
+            debug_assert!(
+                self.access_slow.is_none(),
+                "a checked read without its load"
+            );
+            self.access_slow = Some(slow);
+            return Ok(());
+        }
         self.a
             .logic_imm(Logic::Ands, Width::X, ZR, ADDR, !((1u64 << 47) - 1))?;
         self.a.b_cond(Cond::Ne, slow);
@@ -4235,7 +4576,7 @@ impl Translator {
             self.a.mov(w, FA, a);
             self.a.mov(w, FB, b);
         }
-        self.lazy = Lazy::Static(Pending { kind, size, mask });
+        self.lazy = Lazy::Static(Pending::new(kind, size, mask));
     }
 
     /// Defers the flags of a shift or a multiplication (`FlagKind::Shift`,
@@ -4250,11 +4591,7 @@ impl Translator {
         if let Some(b) = b {
             self.a.mov(Width::X, FB, b);
         }
-        self.lazy = Lazy::Static(Pending {
-            kind,
-            size,
-            mask: STATUS_FLAGS,
-        });
+        self.lazy = Lazy::Static(Pending::new(kind, size, STATUS_FLAGS));
     }
 
     /// Before an instruction that keeps CF (inc, dec) while CF is live:
@@ -4276,7 +4613,11 @@ impl Translator {
                 ..
             }) => {
                 let sub = kind == FlagKind::Sub;
-                self.arith(sub, size, FA, FB)?;
+                let Lazy::Static(p) = self.lazy else {
+                    unreachable!("matched above")
+                };
+                let _ = size;
+                self.redo(p)?;
                 // A subtraction's CF is the inverted host carry.
                 self.a
                     .cset(Width::X, T1, if sub { Cond::Lo } else { Cond::Hs });
@@ -4286,18 +4627,169 @@ impl Translator {
         }
     }
 
+    /// The register holding `h`, a constant loaded into `scratch`.
+    fn held(&mut self, h: Held, scratch: HostReg) -> HostReg {
+        match h {
+            Held::Fa => FA,
+            Held::Fb => FB,
+            Held::Reg(r) => r,
+            Held::Imm(v) => {
+                self.a.mov_imm64(scratch, v);
+                scratch
+            }
+        }
+    }
+
+    /// The first operand of a pending addition or subtraction, derived
+    /// from the result when `p.result` (in `scratch`). Uses `T3`.
+    fn first_operand(&mut self, p: Pending, scratch: HostReg) -> Emit<HostReg> {
+        if !p.result {
+            return Ok(self.held(p.a, scratch));
+        }
+        let r = self.held(p.a, scratch);
+        let w = width(p.size);
+        // a = r - b after an addition, r + b after a subtraction.
+        self.arith_held_plain(p.kind == FlagKind::Add, w, scratch, r, p.b)?;
+        Ok(scratch)
+    }
+
+    /// `rd` = `a` ± `b` (flags set), `b` where it is held; a constant goes
+    /// in the instruction, as `alu_in_place` only holds encodable ones
+    /// (below 4096, or negated: then the other operation, with the same
+    /// NZCV, as the constant is never the size's minimum). Uses `T3`.
+    fn arith_held(&mut self, sub: bool, w: Width, rd: HostReg, a: HostReg, b: Held) -> Emit {
+        match b {
+            Held::Imm(v) => {
+                let bits = if w == Width::X { 64 } else { 32 };
+                let mask = if bits == 64 { u64::MAX } else { 0xffff_ffff };
+                let negated = v.wrapping_neg() & mask;
+                match (v < 1 << 12, sub) {
+                    (true, true) => self.a.subs_imm(w, rd, a, v as u32),
+                    (true, false) => self.a.adds_imm(w, rd, a, v as u32),
+                    (false, true) if negated < 1 << 12 => self.a.adds_imm(w, rd, a, negated as u32),
+                    (false, false) if negated < 1 << 12 => {
+                        self.a.subs_imm(w, rd, a, negated as u32)
+                    }
+                    _ => {
+                        self.a.mov_imm64(T3, v);
+                        if sub {
+                            self.a.subs(w, rd, a, T3, Shift::Lsl, 0)
+                        } else {
+                            self.a.adds(w, rd, a, T3, Shift::Lsl, 0)
+                        }
+                    }
+                }
+            }
+            _ => {
+                let b = self.held(b, T3);
+                if sub {
+                    self.a.subs(w, rd, a, b, Shift::Lsl, 0)
+                } else {
+                    self.a.adds(w, rd, a, b, Shift::Lsl, 0)
+                }
+            }
+        }
+    }
+
+    /// `arith_held` without setting flags (the value only).
+    fn arith_held_plain(&mut self, sub: bool, w: Width, rd: HostReg, a: HostReg, b: Held) -> Emit {
+        match b {
+            Held::Imm(v) => {
+                let mask = if w == Width::X { u64::MAX } else { 0xffff_ffff };
+                let v = if sub { v.wrapping_neg() & mask } else { v };
+                // rd = a + v (mod 2^bits).
+                let negated = v.wrapping_neg() & mask;
+                if v < 1 << 12 {
+                    self.a.add_imm(w, rd, a, v as u32)
+                } else if negated < 1 << 12 {
+                    self.a.sub_imm(w, rd, a, negated as u32)
+                } else {
+                    self.a.mov_imm64(T3, v);
+                    self.a.add(w, rd, a, T3, Shift::Lsl, 0)
+                }
+            }
+            _ => {
+                let b = self.held(b, T3);
+                if sub {
+                    self.a.sub(w, rd, a, b, Shift::Lsl, 0)
+                } else {
+                    self.a.add(w, rd, a, b, Shift::Lsl, 0)
+                }
+            }
+        }
+    }
+
+    /// Copies the pending operands to `FA`/`FB` (the form the flag routine
+    /// and `KIND` describe), deriving the first one from a result. Before
+    /// a held register changes, before an exit, and in every slow path:
+    /// the registers still hold the operands there, as translated code
+    /// writes guest registers only after its last slow path. Uses `T3`.
+    fn spill(&mut self) -> Emit {
+        let Lazy::Static(p) = self.lazy else {
+            return Ok(());
+        };
+        if p.plain() {
+            return Ok(());
+        }
+        let w = width(p.size);
+        match p.kind {
+            FlagKind::Logic => {
+                let r = self.held(p.a, T3);
+                self.a.mov(Width::X, FA, r);
+            }
+            FlagKind::Add | FlagKind::Sub => {
+                if p.result {
+                    let r = self.held(p.a, FA);
+                    self.arith_held_plain(p.kind == FlagKind::Add, w, FA, r, p.b)?;
+                } else {
+                    let a = self.held(p.a, FA);
+                    if a != FA {
+                        self.a.mov(w, FA, a);
+                    }
+                }
+                match p.b {
+                    Held::Imm(v) => self.a.mov_imm64(FB, v),
+                    b => {
+                        let b = self.held(b, FB);
+                        self.a.mov(w, FB, b);
+                    }
+                }
+            }
+            _ => unreachable!("only additions, subtractions and logic hold operands"),
+        }
+        self.lazy = Lazy::Static(Pending::new(p.kind, p.size, p.mask));
+        Ok(())
+    }
+
+    /// `Context::kind` = 0: nothing pending.
+    fn clear_kind(&mut self) -> Emit {
+        self.a
+            .str(MemSize::B64, ZR, CONTEXT, field(offset_of!(Context, kind)))
+    }
+
     /// Before leaving the block: `KIND` says what is pending (the flags
     /// are computed by whoever needs them, at the latest by the epilogue
     /// on the way back to the engine). Operations the flag routine does
     /// not know are computed here. Does not touch `A`.
     fn publish_lazy(&mut self) -> Emit {
         match self.lazy {
-            Lazy::Current => self.a.mov(Width::X, KIND, ZR),
+            Lazy::Current => self.clear_kind()?,
+            Lazy::Static(p)
+                if !p.plain()
+                    && matches!(p.kind, FlagKind::Add | FlagKind::Sub | FlagKind::Logic) =>
+            {
+                self.spill()?;
+                return self.publish_lazy();
+            }
             Lazy::Static(p) => match p.code() {
-                Some(code) => self.a.movz(Width::X, KIND, code, 0)?,
+                Some(code) => {
+                    self.a.movz(Width::X, T1, code, 0)?;
+                    self.a
+                        .str(MemSize::B64, T1, CONTEXT, field(offset_of!(Context, kind)))?;
+                }
                 None => {
                     self.materialize()?;
-                    self.a.mov(Width::X, KIND, ZR);
+                    self.clear_kind()?;
                 }
             },
             Lazy::Dynamic => {}
@@ -4308,12 +4800,15 @@ impl Translator {
     /// Merges the pending flags, if any, into `FLAGS` (from `FA` and
     /// `FB`, redoing the operation for the host NZCV). Uses `R`, `T1`–`T3`.
     fn materialize(&mut self) -> Emit {
+        self.spill()?;
         let p = match std::mem::replace(&mut self.lazy, Lazy::Current) {
             Lazy::Current => return Ok(()),
             Lazy::Static(p) => p,
             Lazy::Dynamic => {
                 let skip = self.a.new_label();
-                self.a.cbz(false, Width::X, KIND, skip);
+                self.a
+                    .ldr(MemSize::B64, T1, CONTEXT, field(offset_of!(Context, kind)))?;
+                self.a.cbz(false, Width::X, T1, skip);
                 self.a.ldr(
                     MemSize::B64,
                     T1,
@@ -4468,6 +4963,33 @@ impl Translator {
     /// The host NZCV of the pending operation `p` (add, sub or logical),
     /// redone from `FA` and `FB`. Uses `R` and `T3`.
     fn redo_nzcv(&mut self, p: Pending) -> Emit {
+        // The previous instruction (a jcc, setcc or cmov) left the host
+        // NZCV of the same pending operation, and nothing since changed it.
+        if std::mem::take(&mut self.nzcv_now) {
+            self.nzcv_valid = true;
+            return Ok(());
+        }
+        self.nzcv_valid = true;
+        self.redo(p)
+    }
+
+    /// The host NZCV of the pending operation `p`, redone from its operands
+    /// wherever they are. Uses `R`, `T3`, `T4`.
+    fn redo(&mut self, p: Pending) -> Emit {
+        if !p.plain() {
+            let w = width(p.size);
+            return match p.kind {
+                FlagKind::Logic => {
+                    let r = self.held(p.a, T4);
+                    self.a.logic(Logic::Ands, false, w, ZR, r, r, Shift::Lsl, 0)
+                }
+                kind => {
+                    let sub = kind == FlagKind::Sub;
+                    let a = self.first_operand(p, T4)?;
+                    self.arith_held(sub, w, R, a, p.b)
+                }
+            };
+        }
         match p.kind {
             FlagKind::Logic if matches!(p.size, Size::B32 | Size::B64) => {
                 self.a
@@ -4476,6 +4998,17 @@ impl Translator {
             FlagKind::Logic => {
                 self.a.mov(Width::X, R, FA);
                 self.test_result(p.size)
+            }
+            kind if matches!(p.size, Size::B8 | Size::B16) => {
+                // The host NZCV only: the operands at the top of a 32-bit
+                // register, without shifting the result back.
+                let top = 32 - p.size.bits();
+                self.a.shift_imm(Shift::Lsl, Width::W, T3, FA, top)?;
+                if kind == FlagKind::Sub {
+                    self.a.subs(Width::W, R, T3, FB, Shift::Lsl, top)
+                } else {
+                    self.a.adds(Width::W, R, T3, FB, Shift::Lsl, top)
+                }
             }
             kind => self.arith(kind == FlagKind::Sub, p.size, FA, FB),
         }

@@ -469,7 +469,12 @@ fn main() -> ExitCode {
         .chain(&guest_args)
         .map(|a| a.as_bytes())
         .collect();
-    let mem = AddressSpace::new();
+    let mut mem = AddressSpace::new();
+    // ADR-0046: on hosts with 4K pages the host checks the JIT's reads;
+    // `ARMOR_PERMISSIONS=table` keeps the table checks (to compare them).
+    if jit && std::env::var_os("ARMOR_PERMISSIONS").is_none_or(|v| v != "table") {
+        mem.enable_host_protection();
+    }
     limits::apply_memory(&resource_limits, &mem);
     let image = match loader::load(
         &mem,
