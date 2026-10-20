@@ -129,9 +129,21 @@ impl Record {
             let head = output("git", &["rev-parse", "--short", "HEAD"])
                 .trim()
                 .to_string();
-            let dirty = !output("git", &["status", "--porcelain", "--untracked-files=no"])
-                .trim()
-                .is_empty();
+            // Results recorded by an earlier `--report` run are not
+            // changes to what is measured.
+            let dirty = !output(
+                "git",
+                &[
+                    "status",
+                    "--porcelain",
+                    "--untracked-files=no",
+                    "--",
+                    ".",
+                    ":!docs/results",
+                ],
+            )
+            .trim()
+            .is_empty();
             if dirty {
                 format!("{head}+changes")
             } else {
@@ -525,7 +537,7 @@ fn seconds(r: &Record) -> String {
 }
 
 /// A suite result for the README: the result, the mode and the reference
-/// in a few words ("470/470 lockstep, qemu").
+/// in a few words ("470/470 lockstep, qemu", "412/470 under fex, qemu").
 fn suite_label(r: &Record) -> String {
     if r.name != "difftest" {
         return format!(
@@ -534,12 +546,15 @@ fn suite_label(r: &Record) -> String {
             r.result.split(" (").next().unwrap_or_default()
         );
     }
-    let mode = if r.engine.contains("lockstep") {
-        "lockstep"
+    // The same cases under another engine (`difftest --engine`).
+    let mode = if !r.engine.starts_with("armor") {
+        format!("under {}", r.engine)
+    } else if r.engine.contains("lockstep") {
+        "lockstep".to_string()
     } else if r.engine.contains("ARMv8.0") {
-        "ARMv8.0 paths"
+        "ARMv8.0 paths".to_string()
     } else {
-        "interpreter and JIT"
+        "interpreter and JIT".to_string()
     };
     let reference = if r.reference.starts_with("x86-64 hardware") {
         "a real x86 CPU"

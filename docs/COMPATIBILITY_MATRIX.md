@@ -57,6 +57,8 @@ Kernel `6.18.50+rpt-rpi-v8`.
 | suite | difftest | armor interpreter, jit | x86-64 hardware: Intel(R) Xeon(R) CPU X5675 @ 3.07GHz, Linux 7.0.2-6-pve | 281/281 | 2026-10-15 | 97f001d | `cargo xtask difftest --oracle` |
 | suite | difftest | armor interpreter, jit, ARMv8.0 paths | qemu-x86_64 10.0.13 | 470/470 | 2026-10-15 | 97f001d | `ARMOR_HOST_FEATURES=baseline cargo xtask difftest` |
 | suite | difftest | armor lockstep | qemu-x86_64 10.0.13 | 470/470 | 2026-10-15 | 97f001d | `cargo xtask difftest --lockstep` |
+| suite | difftest | box64 | qemu-x86_64 10.0.13 | 254/470 | 2026-10-20 | f7e4a55 | `cargo xtask difftest --engine box64` |
+| suite | difftest | fex | qemu-x86_64 10.0.13 | 412/470 | 2026-10-20 | f7e4a55 | `cargo xtask difftest --engine fex` |
 
 Performance against the native AArch64 build, same machine (`cargo xtask bench --box64 --fex`, 2026-10-15, 97f001d): time, and the multiple of the native time, median of 5.
 

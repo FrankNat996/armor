@@ -51,7 +51,7 @@ x86-64 assembly programs by group: identical `faults` 6, `control` 6, `alu` 6, `
 
 The differences in the assembly programs fall into: memory protection faults (consistent with 4K guest pages that box64 does not distinguish inside a 16K host page), undefined flags (`alu/*`, `stack/enter_popf`), NaN propagation and MXCSR (`sse/*`), CPUID and auxv (`basic/cpuid`, `basic/auxv`: different by construction, each engine declares its own CPU).
 
-**Reading:** box64 is strong on real x86-64 programs (143/153), partly thanks to the host's native libraries that it calls in place of the x86 ones; its i386 mode is not usable (with 4K pages too: section "On 4K pages") and on 16K pages memory protection faults are not reproduced. armor covers both. ⚠️ On a host with 4K pages box64's results may be different: to be redone there with the same command.
+**Reading:** box64 is strong on real x86-64 programs (143/153), partly thanks to the host's native libraries that it calls in place of the x86 ones; its i386 mode is not usable (with 4K pages too: section "On 4K pages") and on 16K pages memory protection faults are not reproduced. armor covers both. On 4K pages the results do not get better (section "The three engines on the same 470 cases").
 
 ### Speed (✅ 2026-10-14)
 `ARMOR_BOX64=~/src/box64/build/box64 cargo xtask bench --box64 --runs 3` (Pi 5, 16K pages; the workloads are those of `tech/performance.md`; an output different from qemu's or a failure is marked in the cell instead of stopping the measurement). Median of 3 runs:
@@ -72,11 +72,28 @@ The differences in the assembly programs fall into: memory protection faults (co
 
 **Reading:** on computation box64 is 2 to 3 times faster than armor (its JIT is mature; armor stays faster than qemu everywhere and beats box64 only on static startup), but on the workload with 4 threads box64 terminates with SIGABRT. The two measurements together (exactness in `difftest`, speed here) say: for x86-64 Linux programs where box64 works, it is the fastest engine; armor is the one that works where box64 does not (i386 and faults with 16K pages, threads in this workload) and the exactness reference. What follows for armor: its JIT has room for improvement (`tech/performance.md`), and armor will be able to choose the engine per program (M7).
 
+## The three engines on the same 470 cases (✅ 2026-10-20, 4K pages)
+`cargo xtask difftest --engine box64 --report` and `--engine fex --report`, box64 v0.4.4 and FEX-2610 (the latest releases on 2026-10-20, builds above), Pi 5 with 4K pages, qemu reference (`qemu-x86_64` / `qemu-i386` 10.0.13), limit of 120 s per run; armor on the same tree with `cargo xtask difftest`. Recorded in `docs/results/` (ADR-0045) and rendered in `COMPATIBILITY_MATRIX.md`.
+
+| Group | armor | FEX | box64 |
+|---|---|---|---|
+| real x86-64 programs: coreutils, busybox, `tools`, `interpreters` | 153/153 | **153/153** | 143/153: busybox 46/50 (the four `sh-*` cases), coreutils 46/51, `tools` 32/33 (`gawk-bignum`) |
+| x86-64 C test programs (`c/`, `c-pie/`, `c-dyn/`) | 123/123 | **99/123** (33 in each variant) | 61/123: `c/` 15/41, `c-pie/` 15/41, `c-dyn/` 31/41 |
+| x86-64 assembly programs | 64/64 | **48/64** | 35/64 |
+| i386: `coreutils32`, C (`c32*`), assembly | 130/130 | **112/130**: `coreutils32` 50/50, C 19/25 in each variant, assembly 5/5 | 15/130: `coreutils32` 5/50, `c32-dyn/` 10/25, `c32/` and `c32-pie/` 0/25, assembly 0/5 |
+| **total** | **470/470** | **412/470** | **254/470** |
+
+**FEX's 58 differences** are all in the exactness tests, none in the real programs: x87 (`x87`, `x87_more`), signals (`signals`, `signals_async`, `signals32`, `ppoll_mask`, `events`), `privileged`, `undeclared_extensions`, `legacy_syscalls`, i386 `writev`; in assembly `sse/*` 8 (NaN, MXCSR, packed and scalar floating point, `sse3`, `sse41`, `reciprocal`, `state`), `faults/*` 4 (division by zero and overflow without SIGFPE, misaligned SSE without SIGSEGV, misaligned `cmpxchg16b`), `alu/bits`, `alu/legacy`, `stack/enter_popf`, `basic/cpuid` (different by construction). Kinds: 45 different stdouts, 9 SIGSEGVs where qemu exits with 0, 4 other statuses or signals.
+
+**box64's 216 differences:** 119 runs killed by a signal where qemu exits normally (most of the i386 ones: its i386 mode, BOX32, is experimental for box64 itself, section "box64 v0.4.4"), 65 different stdouts, 15 runs over the time limit, 17 other statuses. On 4K pages box64 reproduces no more faults than on 16K: `faults/*` 6/16 (no SIGSEGV for `exec_data`, `exec_after_mprotect`, `exec_unmapped`, `cmpxchg8b_rodata`, misaligned SSE; no SIGFPE on division; `int3`, `hlt`), so these are not a matter of the page size.
+
+**Reading:** FEX is the mature engine for real programs, x86-64 and i386; box64 is strong on real x86-64 programs and weak on i386; armor is the only one that matches the reference on every case. M11's criterion asks armor to pass at least as many cases as either while getting as fast as both (`roadmap.md`).
+
 ## FEX-2610
 - ✅ **FEX requires ARMv8.0 with FP and CRC32:** its `CMakeLists.txt` always adds `+crc` to the architecture (`-march=armv8-a+crc`); the generic build (`TUNE_CPU=generic`, `TUNE_ARCH=armv8-a`) compiles on this host (2026-10-14).
 - ✅ **It does not run with 16K pages:** every program terminates immediately with `<jemalloc>: Unsupported system page size` (for example `~/src/FEX/build/Bin/FEX target/guest/c/hello`, rerun on 2026-10-14). `difftest --engine fex` therefore has no results on this host.
 - ✅ **Without jemalloc it does not compile:** the configuration with `ENABLE_JEMALLOC_GLIBC_ALLOC=OFF` (`~/src/FEX/build-nojemalloc`) stops with compilation errors (tried on 2026-10-14); upstream does not support it.
-- ✅ **On 4K pages it runs:** `difftest` results in the section "On 4K pages" (345/397).
+- ✅ **On 4K pages it runs:** `difftest` results in the section "On 4K pages" (345/397, 2026-10-14) and, on today's 470 cases, 412/470 (section "The three engines on the same 470 cases").
 
 ## Valve's native ARM64 Steam client
 - ✅ **Manifest:** `steam_client_linuxarm64`, platform `linuxarm64`, version `1791918634`, the same as the x86 client (downloaded on 2026-10-14).
@@ -101,7 +118,7 @@ The Pi 5 boots `kernel8.img` (`environment.md`): `getconf PAGESIZE` gives 4096 �
 | i386 | **94/109**: `coreutils32` 50/50, `c32/` 13/18, `c32-pie/` 13/18, `c32-dyn/` 13/18, i386 assembly 5/5 | 11/109 | 109/109 |
 | **total** | **345/397** | 218/397 | 397/397 |
 
-box64 and FEX are measured on different pages: the comparison between the two is indicative. ⚠️ x86-64 box64 on 4K pages has not been redone (`difftest --engine box64` with this kernel).
+box64 and FEX are measured on different pages here: the comparison of the three engines on the same pages and cases is in the section "The three engines on the same 470 cases" (2026-10-20).
 
 **The 52 differences are all in the exactness tests**, none in the real programs:
 - C programs (x86-64 and i386): x87 (`x87`, `x87_more`), asynchronous signals and signal frames (`signals`, `signals_async`, `signals32`), `privileged`, `writev`, `undeclared_extensions`, `legacy_syscalls`, `events`;
