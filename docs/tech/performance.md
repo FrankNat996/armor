@@ -579,3 +579,6 @@ The xmm registers alone (measured on the intermediate build, the first run): `fl
 | python-float | 1146 ms | 792 ms | 452 ms | 1691 ms | 179 ms |
 
 armor is now faster than box64 on `start-static` and `threads` (where box64 fails), close on `memory`, and faster than FEX everywhere but 7-Zip; box64 stays ahead on computation, by 1.2× (`integer`) to 2× (7-Zip, Python). `memory` varies between runs (243–287 ms in the runs of this day).
+
+## Writes checked by the host (ADR-0046, 2026-10-20)
+`jit.md`, "Writes checked by the host, the stack with writeback". Single runs of the bench commands on the same day, before (350064f) and after: 7-Zip 13.9 → 13.6 s; Python's integer loop 937 → about 800 ms (780–825), its float loop 792 → about 700 ms (695–720). Python's dictionary lookup starts with six pushes, each from 7 AArch64 instructions (an address, the table check with its dependent load, the store, the new rsp) to 3.

@@ -1033,6 +1033,38 @@ impl Assembler {
         Ok(())
     }
 
+    /// LDR / STR (immediate) of 32 or 64 bits with writeback: pre-index
+    /// (`[rn, #offset]!`, the address is rn + offset) or post-index
+    /// (`[rn], #offset`, the address is rn); rn += offset either way.
+    /// `offset` from -256 to 255; rt must not be rn.
+    pub fn load_store_indexed(
+        &mut self,
+        load: bool,
+        size: MemSize,
+        rt: Reg,
+        rn: Reg,
+        offset: i32,
+        pre: bool,
+    ) -> Result<()> {
+        if !(-256..=255).contains(&offset) {
+            return fail(format!("offset {offset} not encodable with writeback"));
+        }
+        if rt == rn {
+            return fail("writeback to the transferred register");
+        }
+        let base = match (size, load) {
+            (MemSize::B64, false) => 0xF800_0000,
+            (MemSize::B64, true) => 0xF840_0000,
+            (MemSize::B32, false) => 0xB800_0000,
+            (MemSize::B32, true) => 0xB840_0000,
+            _ => return fail("writeback forms of 32 and 64 bits only"),
+        };
+        let mode = if pre { 0xC00 } else { 0x400 };
+        let imm9 = (offset as u32) & 0x1ff;
+        self.emit(base | mode | (imm9 << 12) | (rn.bits() << 5) | rt.bits());
+        Ok(())
+    }
+
     /// LDP Qt1, Qt2 / STP Qt1, Qt2 with a signed offset, a multiple of 16
     /// from -1024 to 1008.
     pub fn pair_q(&mut self, load: bool, vt1: VReg, vt2: VReg, rn: Reg, offset: i32) -> Result<()> {

@@ -1234,6 +1234,29 @@ fn random_code_matches_the_interpreter_with_host_protection() {
         let cpu = guest.cpu(&mut rng);
         guest.compare(&code, &cpu, case + 1);
     }
+    // The stack with writeback (`push`, `pop`, `ret`): faults into the
+    // guard page (no access) and the read-only page after the data, and a
+    // misaligned rsp; a fault leaves rsp as it was.
+    let guard = guest.data + DATA_SIZE;
+    let read_only = guard + 0x1000;
+    for (rsp, ops) in [
+        (read_only + 0x10, &[0x50u8][..]),
+        (guard + 0x10, &[0x50]),
+        (guard + 0x10, &[0x5b]),
+        (guard + 0x10, &[0xc3]),
+        (read_only + 0x10, &[0x5b, 0x5b, 0x50]),
+        (guest.data + 0x101, &[0x50, 0x5b]),
+        (guest.data + 0x1004, &[0x50, 0x50, 0x5b]),
+        (guest.data + 0x1ffc, &[0x5b]),
+        (guest.data + 0x2000 - 4, &[0x50]),
+        (guard + 4, &[0x50]),
+    ] {
+        let mut code = vec![0x48, 0xbc];
+        code.extend_from_slice(&rsp.to_le_bytes());
+        code.extend_from_slice(ops);
+        let cpu = guest.cpu(&mut rng);
+        guest.compare(&code, &cpu, 7);
+    }
 }
 
 /// The same in concurrent mode with ARMv8.0 alone (ADR-0032): LDAR for

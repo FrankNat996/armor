@@ -850,6 +850,20 @@ pub fn samples() -> Vec<Sample> {
     s.add("bsl v3.16b, v16.16b, v1.16b".into(), |a| {
         a.bsl(v(3), v(16), v(1))
     });
+    for (load, m) in [(false, "str"), (true, "ldr")] {
+        for (size, g) in [(MemSize::B64, "x"), (MemSize::B32, "w")] {
+            for (t, n, offset) in [(17u8, 26u8, -8i32), (4, 26, 8), (30, 1, 255), (0, 30, -256)] {
+                s.add(format!("{m} {g}{t}, [x{n}, #{offset}]!"), |a| {
+                    a.load_store_indexed(load, size, r(t), r(n), offset, true)
+                        .unwrap()
+                });
+                s.add(format!("{m} {g}{t}, [x{n}], #{offset}"), |a| {
+                    a.load_store_indexed(load, size, r(t), r(n), offset, false)
+                        .unwrap()
+                });
+            }
+        }
+    }
     s.add("movi v0.2d, #0".into(), |a| a.movi_zero(v(0)));
     s.add("movi v31.2d, #0".into(), |a| a.movi_zero(v(31)));
     for (size, suffix, reg) in [

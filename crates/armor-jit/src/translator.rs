@@ -185,6 +185,8 @@ enum Unaligned {
     Store {
         size: Size,
         rt: HostReg,
+        /// As for loads.
+        fault: Option<Label>,
     },
 }
 
@@ -971,6 +973,7 @@ pub fn translate_block(
         nzcv_now: false,
         access_slow: None,
         faults: Vec::new(),
+        write_edges: Vec::new(),
         packed_underflows: Vec::new(),
         live: STATUS_FLAGS,
         skip_flags: false,
@@ -1070,6 +1073,20 @@ pub fn translate_block(
         t.a.str(MemSize::B64, T1, CONTEXT, field(offset_of!(Context, site)))?;
         let entry = t.status_entry(EXIT_CHAIN);
         t.a.b(entry);
+    }
+    // Unaligned writes the host checks: outside the region, the slow path;
+    // within one page, the host; across two, both pages from the table.
+    for (edge, back, bytes, outside, slow) in std::mem::take(&mut t.write_edges) {
+        t.a.bind(edge);
+        t.a.logic_imm(Logic::Ands, Width::X, ZR, ADDR, outside)?;
+        t.a.b_cond(Cond::Ne, slow);
+        t.a.logic_imm(Logic::And, Width::X, T1, ADDR, 0xfff)?;
+        t.a.subs_imm(Width::X, ZR, T1, 4096 - bytes)?;
+        t.a.b_cond(Cond::Ls, back);
+        t.a.shift_imm(Shift::Lsr, Width::X, T1, ADDR, 12)?;
+        t.a.load_store_reg(true, MemSize::B8, T1, PAGES, T1, false);
+        t.a.tbz(false, T1, PAGE_WRITABLE_DATA_SPAN_BIT, slow);
+        t.a.b(back);
     }
     // Checks near the end of a page.
     for (edge, back, alone, bytes, slow) in std::mem::take(&mut t.page_edges) {
@@ -1197,6 +1214,7 @@ pub fn flags_routine() -> Result<Vec<u32>, EncodeError> {
         nzcv_now: false,
         access_slow: None,
         faults: Vec::new(),
+        write_edges: Vec::new(),
         packed_underflows: Vec::new(),
         live: STATUS_FLAGS,
         skip_flags: false,
@@ -1514,6 +1532,9 @@ struct Translator {
     access_slow: Option<Label>,
     /// Guest loads the host checks: (word offset, slow path).
     faults: Vec<(usize, Label)>,
+    /// Out of line: writes the host checks whose address is not aligned
+    /// (entry, back, size, the bits outside the region, slow path).
+    write_edges: Vec<(Label, Label, u32, u64, Label)>,
     /// Out of line: UFC after packed floating point (entry, slow path;
     /// `slow_if_underflow`).
     packed_underflows: Vec<(Label, Label)>,
@@ -1534,6 +1555,8 @@ impl Translator {
         let next = g.rip.wrapping_add(insn.len as u64);
         let size = insn.size;
         let w = width(size);
+        // The accesses the host checks belong to one instruction's checks.
+        self.access_slow = None;
         // The NZCV of the pending flags survives only into a condition
         // reader that emits nothing before reading it.
         let valid = std::mem::take(&mut self.nzcv_valid);
@@ -1732,12 +1755,19 @@ impl Translator {
                         FlagKind::Logic
                     }
                 };
+                // To memory, the store first: with host protection it may
+                // fault, and the slow path wants the flags as they were.
+                // The host flags of the operation survive a store.
+                let stored = dst.is_mem() && op != AluOp::Cmp;
+                if stored {
+                    self.write_destination(dst, size, R)?;
+                }
                 if matches!(op, AluOp::Adc | AluOp::Sbb) {
                     self.flags(kind, a, b, STATUS_FLAGS)?;
                 } else {
                     self.defer(kind, size, a, b, STATUS_FLAGS);
                 }
-                if op != AluOp::Cmp {
+                if op != AluOp::Cmp && !stored {
                     self.write_destination(dst, size, R)?;
                 }
             }
@@ -1786,16 +1816,25 @@ impl Translator {
                         } else {
                             STATUS_FLAGS & !FLAG_CF
                         };
+                        // To memory, the store before the flags (as ALU).
+                        if dst.is_mem() {
+                            self.write_destination(dst, size, R)?;
+                        }
                         self.defer(kind, size, A, B, mask);
                     }
                     UnaryOp::Neg => {
                         // 0 - a.
                         self.arith(true, size, ZR, A)?;
+                        if dst.is_mem() {
+                            self.write_destination(dst, size, R)?;
+                        }
                         self.defer(FlagKind::Sub, size, ZR, A, STATUS_FLAGS);
                     }
                     UnaryOp::Not => self.a.logic(Logic::Orr, true, w, R, ZR, A, Shift::Lsl, 0)?,
                 }
-                self.write_destination(dst, size, R)?;
+                if !dst.is_mem() || op == UnaryOp::Not {
+                    self.write_destination(dst, size, R)?;
+                }
             }
             Op::Shift { op, dst, count } => match dst {
                 Operand::Reg(reg) if matches!(size, Size::B32 | Size::B64) => {
@@ -1846,6 +1885,21 @@ impl Translator {
                 self.read_destination(dst, size, at, &mut slow, true)?;
                 self.load_reg(B, Reg::Gpr(RAX as u8), size)?;
                 self.arith(true, size, B, A)?;
+                if dst.is_mem() {
+                    // x86 writes memory either way (its old value when
+                    // they differ): the store first, as it may fault, with
+                    // the flags still as they were.
+                    self.load_reg(T3, src, size)?;
+                    self.a.csel(Select::Csel, w, T3, T3, A, Cond::Eq);
+                    self.write_destination(dst, size, T3)?;
+                    self.defer(FlagKind::Sub, size, B, A, STATUS_FLAGS);
+                    let equal = self.a.new_label();
+                    self.a.b_cond(Cond::Eq, equal);
+                    self.store_reg(Reg::Gpr(RAX as u8), size, A)?;
+                    self.a.bind(equal);
+                    self.flags_done(insn, written);
+                    return Ok(true);
+                }
                 self.defer(FlagKind::Sub, size, B, A, STATUS_FLAGS);
                 let (differ, done) = (self.a.new_label(), self.a.new_label());
                 self.a.b_cond(Cond::Ne, differ);
@@ -1861,11 +1915,13 @@ impl Translator {
                 self.read_destination(dst, size, at, &mut slow, true)?;
                 self.load_reg(B, src, size)?;
                 self.arith(false, size, A, B)?;
-                self.defer(FlagKind::Add, size, A, B, STATUS_FLAGS);
                 if dst.is_mem() {
+                    // The store first (it may fault), then the flags.
                     self.write_destination(dst, size, R)?;
+                    self.defer(FlagKind::Add, size, A, B, STATUS_FLAGS);
                     self.store_reg(src, size, A)?;
                 } else {
+                    self.defer(FlagKind::Add, size, A, B, STATUS_FLAGS);
                     self.store_reg(src, size, A)?;
                     self.write_destination(dst, size, R)?;
                 }
@@ -2064,6 +2120,25 @@ impl Translator {
                 };
                 let bytes = size.bytes() as u32;
                 let rsp = register_host(RSP as u8).expect("rsp is mapped");
+                // ADR-0046: one load with writeback (`push`).
+                if let (Some(bits), false, Size::B64, Some(h)) = (
+                    self.options.host_reads,
+                    self.options.concurrent,
+                    size,
+                    whole_register(dst, size),
+                ) && h != rsp
+                {
+                    let slow = self.slow_path(at.rip, &mut slow);
+                    self.a
+                        .logic_imm(Logic::Ands, Width::X, ZR, rsp, !((1u64 << bits) - 1))?;
+                    self.a.b_cond(Cond::Ne, slow);
+                    self.access_slow = Some(slow);
+                    self.mark_access();
+                    self.a
+                        .load_store_indexed(true, MemSize::B64, h, rsp, 8, false)?;
+                    self.flags_done(insn, written);
+                    return Ok(true);
+                }
                 self.a.mov(Width::X, ADDR, rsp);
                 self.check(Check::Read, bytes, at.rip, &mut slow)?;
                 // Straight into a mapped destination, but `pop rsp` loads
@@ -2126,6 +2201,28 @@ impl Translator {
             Op::Ret { pop } => {
                 let bytes = size.bytes() as u64;
                 let rsp = register_host(RSP as u8).expect("rsp is mapped");
+                // ADR-0046: one load with writeback (`push`).
+                if let (Some(bits), false, Size::B64) =
+                    (self.options.host_reads, self.options.concurrent, size)
+                    && 8 + u32::from(pop) <= 255
+                {
+                    let slow = self.slow_path(at.rip, &mut slow);
+                    self.a
+                        .logic_imm(Logic::Ands, Width::X, ZR, rsp, !((1u64 << bits) - 1))?;
+                    self.a.b_cond(Cond::Ne, slow);
+                    self.access_slow = Some(slow);
+                    self.mark_access();
+                    self.a.load_store_indexed(
+                        true,
+                        MemSize::B64,
+                        A,
+                        rsp,
+                        8 + i32::from(pop),
+                        false,
+                    )?;
+                    self.exit_to(A)?;
+                    return Ok(false);
+                }
                 self.a.mov(Width::X, ADDR, rsp);
                 self.check(Check::Read, bytes as u32, at.rip, &mut slow)?;
                 self.guest_load(false, size, A)?;
@@ -2137,10 +2234,6 @@ impl Translator {
             _ => unreachable!("checked by supported"),
         }
         self.flags_done(insn, written);
-        debug_assert!(
-            self.access_slow.is_none(),
-            "{insn:?}: a checked read without its load"
-        );
         Ok(true)
     }
 
@@ -2373,9 +2466,13 @@ impl Translator {
             }
         }
         self.a.logic_imm(Logic::And, Width::X, R, R, mask)?;
+        // To memory, the store before the flags: it may fault (host
+        // protection), and the slow path wants them as they were.
+        if self.skip_flags || dst.is_mem() {
+            self.write_destination(dst, size, R)?;
+        }
         if self.skip_flags {
             // Dead flags (`live_flags`): the result only.
-            self.write_destination(dst, size, R)?;
             self.a.bind(done);
             return Ok(());
         }
@@ -2415,7 +2512,9 @@ impl Translator {
                 .logic(Logic::Orr, false, Width::X, T1, T1, T2, Shift::Lsl, 11)?;
             self.result_flags(size, STATUS_FLAGS)?;
         }
-        self.write_destination(dst, size, R)?;
+        if !dst.is_mem() {
+            self.write_destination(dst, size, R)?;
+        }
         self.a.bind(done);
         Ok(())
     }
@@ -2513,6 +2612,7 @@ impl Translator {
                     let s = xreg(&src);
                     self.address(&m, at.next, true)?;
                     self.check_xmm_access(Check::Write, aligned, at.rip, slow)?;
+                    self.mark_access();
                     self.a.str_q(s, ADDR, 0)
                 }
                 (_, Operand::Mem(m)) => {
@@ -2899,6 +2999,7 @@ impl Translator {
                     (Operand::Mem(m), Operand::Reg(_)) => {
                         self.address(&m, at.next, true)?;
                         self.check(Check::Write, bytes, at.rip, slow)?;
+                        self.mark_access();
                         self.a.load_store_fp(false, double, xreg(&src), ADDR, 0)
                     }
                     _ => unreachable!("checked by supported"),
@@ -3611,7 +3712,7 @@ impl Translator {
     /// Before a guest load at `ADDR`: if its read was left to the host
     /// (`check`), records where it is, for the fault handler.
     fn mark_access(&mut self) -> Option<Label> {
-        let slow = self.access_slow.take()?;
+        let slow = self.access_slow?;
         self.faults.push((self.a.len(), slow));
         Some(slow)
     }
@@ -3625,7 +3726,7 @@ impl Translator {
             self.mark_access();
             return self.load(signed, size, rt, ADDR, 0);
         }
-        let fault = self.access_slow.take();
+        let fault = self.access_slow;
         let back = self.unaligned_test(
             size,
             Unaligned::Load {
@@ -3635,7 +3736,6 @@ impl Translator {
                 fault,
             },
         );
-        self.access_slow = fault;
         self.mark_access();
         if self.options.features.rcpc {
             self.a.ldapr(mem_size(size), rt, ADDR);
@@ -3657,9 +3757,12 @@ impl Translator {
     /// of line with a barrier if `ADDR` is not aligned to the size.
     fn guest_store(&mut self, size: Size, rt: HostReg) -> Emit {
         if !self.options.concurrent {
+            self.mark_access();
             return self.a.str(mem_size(size), rt, ADDR, 0);
         }
-        let back = self.unaligned_test(size, Unaligned::Store { size, rt });
+        let fault = self.access_slow;
+        let back = self.unaligned_test(size, Unaligned::Store { size, rt, fault });
+        self.mark_access();
         self.a.stlr(mem_size(size), rt, ADDR);
         if let Some(back) = back {
             self.a.bind(back);
@@ -3695,12 +3798,17 @@ impl Translator {
                 rt,
                 fault,
             } => {
-                self.access_slow = fault;
-                self.mark_access();
+                if let Some(slow) = fault {
+                    self.faults.push((self.a.len(), slow));
+                }
                 self.load(signed, size, rt, ADDR, 0)?;
                 self.a.dmb(Barrier::IshLd);
             }
-            Unaligned::Store { size, rt } => {
+            Unaligned::Store { size, rt, fault } => {
+                if let Some(slow) = fault {
+                    // The store after the barrier.
+                    self.faults.push((self.a.len() + 1, slow));
+                }
                 self.a.dmb(Barrier::Ish);
                 self.a.str(mem_size(size), rt, ADDR, 0)?;
             }
@@ -4089,11 +4197,13 @@ impl Translator {
     /// (acquire and release); it uses T1 and T4.
     fn atomic_op(&mut self, op: AtomicOp, ms: MemSize, rs: HostReg, rt: HostReg) -> Emit {
         if self.options.features.lse {
+            self.mark_access();
             self.a.atomic(op, ms, rs, rt, ADDR);
             return Ok(());
         }
         let again = self.a.new_label();
         self.a.bind(again);
+        self.mark_access();
         self.a.ldaxr(ms, rt, ADDR);
         match op {
             AtomicOp::Add => self.a.add(Width::X, T1, rt, rs, Shift::Lsl, 0)?,
@@ -4110,6 +4220,7 @@ impl Translator {
             }
             AtomicOp::Swp => self.a.mov(Width::X, T1, rs),
         }
+        self.mark_access();
         self.a.stlxr(ms, T4, T1, ADDR);
         self.a.cbz(true, Width::W, T4, again);
         Ok(())
@@ -4121,15 +4232,18 @@ impl Translator {
     /// still a full barrier, as x86's locked cmpxchg (it uses T1 and T4).
     fn compare_and_swap(&mut self, ms: MemSize, expected: HostReg, new: HostReg) -> Emit {
         if self.options.features.lse {
+            self.mark_access();
             self.a.casal(ms, expected, new, ADDR);
             return Ok(());
         }
         let (again, differ, done) = (self.a.new_label(), self.a.new_label(), self.a.new_label());
         self.a.mov(Width::X, T1, expected);
         self.a.bind(again);
+        self.mark_access();
         self.a.ldaxr(ms, expected, ADDR);
         self.a.subs(Width::X, ZR, expected, T1, Shift::Lsl, 0)?;
         self.a.b_cond(Cond::Ne, differ);
+        self.mark_access();
         self.a.stlxr(ms, T4, new, ADDR);
         self.a.cbz(true, Width::W, T4, again);
         self.a.b(done);
@@ -4146,6 +4260,24 @@ impl Translator {
     fn push(&mut self, value: HostReg, size: Size, rip: u64, slow: &mut Option<Label>) -> Emit {
         let bytes = size.bytes() as u32;
         let rsp = register_host(RSP as u8).expect("rsp is mapped");
+        // ADR-0046: one store with writeback when the host checks writes
+        // and rsp is below the region's end and 8-aligned: the slot then
+        // cannot cross a page, and below the region (or above, in the
+        // guard) the host faults. A misaligned rsp: the interpreter.
+        if let (Some(bits), false, Size::B64) =
+            (self.options.host_reads, self.options.concurrent, size)
+            && value != rsp
+        {
+            let slow = self.slow_path(rip, slow);
+            self.a
+                .logic_imm(Logic::Ands, Width::X, ZR, rsp, !((1u64 << bits) - 1) | 7)?;
+            self.a.b_cond(Cond::Ne, slow);
+            self.access_slow = Some(slow);
+            self.mark_access();
+            return self
+                .a
+                .load_store_indexed(false, MemSize::B64, value, rsp, -8, true);
+        }
         self.a.sub_imm(width(size), ADDR, rsp, bytes)?;
         self.check(Check::Write, bytes, rip, slow)?;
         self.guest_store(size, value)?;
@@ -4455,15 +4587,26 @@ impl Translator {
         let slow = self.slow_path(rip, slow);
         // ADR-0046: the host checks reads below the guest's region's end;
         // above it, the interpreter.
-        if let (Check::Read, Some(bits)) = (check, self.options.host_reads) {
-            self.a
-                .logic_imm(Logic::Ands, Width::X, ZR, ADDR, !((1u64 << bits) - 1))?;
-            self.a.b_cond(Cond::Ne, slow);
-            debug_assert!(
-                self.access_slow.is_none(),
-                "a checked read without its load"
-            );
+        if let Some(bits) = self.options.host_reads {
+            let outside = !((1u64 << bits) - 1);
             self.access_slow = Some(slow);
+            if check == Check::Read || bytes == 1 {
+                // A read faults or not as a whole; a byte cannot cross.
+                self.a.logic_imm(Logic::Ands, Width::X, ZR, ADDR, outside)?;
+                self.a.b_cond(Cond::Ne, slow);
+                return Ok(());
+            }
+            // A write must not cross into a page it may not write: the
+            // host may write the first part before the fault, x86 writes
+            // nothing. An aligned one cannot cross: one test for both, the
+            // rest out of line (`write_edges`).
+            let (edge, back) = (self.a.new_label(), self.a.new_label());
+            let misaligned = u64::from(bytes.next_power_of_two() - 1);
+            self.a
+                .logic_imm(Logic::Ands, Width::X, ZR, ADDR, outside | misaligned)?;
+            self.a.b_cond(Cond::Ne, edge);
+            self.a.bind(back);
+            self.write_edges.push((edge, back, bytes, outside, slow));
             return Ok(());
         }
         self.a

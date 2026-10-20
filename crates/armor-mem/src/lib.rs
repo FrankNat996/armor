@@ -379,11 +379,16 @@ pub struct AddressSpace {
     /// host too, so that translated code may load without checking the
     /// permission table, and armor's own memory is outside the region.
     region_end: u64,
+    /// Serializes the temporary protection changes of `with_access`.
+    access_lock: std::sync::Mutex<()>,
 }
 
 /// The lowest address a mapping placed below the ceiling may start at:
 /// Linux's default `vm.mmap_min_addr`.
 const PLACEMENT_FLOOR: u64 = 0x1_0000;
+
+/// ADR-0046: inaccessible bytes reserved right above the guest's region.
+pub const REGION_GUARD: u64 = 0x1_0000;
 
 #[derive(Default)]
 struct Tables {
@@ -594,6 +599,7 @@ impl AddressSpace {
                 0
             }),
             region_end: 0,
+            access_lock: std::sync::Mutex::new(()),
         }
     }
 
@@ -619,7 +625,10 @@ impl AddressSpace {
         if self.host_page_size != GUEST_PAGE_SIZE || !tables.host_pages.is_empty() {
             return false;
         }
-        let len = end - PLACEMENT_FLOOR;
+        // With a guard above the region: an access that starts below its
+        // end and runs past it faults (translated code tests only where
+        // an access starts, or a base register).
+        let len = end + REGION_GUARD - PLACEMENT_FLOOR;
         // SAFETY: an inaccessible reservation; MAP_FIXED_NOREPLACE fails
         // instead of replacing anything.
         let ptr = unsafe {
@@ -732,11 +741,7 @@ impl AddressSpace {
         if self.region_end == 0 {
             return;
         }
-        let host_prot = |page: u64| match tables.pages.get(page) {
-            Some(Prot::NONE) | None => libc::PROT_NONE,
-            Some(_) if tables.shared.get(&page) == Some(&false) => libc::PROT_READ,
-            Some(_) => libc::PROT_READ | libc::PROT_WRITE,
-        };
+        let host_prot = |page: u64| host_prot_of(tables, page);
         let (first, last) = (start / GUEST_PAGE_SIZE, end.div_ceil(GUEST_PAGE_SIZE));
         let mut page = first;
         while page < last {
@@ -759,16 +764,32 @@ impl AddressSpace {
     }
 
     /// Runs `f` with the guest pages of `[addr, addr + len)` accessible on
-    /// the host: privileged accesses ignore the guest's permissions, and
-    /// with host protection a page that allows no access is inaccessible.
-    fn with_access<T>(&self, tables: &Tables, addr: u64, len: usize, f: impl FnOnce() -> T) -> T {
+    /// the host, for reading or also (`write`) for writing: privileged
+    /// accesses ignore the guest's permissions, the interpreter writes
+    /// executable pages (self-modifying code), and with host protection a
+    /// page may be inaccessible or read-only on the host (`host_prot_of`).
+    /// One thread at a time changes protections here (`access_lock`).
+    fn with_access<T>(
+        &self,
+        tables: &Tables,
+        addr: u64,
+        len: usize,
+        write: bool,
+        f: impl FnOnce() -> T,
+    ) -> T {
         let end = addr + len as u64;
+        let needed = if write {
+            libc::PROT_READ | libc::PROT_WRITE
+        } else {
+            libc::PROT_READ
+        };
         let hidden = self.region_end != 0
             && (addr / GUEST_PAGE_SIZE..end.div_ceil(GUEST_PAGE_SIZE))
-                .any(|page| tables.pages.get(page) == Some(Prot::NONE));
+                .any(|page| host_prot_of(tables, page) & needed != needed);
         if !hidden {
             return f();
         }
+        let _one_at_a_time = self.access_lock.lock().expect("access lock poisoned");
         let start = addr - addr % GUEST_PAGE_SIZE;
         let stop = round_up(end, GUEST_PAGE_SIZE).unwrap_or(end);
         // SAFETY: mapped host pages of this address space; their
@@ -1829,7 +1850,7 @@ impl AddressSpace {
         // SAFETY: `check` verified that every byte is in a mapped guest page,
         // backed by a host page owned by this address space, read-write
         // inside `with_access`.
-        self.with_access(&tables, addr, data.len(), || unsafe {
+        self.with_access(&tables, addr, data.len(), true, || unsafe {
             std::ptr::copy_nonoverlapping(data.as_ptr(), addr as *mut u8, data.len())
         });
         if executable {
@@ -1847,7 +1868,7 @@ impl AddressSpace {
         // SAFETY: `check` verified that every byte is in a mapped guest page,
         // backed by a host page of this address space, accessible inside
         // `with_access`; the lock keeps it.
-        self.with_access(&tables, addr, len, || unsafe {
+        self.with_access(&tables, addr, len, false, || unsafe {
             std::ptr::copy_nonoverlapping(addr as *const u8, buf.as_mut_ptr(), len)
         });
         Ok(())
@@ -1954,6 +1975,25 @@ fn host_runs(first: u64, end: u64, owned: &[u64]) -> Vec<(u64, u64, bool)> {
     runs
 }
 
+/// With host protection (ADR-0046), the host protection of a guest page:
+/// inaccessible for no access; writable only for a writable page that is
+/// not executable (writes to code must reach the interpreter, which
+/// invalidates translations) nor a shared page the host maps read-only;
+/// otherwise read-only.
+fn host_prot_of(tables: &Tables, page: u64) -> libc::c_int {
+    match tables.pages.get(page) {
+        Some(Prot::NONE) | None => libc::PROT_NONE,
+        Some(prot)
+            if prot.contains(Prot::WRITE)
+                && !prot.contains(Prot::EXEC)
+                && tables.shared.get(&page) != Some(&false) =>
+        {
+            libc::PROT_READ | libc::PROT_WRITE
+        }
+        Some(_) => libc::PROT_READ,
+    }
+}
+
 fn set_pages(tables: &mut Tables, start: u64, end: u64, prot: Prot) -> bool {
     let mut executable = prot.contains(Prot::EXEC);
     for page in start / GUEST_PAGE_SIZE..end / GUEST_PAGE_SIZE {
@@ -2023,8 +2063,11 @@ fn write_locked(
         p.allows(Access::Write)
     })?;
     // SAFETY: as in `read_locked`; the host page is writable regardless of
-    // the guest permissions, which `check` enforced.
-    unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), addr as *mut u8, data.len()) };
+    // the guest permissions, which `check` enforced, or made so by
+    // `with_access` (an executable page with host protection).
+    space.with_access(tables, addr, data.len(), true, || unsafe {
+        std::ptr::copy_nonoverlapping(data.as_ptr(), addr as *mut u8, data.len())
+    });
     if executable {
         // Self-modifying code: decoded instructions may be stale.
         space.code_changed();
@@ -2134,7 +2177,10 @@ impl GuestMemory for MemView<'_> {
             fence(Ordering::Release);
         }
         // SAFETY: as in `write_locked`; the view holds the tables lock.
-        unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), addr as *mut u8, data.len()) };
+        self.space
+            .with_access(&self.tables, addr, data.len(), true, || unsafe {
+                std::ptr::copy_nonoverlapping(data.as_ptr(), addr as *mut u8, data.len())
+            });
         if executable {
             self.space.code_changed();
         }
@@ -2169,7 +2215,10 @@ impl GuestMemory for MemView<'_> {
             // SAFETY: aligned, and checked mapped and writable for the
             // guest, hence read-write in the host (as in `atomic_update`);
             // the view holds the tables lock.
-            unsafe { host_compare_exchange_16(addr, expected, new) }
+            self.space
+                .with_access(&self.tables, addr, 16, true, || unsafe {
+                    host_compare_exchange_16(addr, expected, new)
+                })
         } else {
             // cmpxchg16b raises #GP first: only reachable from armor itself.
             let mut bytes = [0u8; 16];
@@ -2211,7 +2260,11 @@ impl GuestMemory for MemView<'_> {
         // host pages of this address space mapped read-write (a shared page
         // is guest-writable only if the host maps it writable); the view
         // holds the tables lock.
-        let old = unsafe { host_atomic_update(addr, size, update) };
+        let old = self
+            .space
+            .with_access(&self.tables, addr, size, true, || unsafe {
+                host_atomic_update(addr, size, update)
+            });
         if executable {
             self.space.code_changed();
         }
