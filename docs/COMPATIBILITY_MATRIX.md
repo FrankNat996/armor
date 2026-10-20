@@ -30,7 +30,7 @@ Every row below comes from a command run with `--report` on the machine named in
 |---|---|
 | 7-Zip 26.04 for Linux x86-64 (7zz) | level 3: archive of tests/guest identical to the native ARM64 7zz's (SHA-256 b7f32abea7665d92…) — armor (JIT) (2026-10-15) |
 | 7-Zip 26.04 for Windows x64 (7z2604-x64.exe) | level 3: archive of tests/guest identical to the ARM64 build's (SHA-256 c3f315b107e7311f…) — Hangover 11.16 (FEX ARM64EC) (2026-10-15) |
-| 7-Zip 26.04 for Windows x86 (7z2604.exe) | level 3: archive of tests/guest identical to the ARM64 build's (SHA-256 c3f315b107e7311f…) — Hangover 11.16 (FEX WoW64) (2026-10-15)<br>level 3: archive of tests/guest identical to the ARM64 build's (SHA-256 187a126a68809f89…) — Hangover 11.16 (armor WoW64) (2026-10-20) |
+| 7-Zip 26.04 for Windows x86 (7z2604.exe) | level 3: archive of tests/guest identical to the ARM64 build's (SHA-256 c3f315b107e7311f…) — Hangover 11.16 (FEX WoW64) (2026-10-15)<br>level 3: archive of tests/guest identical to the ARM64 build's (SHA-256 a3a39bc58fc51735…) — Hangover 11.16 (armor WoW64) (2026-10-20) |
 | Friday Night Funkin' 0.8.6 for Windows x64 (itch.io zip) | level 1: its window (Friday Night Funkin) appeared 4 s after armor run — Hangover 11.16 (FEX ARM64EC) (2026-10-15) |
 | KeePass 2.61.1 for Windows (.NET) | level 1: its window (KeePass) appeared 20 s after armor run — Hangover 11.16 with Wine Mono (2026-10-15)<br>level 1: its window (KeePass) appeared 20 s after armor run — Hangover 11.16 with Wine Mono, 32-bit code under armor WoW64 (2026-10-20) |
 | KeePassXC 2.7.12 (AppImage, x86-64) | level 1: its window (KeePassXC) appeared 5 s after armor run — armor (JIT), Debian's x86-64 libraries (2026-10-15) |
@@ -46,13 +46,13 @@ Kernel `6.18.50+rpt-rpi-v8`.
 | application | 7-Zip 26.04 for Linux x86-64 (7zz) | armor (JIT) | 7-Zip 26.04 for Linux ARM64, run natively | level 3: archive of tests/guest identical to the native ARM64 7zz's (SHA-256 b7f32abea7665d92…) | 2026-10-15 | 97f001d | `cargo xtask app-check 7zip-linux` |
 | application | 7-Zip 26.04 for Windows x64 (7z2604-x64.exe) | Hangover 11.16 (FEX ARM64EC) | 7-Zip 26.04 for Windows ARM64, run the same way | level 3: archive of tests/guest identical to the ARM64 build's (SHA-256 c3f315b107e7311f…) | 2026-10-15 | 97f001d | `cargo xtask app-check 7zip-x64` |
 | application | 7-Zip 26.04 for Windows x86 (7z2604.exe) | Hangover 11.16 (FEX WoW64) | 7-Zip 26.04 for Windows ARM64, run the same way | level 3: archive of tests/guest identical to the ARM64 build's (SHA-256 c3f315b107e7311f…) | 2026-10-15 | 97f001d | `cargo xtask app-check 7zip-x86` |
-| application | 7-Zip 26.04 for Windows x86 (7z2604.exe) | Hangover 11.16 (armor WoW64) | 7-Zip 26.04 for Windows ARM64, run the same way | level 3: archive of tests/guest identical to the ARM64 build's (SHA-256 187a126a68809f89…) | 2026-10-20 | b4922bb | `cargo xtask app-check --x86-engine armor 7zip-x86` |
+| application | 7-Zip 26.04 for Windows x86 (7z2604.exe) | Hangover 11.16 (armor WoW64) | 7-Zip 26.04 for Windows ARM64, run the same way | level 3: archive of tests/guest identical to the ARM64 build's (SHA-256 a3a39bc58fc51735…) | 2026-10-20 | 11404fd | `cargo xtask app-check --x86-engine armor 7zip-x86` |
 | application | Friday Night Funkin' 0.8.6 for Windows x64 (itch.io zip) | Hangover 11.16 (FEX ARM64EC) | a window on an X display (Xvfb) | level 1: its window (Friday Night Funkin) appeared 4 s after armor run | 2026-10-15 | 97f001d | `cargo xtask app-check funkin` |
 | application | KeePass 2.61.1 for Windows (.NET) | Hangover 11.16 with Wine Mono | a window on an X display (Xvfb) | level 1: its window (KeePass) appeared 20 s after armor run | 2026-10-15 | 97f001d | `cargo xtask app-check keepass2` |
-| application | KeePass 2.61.1 for Windows (.NET) | Hangover 11.16 with Wine Mono, 32-bit code under armor WoW64 | a window on an X display (Xvfb) | level 1: its window (KeePass) appeared 20 s after armor run | 2026-10-20 | b4922bb | `cargo xtask app-check --x86-engine armor keepass2` |
+| application | KeePass 2.61.1 for Windows (.NET) | Hangover 11.16 with Wine Mono, 32-bit code under armor WoW64 | a window on an X display (Xvfb) | level 1: its window (KeePass) appeared 20 s after armor run | 2026-10-20 | 11404fd | `cargo xtask app-check --x86-engine armor keepass2` |
 | application | KeePassXC 2.7.12 (AppImage, x86-64) | armor (JIT), Debian's x86-64 libraries | a window on an X display (Xvfb) | level 1: its window (KeePassXC) appeared 5 s after armor run | 2026-10-15 | 97f001d | `cargo xtask app-check keepassxc` |
 | application | Notepad++ 8.9.8.1 for Windows x64 | Hangover 11.16 (FEX ARM64EC) | a window on an X display (Xvfb) | level 1: its window (Notepad++) appeared 2 s after armor run | 2026-10-15 | 97f001d | `cargo xtask app-check notepad-plus-plus` |
-| application | Notepad++ 8.9.8.1 for Windows x64 | Hangover 11.16 (FEX ARM64EC), 32-bit code under armor WoW64 | a window on an X display (Xvfb) | level 1: its window (Notepad++) appeared 2 s after armor run | 2026-10-20 | b4922bb | `cargo xtask app-check --x86-engine armor notepad-plus-plus` |
+| application | Notepad++ 8.9.8.1 for Windows x64 | Hangover 11.16 (FEX ARM64EC), 32-bit code under armor WoW64 | a window on an X display (Xvfb) | level 1: its window (Notepad++) appeared 2 s after armor run | 2026-10-20 | 11404fd | `cargo xtask app-check --x86-engine armor notepad-plus-plus` |
 | application | Spotify 1.3.4.258 (.deb, x86-64, Chromium) | armor (JIT), Debian's x86-64 libraries | a window on an X display (Xvfb) | level 1: its window (Spotify) appeared 20 s after armor run | 2026-10-15 | 97f001d | `cargo xtask app-check spotify` |
 | application | XnView MP 1.12.2 (.deb, x86-64) | armor (JIT), Debian's x86-64 libraries | a window on an X display (Xvfb) | level 1: its window (XnView) appeared 1 s after armor run | 2026-10-15 | 97f001d | `cargo xtask app-check xnviewmp` |
 | suite | difftest | armor interpreter, jit | qemu-x86_64 10.0.13 | 476/476 | 2026-10-20 | b4922bb | `cargo xtask difftest` |
@@ -63,22 +63,22 @@ Kernel `6.18.50+rpt-rpi-v8`.
 | suite | difftest | box64 | qemu-x86_64 10.0.13 | 254/470 | 2026-10-20 | f7e4a55 | `cargo xtask difftest --engine box64` |
 | suite | difftest | fex | qemu-x86_64 10.0.13 | 412/470 | 2026-10-20 | f7e4a55 | `cargo xtask difftest --engine fex` |
 
-Performance against the native AArch64 build, same machine (`cargo xtask bench --box64 --fex`, 2026-10-15, 97f001d): time, and the multiple of the native time, median of 5.
+Performance against the native AArch64 build, same machine (`cargo xtask bench --box64 --fex`, 2026-10-20, 11404fd): time, and the multiple of the native time, median of 5.
 
 | Workload | FEX | armor --jit | box64 | qemu-x86_64 |
 |---|---|---|---|---|
-| 7zip | 8.485 s, 1.39× | 16.542 s, 2.71× | 6.823 s, 1.12× | 28.682 s, 4.71× |
-| float | 1.132 s, 22.17× | 0.265 s, 5.19× | 0.136 s, 2.65× | 0.719 s, 14.07× |
-| integer | 1.193 s, 10.21× | 0.225 s, 1.92× | 0.165 s, 1.41× | 0.334 s, 2.85× |
-| memory | 1.209 s, 8.07× | 0.268 s, 1.79× | 0.238 s, 1.59× | 0.402 s, 2.68× |
-| python-float | 1.680 s, 9.20× | 1.146 s, 6.28× | 0.432 s, 2.37× | 4.383 s, 24.00× |
-| python-int | 1.754 s, 7.72× | 1.369 s, 6.03× | 0.493 s, 2.17× | 5.058 s, 22.27× |
-| python-start | 1.347 s, 90.30× | 0.243 s, 16.30× | 0.088 s, 5.91× | 0.491 s, 32.88× |
-| simd | 1.074 s, 32.80× | 0.211 s, 6.46× | 0.092 s, 2.80× | 0.362 s, 11.05× |
-| start-dynamic | 1.058 s, 1732.96× | 0.019 s, 30.90× | 0.013 s, 20.74× | 0.032 s, 52.00× |
-| start-static | 1.034 s, 2603.58× | 0.010 s, 24.45× | 0.028 s, 69.31× | 0.020 s, 49.34× |
-| syscall | 1.212 s, 10.46× | 0.213 s, 1.84× | 0.168 s, 1.45× | 0.340 s, 2.94× |
-| threads | 1.145 s, 12.65× | 0.158 s, 1.74× | fails (signal: 11 (SIGSEGV)) | 0.292 s, 3.22× |
+| 7zip | 8.529 s, 1.40× | 10.344 s, 1.70× | 6.881 s, 1.13× | 28.778 s, 4.72× |
+| float | 1.131 s, 22.15× | 0.189 s, 3.70× | 0.135 s, 2.64× | 0.718 s, 14.06× |
+| integer | 1.191 s, 10.19× | 0.186 s, 1.59× | 0.165 s, 1.42× | 0.333 s, 2.85× |
+| memory | 1.211 s, 8.11× | 0.265 s, 1.77× | 0.237 s, 1.59× | 0.395 s, 2.64× |
+| python-float | 1.674 s, 9.14× | 0.628 s, 3.43× | 0.447 s, 2.44× | 4.482 s, 24.48× |
+| python-int | 1.768 s, 7.76× | 0.709 s, 3.12× | 0.489 s, 2.15× | 5.087 s, 22.34× |
+| python-start | 1.347 s, 91.02× | 0.186 s, 12.54× | 0.105 s, 7.10× | 0.491 s, 33.19× |
+| simd | 1.076 s, 33.08× | 0.137 s, 4.22× | 0.092 s, 2.81× | 0.360 s, 11.05× |
+| start-dynamic | 1.057 s, 1871.57× | 0.017 s, 30.93× | 0.012 s, 21.98× | 0.032 s, 55.96× |
+| start-static | 1.033 s, 2754.36× | 0.008 s, 21.27× | 0.025 s, 67.89× | 0.020 s, 52.05× |
+| syscall | 1.204 s, 10.39× | 0.206 s, 1.78× | 0.168 s, 1.45× | 0.344 s, 2.97× |
+| threads | 1.146 s, 12.69× | 0.121 s, 1.34× | fails (signal: 11 (SIGSEGV)) | 0.295 s, 3.26× |
 
 ### Cortex-A76, 16K pages, Debian GNU/Linux 13 (KVM virtual machine)
 Kernel `6.12.111+deb13-arm64-16k`.

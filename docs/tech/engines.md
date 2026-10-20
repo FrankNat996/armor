@@ -228,7 +228,7 @@ Measured in the 16K virtual machine of `testing.md` ("Other page sizes": Debian 
 | 32-bit Windows x86 | Hangover, box64 WoW64 (`wowbox64.dll`) | 8.4 |
 | Windows ARM64 | Hangover's Wine, native | 6.7 |
 
-armor's backend takes 1.9 times FEX's time, about the ratio of armor's JIT to box64 on Linux `7zz` (`bench`, `tech/performance.md`): the gains still to come for the JIT are what this backend needs. On the small `tests/guest` input (`app-check`'s) the times were 0.4 s under FEX, 1.3 s under armor's JIT and 23.3 s with its interpreter alone.
+armor's backend takes 1.9 times FEX's time, about the ratio of armor's JIT to box64 on Linux `7zz` (`bench`, `tech/performance.md`): the gains still to come for the JIT are what this backend needs. ✅ After the JIT changes of the same day (shared prologue and epilogue, carries from the kind left pending, region tests once per base…), the same measurement: **13.2 s** (13.3, 13.2, 13.1), the same archive. On the small `tests/guest` input (`app-check`'s) the times were 0.4 s under FEX, 1.3 s under armor's JIT and 23.3 s with its interpreter alone.
 
 ### Epic Games Launcher (2026-10-14)
 Installed with `armor install` (prefix in `~/.local/share/armor/apps/epic`) on the Pi with 4K pages; measured on 2026-10-14.
