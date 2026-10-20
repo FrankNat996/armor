@@ -40,7 +40,7 @@ use armor_mem::{GuestMemory, MemFault, MemView};
 use armor_x86::{MAX_INSTRUCTION_LEN, decode};
 
 use crate::engine::{Entry, Jit};
-use crate::translator::EXIT_INTERPRET;
+use crate::translator::{EXIT_INTERPRET, EXIT_SYSCALL};
 
 /// What the translated code may change.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -226,8 +226,9 @@ pub(crate) fn run(
                     "slow path changed the state",
                 );
             }
+            // (A syscall in compatibility mode goes to the interpreter.)
             if cpu.step(mem)? == Step::Syscall {
-                unreachable!("the translator does not handle syscall");
+                return Ok(Step::Syscall);
             }
             continue;
         }
@@ -244,6 +245,17 @@ pub(crate) fn run(
         if translated != expected {
             mismatch(mem, rip, &before, &expected, &translated, "different state");
         }
+        let syscall = matches!(interpreted, Ok(Step::Syscall));
+        if syscall != (status == EXIT_SYSCALL) {
+            mismatch(
+                mem,
+                rip,
+                &before,
+                &expected,
+                &translated,
+                "only one of the two stopped for a syscall",
+            );
+        }
         for write in &writes {
             let mut now = vec![0; write.new.len()];
             if mem.read(write.addr, &mut now).is_err() || now != write.new {
@@ -259,6 +271,9 @@ pub(crate) fn run(
                     ),
                 );
             }
+        }
+        if syscall {
+            return Ok(Step::Syscall);
         }
     }
     Ok(Step::Continue)

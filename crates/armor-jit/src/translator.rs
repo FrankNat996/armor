@@ -36,8 +36,8 @@ use alloc::vec::Vec;
 use core::mem::offset_of;
 
 use armor_cpu::{
-    Cpu, FLAG_AF, FLAG_CF, FLAG_OF, FLAG_PF, FLAG_SF, FLAG_ZF, RAX, RCX, RDX, RSP, STATUS_FLAGS,
-    mmx_layout,
+    Cpu, FLAG_AF, FLAG_CF, FLAG_OF, FLAG_PF, FLAG_SF, FLAG_ZF, R11, RAX, RCX, RDX, RSP,
+    STATUS_FLAGS, mmx_layout,
 };
 use armor_guest::{
     PAGE_READABLE_BIT, PAGE_READABLE_SPAN_BIT, PAGE_WRITABLE_DATA_BIT, PAGE_WRITABLE_DATA_SPAN_BIT,
@@ -64,6 +64,10 @@ pub const EXIT_INTERPRET: u64 = 1;
 /// Continue at `Cpu::rip`, and the exit at `Context::site` may be chained
 /// to the block there.
 pub const EXIT_CHAIN: u64 = 2;
+
+/// Exit status: a `syscall` (64-bit mode) ran, with `rcx` and `r11` set as
+/// it sets them and rip after it: the engine returns `Step::Syscall`.
+pub const EXIT_SYSCALL: u64 = 3;
 
 /// The most guest instructions in one block.
 pub const MAX_BLOCK_INSTRUCTIONS: usize = 64;
@@ -520,7 +524,7 @@ pub fn supported(insn: &Instruction) -> bool {
         Op::Pop(dst) => stack && matches!(dst, Operand::Reg(Reg::Gpr(_))),
         Op::CallIndirect(src) | Op::JmpIndirect(src) => stack && reg_or_mem(&src),
         Op::Call { .. } | Op::Ret { .. } => stack,
-        Op::Jmp { .. } | Op::Jcc { .. } | Op::Nop | Op::Fence => true,
+        Op::Jmp { .. } | Op::Jcc { .. } | Op::Nop | Op::Fence | Op::Syscall => true,
         _ => false,
     }
 }
@@ -785,7 +789,7 @@ fn flags_may_write(insn: &Instruction) -> u64 {
 /// is observed.
 fn flags_read(insn: &Instruction) -> u64 {
     match insn.op {
-        Op::Jcc { .. } => STATUS_FLAGS,
+        Op::Jcc { .. } | Op::Syscall => STATUS_FLAGS,
         Op::Setcc { cond, .. } | Op::Cmov { cond, .. } => condition_flags(cond),
         Op::Alu {
             op: AluOp::Adc | AluOp::Sbb,
@@ -907,6 +911,7 @@ pub fn ends_block(insn: &Instruction) -> bool {
             | Op::CallIndirect(_)
             | Op::JmpIndirect(_)
             | Op::Ret { .. }
+            | Op::Syscall
     )
 }
 
@@ -1673,6 +1678,11 @@ struct Translator {
     /// position right after it, so that `check` uses it only for that
     /// address).
     simple_address: Option<(HostReg, u64, usize)>,
+    /// The address `address_into` just left in `ADDR`, when it is known at
+    /// translation time (RIP-relative or absolute, without an index), and
+    /// the assembler's position right after it: `check` decides its region
+    /// test then.
+    const_address: Option<(u64, usize)>,
     /// Addresses whose region test passed in this block, with the base
     /// register unchanged since (base, constant, the alignment tested):
     /// an access near one needs none (`REGION_GUARD`). Dropped when an
@@ -1731,6 +1741,7 @@ impl Translator {
             nzcv_now: false,
             access_slow: None,
             simple_address: None,
+            const_address: None,
             checked: Vec::new(),
             known_aligned: false,
             faults: Vec::new(),
@@ -1836,6 +1847,22 @@ impl Translator {
         }
         match insn.op {
             Op::Nop => {}
+            // syscall in 64-bit mode, as the interpreter runs it: rcx = the
+            // next rip, r11 = rflags (exact), then to the engine, which
+            // hands it to the kernel's emulation. In compatibility mode, the
+            // interpreter.
+            Op::Syscall => {
+                if self.options.compat {
+                    self.exit(g.rip, EXIT_INTERPRET)?;
+                    return Ok(false);
+                }
+                self.materialize()?;
+                self.a.mov_imm64(B, next);
+                self.store_reg(Reg::Gpr(RCX as u8), Size::B64, B)?;
+                self.store_reg(Reg::Gpr(R11 as u8), Size::B64, FLAGS)?;
+                self.exit(next, EXIT_SYSCALL)?;
+                return Ok(false);
+            }
             // lfence, mfence, sfence: nothing to order with one runner; a
             // full barrier in concurrent mode (ADR-0023).
             Op::Fence => {
@@ -4685,6 +4712,8 @@ impl Translator {
             Width::X
         };
         self.simple_address = None;
+        self.const_address = None;
+        let mut constant = None;
         let simple = match (mem.base, mem.index) {
             (Base::Gpr(n), None) if rd == ADDR && w == Width::X => register_host(n),
             _ => None,
@@ -4726,8 +4755,15 @@ impl Translator {
                         self.a.shift_imm(Shift::Lsl, w, rd, index, shift)?;
                         self.add_constant_w(rd, value, w)?;
                     }
-                    None if w == Width::W => self.a.mov_imm64(rd, value & u64::from(u32::MAX)),
-                    None => self.a.mov_imm64(rd, value),
+                    None => {
+                        let value = if w == Width::W {
+                            value & u64::from(u32::MAX)
+                        } else {
+                            value
+                        };
+                        self.a.mov_imm64(rd, value);
+                        constant = Some(value);
+                    }
                 }
             }
         }
@@ -4755,6 +4791,9 @@ impl Translator {
         }
         if let Some(base) = simple {
             self.simple_address = Some((base, mem.disp as u64, self.a.len()));
+        }
+        if let (Some(value), true) = (constant, rd == ADDR) {
+            self.const_address = Some((value, self.a.len()));
         }
         Ok(())
     }
@@ -5025,6 +5064,17 @@ impl Translator {
                 1
             };
             let here = self.a.len();
+            // An address known now: the test is decided now.
+            if let Some((value, at)) = self.const_address.take()
+                && at == here
+                && value
+                    .checked_add(u64::from(bytes))
+                    .is_some_and(|last| last <= 1u64 << bits)
+                && value.is_multiple_of(u64::from(align))
+            {
+                self.known_aligned = align > 1;
+                return Ok(());
+            }
             let simple = self
                 .simple_address
                 .take()

@@ -28,9 +28,9 @@ use armor_x86::{MAX_INSTRUCTION_LEN, Mode, decode_in};
 use crate::buffer::CodeBuffer;
 use crate::encoder::branch_word;
 use crate::translator::{
-    BlockEnd, CHAINED_ENTRY, Context, EXIT_CHAIN, EXIT_INTERPRET, FLAG_TABLE, GuestInstruction,
-    HostFeatures, MAX_BLOCK_INSTRUCTIONS, Options, TARGET_ENTRIES, ends_block, supported,
-    supported_concurrent, target_slot, translate_block, uses_mxcsr_control,
+    BlockEnd, CHAINED_ENTRY, Context, EXIT_CHAIN, EXIT_INTERPRET, EXIT_SYSCALL, FLAG_TABLE,
+    GuestInstruction, HostFeatures, MAX_BLOCK_INSTRUCTIONS, Options, TARGET_ENTRIES, ends_block,
+    supported, supported_concurrent, target_slot, translate_block, uses_mxcsr_control,
 };
 use crate::translator::{enter_routine, flags_routine, leave_routine};
 
@@ -335,6 +335,9 @@ impl Jit {
                         self.chain(self.context.site, epoch, cpu.rip, mem);
                     }
                     self.context.exit_kind = 0;
+                    if status == EXIT_SYSCALL {
+                        return Ok(Step::Syscall);
+                    }
                     status == EXIT_INTERPRET
                 }
             };

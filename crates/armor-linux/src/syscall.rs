@@ -362,6 +362,10 @@ const MAX_RW_COUNT: u64 = 0x7fff_f000;
 
 /// Guest bytes are copied to the host in chunks of this size.
 const CHUNK: usize = 64 * 1024;
+
+/// Reads and writes up to this size copy through a buffer on the stack,
+/// without an allocation (the `syscall` benchmark's writes are 1 byte).
+const SMALL_BUFFER: usize = 512;
 /// The largest host buffer for one read: a regular file gives a read
 /// everything it asks for, and programs rely on it (an AppImage's runtime
 /// failed on a short pread of 85585 bytes); beyond this, a short read.
@@ -1633,7 +1637,14 @@ fn drm_version(mem: &AddressSpace, fd: u64, arg: u64) -> SysResult {
 /// read(2) into a host buffer, then copied to the guest. At most
 /// `READ_BUFFER` bytes per call.
 fn read(mem: &AddressSpace, fd: u64, buf: u64, count: u64) -> SysResult {
-    let mut bytes = vec![0u8; (count as usize).min(READ_BUFFER)];
+    let len = (count as usize).min(READ_BUFFER);
+    let (mut small, mut large) = ([0u8; SMALL_BUFFER], Vec::new());
+    let bytes: &mut [u8] = if len <= SMALL_BUFFER {
+        &mut small[..len]
+    } else {
+        large.resize(len, 0);
+        &mut large
+    };
     // SAFETY: bytes is writable for its length.
     let n = unsafe { libc::read(fd as i32, bytes.as_mut_ptr().cast(), bytes.len()) };
     if n < 0 {
@@ -2158,7 +2169,14 @@ pub fn set_process_name(program: &[u8]) {
 /// does not move).
 fn pwrite64(mem: &AddressSpace, fd: u64, buf: u64, count: u64, offset: u64) -> SysResult {
     let count = count.min(MAX_RW_COUNT);
-    let mut chunk = vec![0u8; (count as usize).min(CHUNK)];
+    let size = (count as usize).min(CHUNK);
+    let (mut small, mut large) = ([0u8; SMALL_BUFFER], Vec::new());
+    let chunk: &mut [u8] = if size <= SMALL_BUFFER {
+        &mut small[..size]
+    } else {
+        large.resize(size, 0);
+        &mut large
+    };
     let mut written: u64 = 0;
     while written < count {
         let len = ((count - written) as usize).min(CHUNK);
@@ -2200,7 +2218,14 @@ fn pwrite64(mem: &AddressSpace, fd: u64, buf: u64, count: u64, offset: u64) -> S
 fn write(mem: &AddressSpace, fd: u64, buf: u64, count: u64) -> i64 {
     let fd = fd as i32;
     let count = count.min(MAX_RW_COUNT);
-    let mut chunk = vec![0u8; (count as usize).min(CHUNK)];
+    let size = (count as usize).min(CHUNK);
+    let (mut small, mut large) = ([0u8; SMALL_BUFFER], Vec::new());
+    let chunk: &mut [u8] = if size <= SMALL_BUFFER {
+        &mut small[..size]
+    } else {
+        large.resize(size, 0);
+        &mut large
+    };
     let mut written: u64 = 0;
     while written < count {
         let len = ((count - written) as usize).min(CHUNK);

@@ -1393,6 +1393,12 @@ fn region_tests_cover_nearby_accesses() {
     // within the guard's distance of it, [rsp+0x10008] is not.
     assert_eq!(tests(&[&[0x50], &[0x8b, 0x84, 0x24, 0xf8, 0xff, 0, 0]]), 1);
     assert_eq!(tests(&[&[0x50], &[0x8b, 0x84, 0x24, 0x08, 0, 1, 0]]), 2);
+    // A RIP-relative address is known: no test, unless a write to it is
+    // misaligned.
+    // (rip after the instruction is 0x1006: 0x1006 + 0xfa = 0x1100.)
+    assert_eq!(tests(&[&[0x8b, 0x05, 0x01, 0x01, 0, 0]]), 0);
+    assert_eq!(tests(&[&[0x89, 0x05, 0xfa, 0x00, 0, 0]]), 0);
+    assert_eq!(tests(&[&[0x89, 0x05, 0xfb, 0x00, 0, 0]]), 1);
     // A store 4 bytes off the tested alignment of 8: tested again.
     assert_eq!(tests(&[&[0x50], &[0x89, 0x4c, 0x24, 0xfc]]), 1);
     assert_eq!(tests(&[&[0x50], &[0x48, 0x89, 0x4c, 0x24, 0xfc]]), 2);
