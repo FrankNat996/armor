@@ -30,11 +30,11 @@ Every row below comes from a command run with `--report` on the machine named in
 |---|---|
 | 7-Zip 26.04 for Linux x86-64 (7zz) | level 3: archive of tests/guest identical to the native ARM64 7zz's (SHA-256 b7f32abea7665d92…) — armor (JIT) (2026-10-15) |
 | 7-Zip 26.04 for Windows x64 (7z2604-x64.exe) | level 3: archive of tests/guest identical to the ARM64 build's (SHA-256 c3f315b107e7311f…) — Hangover 11.16 (FEX ARM64EC) (2026-10-15) |
-| 7-Zip 26.04 for Windows x86 (7z2604.exe) | level 3: archive of tests/guest identical to the ARM64 build's (SHA-256 c3f315b107e7311f…) — Hangover 11.16 (FEX WoW64) (2026-10-15) |
+| 7-Zip 26.04 for Windows x86 (7z2604.exe) | level 3: archive of tests/guest identical to the ARM64 build's (SHA-256 c3f315b107e7311f…) — Hangover 11.16 (FEX WoW64) (2026-10-15)<br>level 3: archive of tests/guest identical to the ARM64 build's (SHA-256 187a126a68809f89…) — Hangover 11.16 (armor WoW64) (2026-10-20) |
 | Friday Night Funkin' 0.8.6 for Windows x64 (itch.io zip) | level 1: its window (Friday Night Funkin) appeared 4 s after armor run — Hangover 11.16 (FEX ARM64EC) (2026-10-15) |
-| KeePass 2.61.1 for Windows (.NET) | level 1: its window (KeePass) appeared 20 s after armor run — Hangover 11.16 with Wine Mono (2026-10-15) |
+| KeePass 2.61.1 for Windows (.NET) | level 1: its window (KeePass) appeared 20 s after armor run — Hangover 11.16 with Wine Mono (2026-10-15)<br>level 1: its window (KeePass) appeared 20 s after armor run — Hangover 11.16 with Wine Mono, 32-bit code under armor WoW64 (2026-10-20) |
 | KeePassXC 2.7.12 (AppImage, x86-64) | level 1: its window (KeePassXC) appeared 5 s after armor run — armor (JIT), Debian's x86-64 libraries (2026-10-15) |
-| Notepad++ 8.9.8.1 for Windows x64 | level 1: its window (Notepad++) appeared 2 s after armor run — Hangover 11.16 (FEX ARM64EC) (2026-10-15) |
+| Notepad++ 8.9.8.1 for Windows x64 | level 1: its window (Notepad++) appeared 2 s after armor run — Hangover 11.16 (FEX ARM64EC) (2026-10-15)<br>level 1: its window (Notepad++) appeared 2 s after armor run — Hangover 11.16 (FEX ARM64EC), 32-bit code under armor WoW64 (2026-10-20) |
 | Spotify 1.3.4.258 (.deb, x86-64, Chromium) | level 1: its window (Spotify) appeared 20 s after armor run — armor (JIT), Debian's x86-64 libraries (2026-10-15) |
 | XnView MP 1.12.2 (.deb, x86-64) | level 1: its window (XnView) appeared 1 s after armor run — armor (JIT), Debian's x86-64 libraries (2026-10-15) |
 
@@ -46,17 +46,20 @@ Kernel `6.18.50+rpt-rpi-v8`.
 | application | 7-Zip 26.04 for Linux x86-64 (7zz) | armor (JIT) | 7-Zip 26.04 for Linux ARM64, run natively | level 3: archive of tests/guest identical to the native ARM64 7zz's (SHA-256 b7f32abea7665d92…) | 2026-10-15 | 97f001d | `cargo xtask app-check 7zip-linux` |
 | application | 7-Zip 26.04 for Windows x64 (7z2604-x64.exe) | Hangover 11.16 (FEX ARM64EC) | 7-Zip 26.04 for Windows ARM64, run the same way | level 3: archive of tests/guest identical to the ARM64 build's (SHA-256 c3f315b107e7311f…) | 2026-10-15 | 97f001d | `cargo xtask app-check 7zip-x64` |
 | application | 7-Zip 26.04 for Windows x86 (7z2604.exe) | Hangover 11.16 (FEX WoW64) | 7-Zip 26.04 for Windows ARM64, run the same way | level 3: archive of tests/guest identical to the ARM64 build's (SHA-256 c3f315b107e7311f…) | 2026-10-15 | 97f001d | `cargo xtask app-check 7zip-x86` |
+| application | 7-Zip 26.04 for Windows x86 (7z2604.exe) | Hangover 11.16 (armor WoW64) | 7-Zip 26.04 for Windows ARM64, run the same way | level 3: archive of tests/guest identical to the ARM64 build's (SHA-256 187a126a68809f89…) | 2026-10-20 | b4922bb | `cargo xtask app-check --x86-engine armor 7zip-x86` |
 | application | Friday Night Funkin' 0.8.6 for Windows x64 (itch.io zip) | Hangover 11.16 (FEX ARM64EC) | a window on an X display (Xvfb) | level 1: its window (Friday Night Funkin) appeared 4 s after armor run | 2026-10-15 | 97f001d | `cargo xtask app-check funkin` |
 | application | KeePass 2.61.1 for Windows (.NET) | Hangover 11.16 with Wine Mono | a window on an X display (Xvfb) | level 1: its window (KeePass) appeared 20 s after armor run | 2026-10-15 | 97f001d | `cargo xtask app-check keepass2` |
+| application | KeePass 2.61.1 for Windows (.NET) | Hangover 11.16 with Wine Mono, 32-bit code under armor WoW64 | a window on an X display (Xvfb) | level 1: its window (KeePass) appeared 20 s after armor run | 2026-10-20 | b4922bb | `cargo xtask app-check --x86-engine armor keepass2` |
 | application | KeePassXC 2.7.12 (AppImage, x86-64) | armor (JIT), Debian's x86-64 libraries | a window on an X display (Xvfb) | level 1: its window (KeePassXC) appeared 5 s after armor run | 2026-10-15 | 97f001d | `cargo xtask app-check keepassxc` |
 | application | Notepad++ 8.9.8.1 for Windows x64 | Hangover 11.16 (FEX ARM64EC) | a window on an X display (Xvfb) | level 1: its window (Notepad++) appeared 2 s after armor run | 2026-10-15 | 97f001d | `cargo xtask app-check notepad-plus-plus` |
+| application | Notepad++ 8.9.8.1 for Windows x64 | Hangover 11.16 (FEX ARM64EC), 32-bit code under armor WoW64 | a window on an X display (Xvfb) | level 1: its window (Notepad++) appeared 2 s after armor run | 2026-10-20 | b4922bb | `cargo xtask app-check --x86-engine armor notepad-plus-plus` |
 | application | Spotify 1.3.4.258 (.deb, x86-64, Chromium) | armor (JIT), Debian's x86-64 libraries | a window on an X display (Xvfb) | level 1: its window (Spotify) appeared 20 s after armor run | 2026-10-15 | 97f001d | `cargo xtask app-check spotify` |
 | application | XnView MP 1.12.2 (.deb, x86-64) | armor (JIT), Debian's x86-64 libraries | a window on an X display (Xvfb) | level 1: its window (XnView) appeared 1 s after armor run | 2026-10-15 | 97f001d | `cargo xtask app-check xnviewmp` |
-| suite | difftest | armor interpreter, jit | qemu-x86_64 10.0.13 | 470/470 | 2026-10-15 | 97f001d | `cargo xtask difftest` |
+| suite | difftest | armor interpreter, jit | qemu-x86_64 10.0.13 | 476/476 | 2026-10-20 | b4922bb | `cargo xtask difftest` |
 | suite | difftest | armor interpreter, jit | the same source built for AArch64, run natively | 3/3 | 2026-10-15 | 97f001d | `cargo xtask difftest --native` |
 | suite | difftest | armor interpreter, jit | x86-64 hardware: Intel(R) Xeon(R) CPU X5675 @ 3.07GHz, Linux 7.0.2-6-pve | 281/281 | 2026-10-15 | 97f001d | `cargo xtask difftest --oracle` |
-| suite | difftest | armor interpreter, jit, ARMv8.0 paths | qemu-x86_64 10.0.13 | 470/470 | 2026-10-15 | 97f001d | `ARMOR_HOST_FEATURES=baseline cargo xtask difftest` |
-| suite | difftest | armor lockstep | qemu-x86_64 10.0.13 | 470/470 | 2026-10-15 | 97f001d | `cargo xtask difftest --lockstep` |
+| suite | difftest | armor interpreter, jit, ARMv8.0 paths | qemu-x86_64 10.0.13 | 476/476 | 2026-10-20 | b4922bb | `ARMOR_HOST_FEATURES=baseline cargo xtask difftest` |
+| suite | difftest | armor lockstep | qemu-x86_64 10.0.13 | 476/476 | 2026-10-20 | b4922bb | `cargo xtask difftest --lockstep` |
 | suite | difftest | box64 | qemu-x86_64 10.0.13 | 254/470 | 2026-10-20 | f7e4a55 | `cargo xtask difftest --engine box64` |
 | suite | difftest | fex | qemu-x86_64 10.0.13 | 412/470 | 2026-10-20 | f7e4a55 | `cargo xtask difftest --engine fex` |
 
