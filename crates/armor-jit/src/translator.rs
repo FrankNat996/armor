@@ -31,13 +31,15 @@
 //! the engine when the budget runs out, so that chained code still lets
 //! signals and other threads in (ADR-0021 §6).
 
-use std::mem::offset_of;
+use alloc::vec;
+use alloc::vec::Vec;
+use core::mem::offset_of;
 
 use armor_cpu::{
     Cpu, FLAG_AF, FLAG_CF, FLAG_OF, FLAG_PF, FLAG_SF, FLAG_ZF, RAX, RCX, RDX, RSP, STATUS_FLAGS,
     mmx_layout,
 };
-use armor_mem::{
+use armor_guest::{
     PAGE_READABLE_BIT, PAGE_READABLE_SPAN_BIT, PAGE_WRITABLE_DATA_BIT, PAGE_WRITABLE_DATA_SPAN_BIT,
 };
 use armor_x86::{
@@ -122,6 +124,10 @@ pub struct Options {
     /// where the guest may not read, and the fault goes to the slow path
     /// (`Translation::faults`). `None`: every access checks the table.
     pub host_reads: Option<u32>,
+    /// `armor-mem`'s permission table is at hand (`x1`); without it (the
+    /// Windows backend, ADR-0047) a misaligned write that crosses a page
+    /// goes to the interpreter.
+    pub page_table: bool,
 }
 
 /// A translated block: its words, and its guest loads that may fault on
@@ -155,6 +161,25 @@ impl HostFeatures {
     /// The host's, from the kernel's `AT_HWCAP` (`HWCAP_ATOMICS`,
     /// `HWCAP_LRCPC`); `ARMOR_HOST_FEATURES=baseline` pretends there are
     /// none, to run the ARMv8.0 paths on any machine (`testing.md`).
+    /// From the ID registers (`ID_AA64ISAR0_EL1` for LSE,
+    /// `ID_AA64ISAR1_EL1` for LRCPC), which Linux lets user space read
+    /// (it emulates the access): for code that has no auxiliary vector at
+    /// hand, as the Windows backend (ADR-0047) in a Wine process.
+    pub fn from_id_registers() -> HostFeatures {
+        let (isar0, isar1): (u64, u64);
+        // SAFETY: reads two ID registers, which the kernel emulates for
+        // user space (HWCAP_CPUID).
+        unsafe {
+            core::arch::asm!("mrs {}, id_aa64isar0_el1", out(reg) isar0, options(nomem, nostack));
+            core::arch::asm!("mrs {}, id_aa64isar1_el1", out(reg) isar1, options(nomem, nostack));
+        }
+        HostFeatures {
+            lse: (isar0 >> 20) & 0xf >= 2,
+            rcpc: (isar1 >> 20) & 0xf >= 1,
+        }
+    }
+
+    #[cfg(feature = "std")]
     pub fn detect() -> HostFeatures {
         const HWCAP_ATOMICS: u64 = 1 << 8;
         const HWCAP_LRCPC: u64 = 1 << 15;
@@ -960,11 +985,11 @@ pub fn translate_block(
         a: Assembler::new(),
         epilogue: None,
         status_entries: Vec::new(),
-        slow_paths: Vec::new(),
-        side_exits: Vec::new(),
+        slow_paths: Vec::with_capacity(block.len()),
+        side_exits: Vec::with_capacity(16),
         last: false,
-        chain_stubs: Vec::new(),
-        page_edges: Vec::new(),
+        chain_stubs: Vec::with_capacity(16),
+        page_edges: Vec::with_capacity(block.len()),
         unaligned: Vec::new(),
         underflows: Vec::new(),
         denormals: Vec::new(),
@@ -972,8 +997,8 @@ pub fn translate_block(
         nzcv_valid: false,
         nzcv_now: false,
         access_slow: None,
-        faults: Vec::new(),
-        write_edges: Vec::new(),
+        faults: Vec::with_capacity(block.len()),
+        write_edges: Vec::with_capacity(16),
         packed_underflows: Vec::new(),
         live: STATUS_FLAGS,
         skip_flags: false,
@@ -1056,7 +1081,7 @@ pub fn translate_block(
     }
     // Out-of-line code: each piece starts with the lazy-flags state of
     // the point it is reached from.
-    for (label, rip, lazy) in std::mem::take(&mut t.side_exits) {
+    for (label, rip, lazy) in core::mem::take(&mut t.side_exits) {
         t.a.bind(label);
         t.lazy = lazy;
         t.exit_direct(rip)?;
@@ -1066,7 +1091,7 @@ pub fn translate_block(
     t.exit(start, EXIT_CONTINUE)?;
     t.lazy = Lazy::Current;
     // Chainable exits: the `b` at `site` comes here until it is patched.
-    for (site, stub, rip) in std::mem::take(&mut t.chain_stubs) {
+    for (site, stub, rip) in core::mem::take(&mut t.chain_stubs) {
         t.a.bind(stub);
         t.a.mov_imm64(EXIT_RIP, rip);
         t.a.adr(T1, site);
@@ -1076,28 +1101,32 @@ pub fn translate_block(
     }
     // Unaligned writes the host checks: outside the region, the slow path;
     // within one page, the host; across two, both pages from the table.
-    for (edge, back, bytes, outside, slow) in std::mem::take(&mut t.write_edges) {
+    for (edge, back, bytes, outside, slow) in core::mem::take(&mut t.write_edges) {
         t.a.bind(edge);
         t.a.logic_imm(Logic::Ands, Width::X, ZR, ADDR, outside)?;
         t.a.b_cond(Cond::Ne, slow);
         t.a.logic_imm(Logic::And, Width::X, T1, ADDR, 0xfff)?;
         t.a.subs_imm(Width::X, ZR, T1, 4096 - bytes)?;
         t.a.b_cond(Cond::Ls, back);
+        if !t.options.page_table {
+            t.a.b(slow);
+            continue;
+        }
         t.a.shift_imm(Shift::Lsr, Width::X, T1, ADDR, 12)?;
         t.a.load_store_reg(true, MemSize::B8, T1, PAGES, T1, false);
         t.a.tbz(false, T1, PAGE_WRITABLE_DATA_SPAN_BIT, slow);
         t.a.b(back);
     }
     // Checks near the end of a page.
-    for (edge, back, alone, bytes, slow) in std::mem::take(&mut t.page_edges) {
+    for (edge, back, alone, bytes, slow) in core::mem::take(&mut t.page_edges) {
         t.page_edge(edge, back, alone, bytes, slow)?;
     }
     // Ordered accesses to unaligned addresses (concurrent mode).
-    for (entry, back, access) in std::mem::take(&mut t.unaligned) {
+    for (entry, back, access) in core::mem::take(&mut t.unaligned) {
         t.unaligned_access(entry, back, access)?;
     }
     // Operands with a zero exponent: denormal or zero.
-    for (entry, back, slow, w) in std::mem::take(&mut t.denormals) {
+    for (entry, back, slow, w) in core::mem::take(&mut t.denormals) {
         t.a.bind(entry);
         t.a.shift_imm(Shift::Lsl, w, T1, T1, 1)?;
         t.a.cbz(true, w, T1, slow);
@@ -1105,7 +1134,7 @@ pub fn translate_block(
     }
     // Shifts by a cl of 0: the flags before them into `FLAGS`. The count
     // (`T3`) is 0 again for the deferred flags.
-    for (entry, back, lazy) in std::mem::take(&mut t.zero_counts) {
+    for (entry, back, lazy) in core::mem::take(&mut t.zero_counts) {
         t.a.bind(entry);
         t.lazy = lazy;
         t.materialize()?;
@@ -1113,7 +1142,7 @@ pub fn translate_block(
         t.a.b(back);
     }
     // UFC after packed floating point: cleared, then the slow path.
-    for (entry, slow) in std::mem::take(&mut t.packed_underflows) {
+    for (entry, slow) in core::mem::take(&mut t.packed_underflows) {
         t.a.bind(entry);
         t.a.read_fpsr(T1);
         t.a.logic_imm(Logic::And, Width::X, T1, T1, !(1u64 << 3))?;
@@ -1121,18 +1150,18 @@ pub fn translate_block(
         t.a.b(slow);
     }
     // UFC raised by the host, made x86's UE.
-    for (entry, back) in std::mem::take(&mut t.underflows) {
+    for (entry, back) in core::mem::take(&mut t.underflows) {
         t.underflow_fixup(entry, back)?;
     }
     // Slow paths: the instruction at `rip` goes to the interpreter, which
     // finds the state exactly as before it.
-    for (label, rip, lazy) in std::mem::take(&mut t.slow_paths) {
+    for (label, rip, lazy) in core::mem::take(&mut t.slow_paths) {
         t.a.bind(label);
         t.lazy = lazy;
         t.exit(rip, EXIT_INTERPRET)?;
     }
     // The exit statuses, then the epilogue.
-    for (status, entry) in std::mem::take(&mut t.status_entries) {
+    for (status, entry) in core::mem::take(&mut t.status_entries) {
         t.a.bind(entry);
         t.set_status(status)?;
         t.a.b(epilogue);
@@ -1178,7 +1207,7 @@ pub fn translate_block(
         field(offset_of!(Context, status)),
     )?;
     t.a.ret();
-    let faults = std::mem::take(&mut t.faults)
+    let faults = core::mem::take(&mut t.faults)
         .into_iter()
         .map(|(at, slow)| {
             let target = t.a.position(slow).expect("slow paths are bound");
@@ -1225,6 +1254,7 @@ pub fn flags_routine() -> Result<Vec<u32>, EncodeError> {
             concurrent: false,
             compat: false,
             host_reads: None,
+            page_table: true,
         },
         lazy: Lazy::Current,
     };
@@ -1559,7 +1589,7 @@ impl Translator {
         self.access_slow = None;
         // The NZCV of the pending flags survives only into a condition
         // reader that emits nothing before reading it.
-        let valid = std::mem::take(&mut self.nzcv_valid);
+        let valid = core::mem::take(&mut self.nzcv_valid);
         self.nzcv_now = valid
             && match insn.op {
                 Op::Jcc { .. } => true,
@@ -2242,7 +2272,7 @@ impl Translator {
     /// `flags_written` claims (debug builds), and an instruction that set
     /// them all eagerly leaves `FLAGS` current.
     fn flags_done(&mut self, insn: &Instruction, written: u64) {
-        if std::mem::take(&mut self.skip_flags) {
+        if core::mem::take(&mut self.skip_flags) {
             return;
         }
         debug_assert_eq!(
@@ -3891,6 +3921,13 @@ impl Translator {
             (12, 13),
             (14, 15),
         ] {
+            // Compatibility mode has no r8–r15: their host registers stay
+            // untouched (x18 is the TEB under Windows, ADR-0047), and the
+            // prologue keeps its length.
+            if self.options.compat && first >= 8 {
+                self.a.nop();
+                continue;
+            }
             let (a, b) = (GUEST[first], GUEST[second]);
             let (a, b) = (a.expect("mapped"), b.expect("mapped"));
             self.a.pair(
@@ -4944,7 +4981,7 @@ impl Translator {
     /// `FB`, redoing the operation for the host NZCV). Uses `R`, `T1`–`T3`.
     fn materialize(&mut self) -> Emit {
         self.spill()?;
-        let p = match std::mem::replace(&mut self.lazy, Lazy::Current) {
+        let p = match core::mem::replace(&mut self.lazy, Lazy::Current) {
             Lazy::Current => return Ok(()),
             Lazy::Static(p) => p,
             Lazy::Dynamic => {
@@ -5108,7 +5145,7 @@ impl Translator {
     fn redo_nzcv(&mut self, p: Pending) -> Emit {
         // The previous instruction (a jcc, setcc or cmov) left the host
         // NZCV of the same pending operation, and nothing since changed it.
-        if std::mem::take(&mut self.nzcv_now) {
+        if core::mem::take(&mut self.nzcv_now) {
             self.nzcv_valid = true;
             return Ok(());
         }

@@ -12,17 +12,31 @@
 //! - `check`: the encoder's samples for `cargo xtask encoder-check`.
 //!
 //! All of armor's code-generation `unsafe` lives in `buffer` and `engine`.
+//!
+//! Without the `std` feature only `encoder` and `translator` are built,
+//! with `core` and `alloc`: the Windows backend (ADR-0047) has its own
+//! engine around them.
 
+#![cfg_attr(not(feature = "std"), no_std)]
+
+extern crate alloc;
+
+#[cfg(feature = "std")]
 pub mod buffer;
+#[cfg(feature = "std")]
 #[doc(hidden)]
 pub mod check;
 pub mod encoder;
+#[cfg(feature = "std")]
 pub mod engine;
+#[cfg(feature = "std")]
 mod lockstep;
+#[cfg(feature = "std")]
 pub mod stats;
 pub mod translator;
 
 #[cfg(test)]
 mod tests;
 
+#[cfg(feature = "std")]
 pub use engine::Jit;

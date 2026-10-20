@@ -7,8 +7,9 @@
 //!
 //! With 32-bit addresses (compatibility mode) the registers are esi, edi
 //! and ecx: they wrap at 4 GiB.
+use alloc::vec;
 
-use armor_mem::GuestMemory;
+use armor_guest::GuestMemory;
 use armor_x86::{AluOp, Reg, Rep, Size, StringOp};
 
 use crate::{Cpu, Exec, FLAG_DF, FLAG_ZF, RAX, RCX, RDI, RSI, alu};

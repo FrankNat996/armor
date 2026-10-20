@@ -1,0 +1,26 @@
+[package]
+name = "armor-wow64"
+description = "armor's engine as Wine's WoW64 CPU backend for 32-bit x86 Windows programs (ADR-0047)"
+version = "0.6.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+publish = false
+
+# A Windows DLL (aarch64-pc-windows-msvc, linked with LLVM's lld-link):
+# outside the engine's workspace, like the window (`gui/`).
+[workspace]
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+armor-cpu = { path = "../crates/armor-cpu" }
+armor-guest = { path = "../crates/armor-guest" }
+armor-jit = { path = "../crates/armor-jit", default-features = false }
+armor-x86 = { path = "../crates/armor-x86" }
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"

@@ -1305,6 +1305,7 @@ fn concurrent_mode_emits_ordered_accesses() {
                 concurrent,
                 compat: false,
                 host_reads: None,
+                page_table: true,
             },
         )
         .unwrap()
@@ -1342,6 +1343,7 @@ fn concurrent_mode_emits_lse_atomics() {
             concurrent,
             compat: false,
             host_reads: None,
+            page_table: true,
         };
         translate(&block, end, options).unwrap()
     };
@@ -1399,6 +1401,7 @@ fn dead_flags_are_not_computed() {
         concurrent: false,
         compat: false,
         host_reads: None,
+        page_table: true,
     };
     let words = translate(&block, BlockEnd::Continue(0x1000 + at as u64), options).unwrap();
     let is_mrs_nzcv = |w: &u32| w & 0xFFFF_FFE0 == 0xD53B_4200;
@@ -2009,6 +2012,7 @@ fn dump_translation() {
             host_reads: std::env::var("ARMOR_DUMP_HOST_READS")
                 .ok()
                 .map(|b| b.parse().unwrap()),
+            page_table: true,
         },
     )
     .unwrap();

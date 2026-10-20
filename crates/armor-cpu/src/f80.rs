@@ -17,7 +17,7 @@
 //!   underflow flag (with the exception masked) needs a tiny and inexact
 //!   result, tininess being detected before rounding.
 
-use std::cmp::Ordering;
+use core::cmp::Ordering;
 
 mod transcendental;
 pub use transcendental::{Trig, atan2, cos, exp2m1, sin, tan, ylog2x, ylog2xp1};

@@ -123,7 +123,8 @@ fn memory_form(opcode: u8, digit: u8, m: crate::Mem) -> Result<X87Op, DecodeErro
         (0xdf, 3) => store(I16, true),
         (0xdf, 5) => X87Op::Load(mem(I64)),
         (0xdf, 7) => store(I64, true),
-        (0xdf, 4 | 6) => return unsupported("x87 BCD (fbld, fbstp)"),
+        (0xdf, 4) => X87Op::Load(mem(Bcd)),
+        (0xdf, 6) => store(Bcd, true),
         _ => return Err(DecodeError::Invalid),
     })
 }

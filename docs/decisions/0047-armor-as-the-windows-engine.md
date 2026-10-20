@@ -32,3 +32,8 @@ armor's engine becomes a Wine CPU backend, in two stages, each opt-in until it p
 - − A new target and toolchain in the chain (`aarch64-pc-windows-gnullvm`, later ARM64EC), and Windows test programs built with mingw.
 - − Inside Wine, armor no longer owns memory and faults: what `armor-mem` and `armor-linux` do for Linux programs, Wine does there; exactness depends on Wine's emulation of Windows, as for FEX and box64.
 - − Months of work; the ARM64EC stage depends on a toolchain measurement not yet done.
+
+## Implementation notes
+- **Stage 1 (2026-10-20):** `armor-wow64.dll` (`wow64/`, `cargo xtask wow64`; `tech/jit.md`, "Inside Wine"). Two details differ from the plan above. The DLL is built for `aarch64-pc-windows-msvc` with LLVM's `lld-link` and import libraries from `llvm-dlltool`, without MSVC or a Windows SDK and without llvm-mingw: the same linker and kind of target the ARM64EC stage needs (`arm64ec-pc-windows-msvc`). The backend is chosen with Hangover's `HODLL` variable rather than the registry key: Hangover's `wow64.dll` reads `HODLL` (`tech/engines.md`, "How the emulator is chosen"), and `armor run` already sets it; the DLL is copied into the prefix's `system32`, where Wine finds it. The setting is `x86-engine = armor|fex` in the application's `app.conf` (or `ARMOR_WINDOWS_X86_ENGINE` for every application), and `cargo xtask app-check --x86-engine armor` checks the applications with it.
+- **Default:** FEX stays the default while armor's backend is slower than FEX on the same program (7-Zip x86 on 12 MB: 16.5 s against 8.7 s, `tech/engines.md`), as the goal of M11 is the faster engine; armor's backend becomes the default once it passes `app-check` and is not slower.
+

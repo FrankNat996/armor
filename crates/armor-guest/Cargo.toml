@@ -1,0 +1,11 @@
+[package]
+name = "armor-guest"
+description = "Guest memory interface of armor's interpreter (no_std)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true

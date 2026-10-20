@@ -10,6 +10,11 @@
 //! docs/tech/x86-64-flags.md.
 
 #![forbid(unsafe_code)]
+// No standard library: the Windows backend (ADR-0047) uses it too.
+#![cfg_attr(not(test), no_std)]
+use alloc::vec::Vec;
+
+extern crate alloc;
 
 mod alu;
 pub mod cpuid;
@@ -21,9 +26,9 @@ mod sse;
 mod string;
 mod x87;
 
-use std::fmt;
+use core::fmt;
 
-use armor_mem::{Access, GuestMemory, MemFault};
+use armor_guest::{Access, GuestMemory, MemFault};
 use armor_x86::{
     AluOp, Base, BitTestOp, Cond, DecodeError, FlagOp, Instruction, LoopKind, MAX_INSTRUCTION_LEN,
     Mem, Mode, Op, Operand, Reg, Segment, ShiftCount, Size, UnaryOp, decode_in,
@@ -119,7 +124,7 @@ impl Cpu {
 /// scratch registers hold an MMX instruction's operands for its SSE
 /// equivalent.
 pub mod mmx_layout {
-    use std::mem::{offset_of, size_of};
+    use core::mem::{offset_of, size_of};
 
     use crate::f80::F80;
     use crate::{Cpu, x87};
@@ -248,7 +253,7 @@ impl fmt::Display for CpuError {
     }
 }
 
-impl std::error::Error for CpuError {}
+impl core::error::Error for CpuError {}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Step {
@@ -850,7 +855,7 @@ impl Cpu {
                 self.regs[RDX] = u64::from(d);
             }
             Op::Rdtsc => {
-                let tsc = time_stamp_counter();
+                let tsc = mem.time_stamp_counter();
                 self.regs[RAX] = tsc & 0xffff_ffff;
                 self.regs[RDX] = tsc >> 32;
             }
@@ -895,7 +900,7 @@ impl Cpu {
             Op::Nop => {}
             // A full barrier, whatever the kind: lfence and sfence order
             // less on x86, and fences are rare (ADR-0023).
-            Op::Fence => std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst),
+            Op::Fence => core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst),
             Op::Privileged => return Err(Trap::Exception(Exception::GeneralProtection)),
             Op::Int3 => return Err(Trap::Exception(Exception::Breakpoint(insn.len as u8))),
             Op::Int1 => return Err(Trap::Exception(Exception::Debug)),
@@ -1301,12 +1306,3 @@ fn half_size(size: Size) -> Size {
 
 #[cfg(test)]
 mod tests;
-
-/// The value rdtsc reads: nanoseconds since the first read, so it only
-/// grows. Real counters tick at a CPU-specific rate that CPUID does not
-/// report here (no leaf 0x15), so programs cannot rely on the unit.
-fn time_stamp_counter() -> u64 {
-    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
-    let start = START.get_or_init(std::time::Instant::now);
-    u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX)
-}

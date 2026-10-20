@@ -98,6 +98,10 @@ struct Recorder<'m, 'a> {
 }
 
 impl GuestMemory for Recorder<'_, '_> {
+    fn time_stamp_counter(&self) -> u64 {
+        self.mem.time_stamp_counter()
+    }
+
     fn read(&self, addr: u64, buf: &mut [u8]) -> Result<(), MemFault> {
         if self.mem.in_shared(addr, buf.len()) {
             self.shared.set(true);

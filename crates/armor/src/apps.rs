@@ -57,6 +57,10 @@ pub struct AppConf {
     /// A Linux program's OpenGL through the host's libGL (`--host-gl`,
     /// ADR-0041).
     pub host_gl: bool,
+    /// The engine of 32-bit x86 code in a Windows program (Hangover's
+    /// WoW64 CPU backend, `HODLL`): empty or `fex` (FEX), or `armor`
+    /// (armor's own, `armor-wow64.dll`, ADR-0047).
+    pub x86_engine: String,
     pub env: Vec<(String, String)>,
 }
 
@@ -77,6 +81,9 @@ pub fn render_app_conf(conf: &AppConf, reasons: &[(String, String)]) -> String {
     }
     if conf.host_gl {
         text.push_str("host-gl = yes\n");
+    }
+    if conf.x86_engine == "armor" {
+        text.push_str("x86-engine = armor\n");
     }
     for (name, value) in &conf.env {
         if let Some((_, why)) = reasons.iter().find(|(n, _)| n == name) {
@@ -109,6 +116,9 @@ pub fn parse_app_conf(text: &str) -> Result<AppConf, String> {
             "vcredist" if value == "yes" || value == "no" => conf.vcredist = value == "yes",
             "engine" if value == "hangover" || value == "proton" => conf.engine = value.to_string(),
             "host-gl" if value == "yes" || value == "no" => conf.host_gl = value == "yes",
+            "x86-engine" if value == "armor" || value == "fex" => {
+                conf.x86_engine = value.to_string()
+            }
             "env" => {
                 let (name, val) = value
                     .split_once('=')
@@ -573,8 +583,20 @@ fn wine_command(program: &Path, app: &Path, conf: &AppConf) -> Command {
     } else {
         disabled.to_string()
     };
+    let hodll = match x86_engine(conf) {
+        "armor" => match install_wow64_dll(&app.join("prefix")) {
+            Ok(true) => "armor-wow64.dll",
+            // The prefix is being made: Wine's own setup runs under FEX.
+            Ok(false) => "libwow64fex.dll",
+            Err(why) => {
+                eprintln!("armor: armor's engine for 32-bit code is not available ({why}): FEX");
+                "libwow64fex.dll"
+            }
+        },
+        _ => "libwow64fex.dll",
+    };
     let mut defaults = vec![
-        ("HODLL".to_string(), "libwow64fex.dll".to_string()),
+        ("HODLL".to_string(), hodll.to_string()),
         ("WINEDLLOVERRIDES".to_string(), overrides),
         // Only the loader's errors: the missing DLLs `armor run` explains.
         ("WINEDEBUG".to_string(), "-all,err+module".to_string()),
@@ -592,6 +614,56 @@ fn wine_command(program: &Path, app: &Path, conf: &AppConf) -> Command {
         }
     }
     command
+}
+
+/// The engine of a Windows program's 32-bit code: `ARMOR_WINDOWS_X86_ENGINE`
+/// (for every application, as `cargo xtask app-check` uses it), else the
+/// application's `x86-engine`, else FEX.
+fn x86_engine(conf: &AppConf) -> &str {
+    match std::env::var("ARMOR_WINDOWS_X86_ENGINE").as_deref() {
+        Ok("armor") => "armor",
+        Ok("fex") => "fex",
+        _ if conf.x86_engine == "armor" => "armor",
+        _ => "fex",
+    }
+}
+
+/// armor's WoW64 CPU backend (ADR-0047): `ARMOR_WOW64_DLL`, else
+/// `../lib/armor/aarch64-windows/armor-wow64.dll` from armor's directory
+/// (the package), else `../wow64/armor-wow64.dll` (`cargo xtask wow64` in
+/// `target/`).
+pub fn wow64_dll() -> Option<PathBuf> {
+    if let Some(path) = std::env::var_os("ARMOR_WOW64_DLL").filter(|v| !v.is_empty()) {
+        return Some(PathBuf::from(path));
+    }
+    let exe = std::env::current_exe().ok()?;
+    let dir = exe.parent()?;
+    [
+        dir.join("../lib/armor/aarch64-windows/armor-wow64.dll"),
+        dir.join("../wow64/armor-wow64.dll"),
+    ]
+    .into_iter()
+    .find(|p| p.is_file())
+}
+
+/// Puts armor's WoW64 backend into the prefix's `system32`, where Wine's
+/// wow64 loads `HODLL` from (replaced when it differs); false when the
+/// prefix has no `system32` yet.
+fn install_wow64_dll(prefix: &Path) -> Result<bool, String> {
+    let system32 = prefix.join("drive_c/windows/system32");
+    if !system32.is_dir() {
+        return Ok(false);
+    }
+    let dll = wow64_dll().ok_or("armor-wow64.dll not found")?;
+    let bytes = fs::read(&dll).map_err(|e| format!("{}: {e}", dll.display()))?;
+    let target = system32.join("armor-wow64.dll");
+    if fs::read(&target).ok().as_deref() != Some(&bytes[..]) {
+        let partial = target.with_extension("dll.new");
+        fs::write(&partial, &bytes)
+            .and_then(|_| fs::rename(&partial, &target))
+            .map_err(|e| format!("{}: {e}", target.display()))?;
+    }
+    Ok(true)
 }
 
 /// Kernel GPU drivers whose Vulkan driver DXVK refuses, so that Direct3D
@@ -3431,6 +3503,11 @@ mod tests {
                 .host_gl
         );
         assert!(parse_app_conf("host-gl = on\n").is_err());
+        assert_eq!(
+            parse_app_conf("x86-engine = armor\n").unwrap().x86_engine,
+            "armor"
+        );
+        assert!(parse_app_conf("x86-engine = box64\n").is_err());
         assert!(parse_app_conf("kind = macos\n").is_err());
         assert!(parse_app_conf("dxvk = maybe\n").is_err());
         assert!(parse_app_conf("env = =x\n").is_err());
@@ -3572,6 +3649,7 @@ mod tests {
             vcredist: true,
             engine: "proton".to_string(),
             host_gl: true,
+            x86_engine: "armor".to_string(),
             env: vec![(
                 "DXVK_FILTER_DEVICE_NAME".to_string(),
                 "llvmpipe".to_string(),

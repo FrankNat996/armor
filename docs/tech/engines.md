@@ -214,6 +214,22 @@ Measured in the 16K virtual machine of `testing.md` ("Other page sizes": Debian 
 - ✅ **On 64K pages too** (the 64K virtual machine: Ubuntu 24.04, `6.8.0-147-generic-64k`, Hangover's build for noble): the same warning, then 7-Zip x64 and ARM64 install, and their archives of the same files are byte-for-byte identical (SHA-256 `29bea77b…`). Creating the first prefix took several minutes there.
 - So Windows programs are not limited to 4K pages; Valve's ARM64 Steam client still is (below, "Valve's native ARM64 Steam client").
 
+### armor's own WoW64 backend (ADR-0047, since 2026-10-20)
+`armor-wow64.dll` puts armor's engine in FEX's place for 32-bit x86 code (`tech/jit.md`, "Inside Wine"): `x86-engine = armor` in an application's `app.conf`, or `ARMOR_WINDOWS_X86_ENGINE=armor`; FEX stays the default. ✅ `cargo xtask app-check --x86-engine armor` on 2026-10-20 (Pi 5, 4K pages, Hangover 11.16; the backend's line at start counted in each log):
+- **7-Zip 26.04 x86** (`7z2604.exe`): installed by its 32-bit installer and run under armor's backend (6 processes), the archive of `tests/guest` is byte for byte the Windows ARM64 build's: level 3.
+- **Notepad++ 8.9.8.1** (x64, with a 32-bit NSIS installer, 3 processes under armor's backend): its window appears, level 1.
+- **KeePass 2.61.1** (.NET, a 32-bit Inno Setup installer): at first the installer stopped on `fbstp` (x87 packed BCD, which armor did not have; Delphi formats numbers with it); with `fbld` and `fbstp` (`tech/floating-point.md`) it installs and the window appears, level 1 (6 processes).
+- ✅ **Speed** (2026-10-20, the machine otherwise idle; median of 3 wall-clock runs): 7-Zip 26.04 x86 compressing the 12 MB input of `bench`'s `7zip` workload (`target/bench/7zip-input.bin`) with `7z a -txz -mx=9 -mmt=1`, in a test prefix with `HODLL` set per run; every engine writes the same archive (SHA-256 `1611e3a6…`):
+
+| Build | Engine | s |
+|---|---|---|
+| 32-bit Windows x86 | Hangover, armor WoW64 (`armor-wow64.dll`, JIT) | 16.5 |
+| 32-bit Windows x86 | Hangover, FEX WoW64 (`libwow64fex.dll`) | 8.7 |
+| 32-bit Windows x86 | Hangover, box64 WoW64 (`wowbox64.dll`) | 8.4 |
+| Windows ARM64 | Hangover's Wine, native | 6.7 |
+
+armor's backend takes 1.9 times FEX's time, about the ratio of armor's JIT to box64 on Linux `7zz` (`bench`, `tech/performance.md`): the gains still to come for the JIT are what this backend needs. On the small `tests/guest` input (`app-check`'s) the times were 0.4 s under FEX, 1.3 s under armor's JIT and 23.3 s with its interpreter alone.
+
 ### Epic Games Launcher (2026-10-14)
 Installed with `armor install` (prefix in `~/.local/share/armor/apps/epic`) on the Pi with 4K pages; measured on 2026-10-14.
 - ✅ **Installation:** the installer downloaded from Epic (`EpicGamesLauncherInstaller.msi`, that is `EpicInstaller-20.3.3.msi`, SHA-256 in ADR-0033) installs in 39 s; the launcher updates itself from 20.3.3 to 20.3.5 (671.7 MB, after a click on its update button).

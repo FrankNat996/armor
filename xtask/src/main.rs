@@ -24,6 +24,7 @@ mod progress;
 mod results;
 mod rootfs;
 mod sandbox_check;
+mod wow64;
 
 use std::env;
 use std::fs;
@@ -85,6 +86,10 @@ commands:
   gl-gen [--check]               generate armor's OpenGL table and the guest's
                                  libGL stubs from third_party/khronos/gl.xml
                                  (--check: fail if they are stale instead)
+  wow64                          build armor's WoW64 CPU backend for 32-bit
+                                 Windows programs into target/wow64/ (needs
+                                 the aarch64-pc-windows-msvc target, lld and
+                                 llvm; ADR-0047)
   gl-check                       draw with OpenGL under armor, with the guest's
                                  Mesa and with the host's GPU (--host-gl), and
                                  compare the pixels (needs an X display and
@@ -93,9 +98,12 @@ commands:
                                  podman containers of Fedora and Arch Linux
                                  ARM: x86-64 and i386 programs, an x86-64
                                  .deb, the Windows engine (ADR-0043)
-  app-check [--report] [id...]   install and run real applications under
+  app-check [--report] [--x86-engine armor|fex] [id...]
+                                 install and run real applications under
                                  Xvfb: a window, or 7-Zip's archive against
-                                 its ARM64 build (ADR-0045)
+                                 its ARM64 build (ADR-0045); --x86-engine
+                                 armor: Windows 32-bit code under armor's
+                                 WoW64 backend instead of FEX (ADR-0047)
   matrix [--check]               render the matrix in COMPATIBILITY_MATRIX.md
                                  and README.md from docs/results/ (ADR-0045)";
 
@@ -178,6 +186,7 @@ const I386_SHARED_C_TESTS: &[&str] = &[
     "threads",
     "threads_signals",
     "writev",
+    "x87_bcd",
     "x87_more",
     "x87_transcendental",
 ];
@@ -231,6 +240,7 @@ fn main() -> ExitCode {
             _ => Err(format!("usage: cargo xtask gl-gen [--check]\n\n{USAGE}")),
         },
         Some("gl-check") => gl::check(&Paths::new()),
+        Some("wow64") => wow64::run(&Paths::new().root),
         Some("distro-check") => {
             let mut rest = args[1..].to_vec();
             let report = results::take_flag(&mut rest);

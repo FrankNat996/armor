@@ -18,130 +18,20 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::io;
-use std::ops::BitOr;
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering, fence};
 use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
-pub const GUEST_PAGE_SIZE: u64 = 4096;
+pub use armor_guest::{Access, GUEST_PAGE_SIZE, GuestMemory, MemFault, Prot};
 
-/// Guest page permissions, as in `PROT_*`.
-#[derive(Clone, Copy, PartialEq, Eq, Default)]
-pub struct Prot(u8);
-
-impl Prot {
-    pub const NONE: Prot = Prot(0);
-    pub const READ: Prot = Prot(1);
-    pub const WRITE: Prot = Prot(2);
-    pub const EXEC: Prot = Prot(4);
-
-    /// The `PROT_*` bits, as stored in the page table (`MemView::page_table`).
-    pub const fn bits(self) -> u8 {
-        self.0
-    }
-
-    pub fn contains(self, other: Prot) -> bool {
-        self.0 & other.0 == other.0
-    }
-
-    /// x86-64 page tables cannot express write-only or execute-only pages:
-    /// every page that is mapped with any permission is readable.
-    fn allows(self, access: Access) -> bool {
-        match access {
-            Access::Read => self != Prot::NONE,
-            Access::Write => self.contains(Prot::WRITE),
-            Access::Execute => self.contains(Prot::EXEC),
-        }
-    }
-}
-
-impl BitOr for Prot {
-    type Output = Prot;
-    fn bitor(self, rhs: Prot) -> Prot {
-        Prot(self.0 | rhs.0)
-    }
-}
-
-impl fmt::Debug for Prot {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let flag = |p: Prot, c: char| if self.contains(p) { c } else { '-' };
-        write!(
-            f,
-            "{}{}{}",
-            flag(Prot::READ, 'r'),
-            flag(Prot::WRITE, 'w'),
-            flag(Prot::EXEC, 'x')
-        )
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Access {
-    Read,
-    Write,
-    Execute,
-}
-
-/// A guest access that the guest page permissions do not allow.
-/// `addr` is the first byte of the access that faulted.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct MemFault {
-    pub addr: u64,
-    pub access: Access,
-}
-
-impl fmt::Display for MemFault {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let what = match self.access {
-            Access::Read => "read",
-            Access::Write => "write",
-            Access::Execute => "execute",
-        };
-        write!(f, "invalid {what} at {:#x}", self.addr)
-    }
-}
-
-/// What the interpreter needs from guest memory.
-pub trait GuestMemory {
-    fn read(&self, addr: u64, buf: &mut [u8]) -> Result<(), MemFault>;
-    fn write(&self, addr: u64, data: &[u8]) -> Result<(), MemFault>;
-    /// Copies executable bytes starting at `addr` into `buf`, stopping at the
-    /// first byte whose page is not executable. Returns how many were copied.
-    fn fetch(&self, addr: u64, buf: &mut [u8]) -> usize;
-    /// A counter that changes whenever executable bytes or permissions may
-    /// have changed, so that decoded instructions can be cached.
-    fn code_generation(&self) -> u64 {
-        0
-    }
-    /// An x86 `LOCK` read-modify-write of the `size`-byte value at `addr`
-    /// (1, 2, 4 or 8 bytes): replaces it with `update(old)` and returns
-    /// `old`. Another process sharing the memory (ADR-0022) sees either
-    /// value, never a mix. This default reads and writes, which is exact
-    /// for memory nothing else can see.
-    fn atomic_update(
-        &self,
-        addr: u64,
-        size: usize,
-        update: &mut dyn FnMut(u64) -> u64,
-    ) -> Result<u64, MemFault> {
-        let mut bytes = [0u8; 8];
-        self.read(addr, &mut bytes[..size])?;
-        let old = u64::from_le_bytes(bytes);
-        self.write(addr, &update(old).to_le_bytes()[..size])?;
-        Ok(old)
-    }
-    /// `lock cmpxchg16b`: if the 16 bytes at `addr` (16-byte aligned)
-    /// equal `expected`, replaces them with `new`; returns the old value
-    /// either way, and writes in both cases as x86 does. Atomic like
-    /// `atomic_update`; this default reads and writes.
-    fn compare_exchange_16(&self, addr: u64, expected: u128, new: u128) -> Result<u128, MemFault> {
-        let mut bytes = [0u8; 16];
-        self.read(addr, &mut bytes)?;
-        let old = u128::from_le_bytes(bytes);
-        let value = if old == expected { new } else { old };
-        self.write(addr, &value.to_le_bytes())?;
-        Ok(old)
-    }
+/// The value rdtsc reads (`GuestMemory::time_stamp_counter`):
+/// nanoseconds since the first read, so it only grows. Real counters tick
+/// at a CPU-specific rate that CPUID does not report here (no leaf 0x15),
+/// so programs cannot rely on the unit.
+pub fn time_stamp_counter() -> u64 {
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    let start = START.get_or_init(std::time::Instant::now);
+    u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX)
 }
 
 /// A 16-byte compare-and-swap on host memory: LSE's CASPAL when the host
@@ -406,18 +296,9 @@ struct Tables {
 const PAGE_TABLE_ENTRIES: u64 = 1 << (47 - 12);
 /// Marks a mapped page in `PageTable`; the low bits are its `Prot`.
 const MAPPED: u8 = 0x80;
-/// Bits of a `PageTable` byte derived from the `Prot`, for the JIT: one
-/// `tbz` per check instead of a mask and a compare.
-/// Set when the page is readable (any permission, as on x86).
-pub const PAGE_READABLE_BIT: u32 = 3;
-/// Set when the page is writable and not executable: writes to code must
-/// go through the interpreter, which invalidates translations.
-pub const PAGE_WRITABLE_DATA_BIT: u32 = 4;
-/// Set when this page and the next one are both readable: an access that
-/// starts here may cross into the next page.
-pub const PAGE_READABLE_SPAN_BIT: u32 = 5;
-/// Set when this page and the next one are both writable data pages.
-pub const PAGE_WRITABLE_DATA_SPAN_BIT: u32 = 6;
+pub use armor_guest::{
+    PAGE_READABLE_BIT, PAGE_READABLE_SPAN_BIT, PAGE_WRITABLE_DATA_BIT, PAGE_WRITABLE_DATA_SPAN_BIT,
+};
 
 /// The permissions of every guest page in a flat array, one byte per page
 /// (ADR-0021): 0 for an unmapped page, `MAPPED | prot` plus the derived
@@ -475,7 +356,7 @@ impl PageTable {
         }
         // SAFETY: `page` is inside the reservation.
         let byte = unsafe { *self.base.as_ptr().add(page as usize) };
-        (byte & MAPPED != 0).then_some(Prot(byte & 7))
+        (byte & MAPPED != 0).then_some(Prot::from_bits(byte))
     }
 
     fn contains_key(&self, page: u64) -> bool {
@@ -530,7 +411,7 @@ impl PageTable {
         let readable = u8::from(prot != Prot::NONE) << PAGE_READABLE_BIT;
         let data = u8::from(prot.contains(Prot::WRITE) && !prot.contains(Prot::EXEC))
             << PAGE_WRITABLE_DATA_BIT;
-        self.set(page, MAPPED | prot.0 | readable | data)
+        self.set(page, MAPPED | prot.bits() | readable | data)
     }
 
     fn remove(&mut self, page: u64) -> Option<Prot> {
@@ -2147,6 +2028,10 @@ impl MemView<'_> {
 }
 
 impl GuestMemory for MemView<'_> {
+    fn time_stamp_counter(&self) -> u64 {
+        time_stamp_counter()
+    }
+
     fn read(&self, addr: u64, buf: &mut [u8]) -> Result<(), MemFault> {
         check_with(
             |p| self.prot_of(p),
@@ -2279,6 +2164,10 @@ impl Default for AddressSpace {
 }
 
 impl GuestMemory for AddressSpace {
+    fn time_stamp_counter(&self) -> u64 {
+        time_stamp_counter()
+    }
+
     fn read(&self, addr: u64, buf: &mut [u8]) -> Result<(), MemFault> {
         read_locked(&self.tables(), addr, buf)
     }
@@ -2638,7 +2527,8 @@ mod tests {
         mem.map_fixed(a, 8 * GUEST_PAGE_SIZE, Prot::NONE).unwrap();
         for bits in 0..8u8 {
             let addr = a + u64::from(bits) * GUEST_PAGE_SIZE;
-            mem.protect(addr, GUEST_PAGE_SIZE, Prot(bits)).unwrap();
+            mem.protect(addr, GUEST_PAGE_SIZE, Prot::from_bits(bits))
+                .unwrap();
             let view = mem.view();
             // SAFETY: the page is mapped, so its byte is inside the table.
             let byte = unsafe { *view.page_table().add((addr / GUEST_PAGE_SIZE) as usize) };
@@ -2649,7 +2539,10 @@ mod tests {
             // The next page is still mapped PROT_NONE (or the last one of
             // the range: then unmapped): no span.
             assert_eq!(byte >> PAGE_READABLE_SPAN_BIT & 1, 0, "prot {bits}");
-            assert_eq!(view.prot_of(addr / GUEST_PAGE_SIZE), Some(Prot(bits)));
+            assert_eq!(
+                view.prot_of(addr / GUEST_PAGE_SIZE),
+                Some(Prot::from_bits(bits))
+            );
         }
     }
 

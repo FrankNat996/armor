@@ -6,6 +6,8 @@
 //! docs/tech/x86-64-encoding.md.
 
 #![forbid(unsafe_code)]
+// No standard library: the Windows backend (ADR-0047) uses it too.
+#![cfg_attr(not(test), no_std)]
 
 mod decoder;
 mod length;
@@ -15,7 +17,7 @@ pub use length::{Extension, Length, length, length_in};
 mod sse;
 mod x87;
 
-use std::fmt;
+use core::fmt;
 
 /// Architectural limit: longer instructions raise #GP.
 pub const MAX_INSTRUCTION_LEN: usize = 15;
@@ -618,6 +620,9 @@ pub enum X87Format {
     I16,
     I32,
     I64,
+    /// Packed BCD (`fbld`, `fbstp`): 18 decimal digits, two per byte from
+    /// the lowest, and the sign in bit 7 of the tenth byte.
+    Bcd,
 }
 
 /// A source or destination of an x87 instruction: ST(i) or memory.
@@ -1025,7 +1030,7 @@ impl fmt::Display for DecodeError {
     }
 }
 
-impl std::error::Error for DecodeError {}
+impl core::error::Error for DecodeError {}
 
 /// Decodes the instruction at the start of `bytes`.
 pub fn decode(bytes: &[u8]) -> Result<Instruction, DecodeError> {

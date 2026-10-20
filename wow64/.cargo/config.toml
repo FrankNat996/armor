@@ -1,0 +1,8 @@
+[build]
+target = "aarch64-pc-windows-msvc"
+
+[target.aarch64-pc-windows-msvc]
+linker = "lld-link"
+# No C runtime: only ntdll and wow64.dll, as the 64-bit side of a WoW64
+# process has nothing else (import libraries from build.rs).
+rustflags = ["-C", "link-arg=/NODEFAULTLIB", "-C", "link-arg=/NOENTRY", "-C", "target-feature=+crt-static"]

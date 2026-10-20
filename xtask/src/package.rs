@@ -7,9 +7,11 @@
 //! armor" (a double click on a Windows `.exe` or `.msi`, an x86-64 `.deb` or
 //! an AppImage installs it, in a terminal window that shows the progress) and
 //! the licenses, and armor's x86-64 `libGL.so.1` in
-//! `/usr/lib/armor/x86_64-linux-gnu/` (ADR-0041, for `--host-gl`). Nothing runs
-//! at installation except refreshing the desktop's MIME cache. The Windows
-//! engine is not in the package: `armor engine fetch` downloads it.
+//! `/usr/lib/armor/x86_64-linux-gnu/` (ADR-0041, for `--host-gl`), and armor's
+//! WoW64 backend for 32-bit Windows code, `armor-wow64.dll` in
+//! `/usr/lib/armor/aarch64-windows/` (ADR-0047, `cargo xtask wow64`). Nothing
+//! runs at installation except refreshing the desktop's MIME cache. The
+//! Windows engine is not in the package: `armor engine fetch` downloads it.
 //!
 //! The same files also go into `armor_<version>_arm64.tar.gz` (ADR-0043),
 //! for distributions other than Debian and Ubuntu: `bin/`, `lib/armor/`,
@@ -221,6 +223,12 @@ pub fn build(root: &Path) -> Result<(std::path::PathBuf, std::path::PathBuf), St
         &libgl,
         &stage.join("usr/lib/armor/x86_64-linux-gnu/libGL.so.1"),
     )?;
+    // armor's engine for 32-bit Windows code (ADR-0047).
+    let wow64 = crate::wow64::build(root)?;
+    copy(
+        &wow64,
+        &stage.join("usr/lib/armor/aarch64-windows/armor-wow64.dll"),
+    )?;
     if !Path::new(DEBIAN_KEYRING).is_file() {
         return Err(format!(
             "{DEBIAN_KEYRING} is missing: the package carries it (install debian-archive-keyring)"
@@ -247,6 +255,7 @@ pub fn build(root: &Path) -> Result<(std::path::PathBuf, std::path::PathBuf), St
          License: MIT OR Apache-2.0 (LICENSE-MIT, LICENSE-APACHE in this directory).\n\
          /usr/lib/armor/x86_64-linux-gnu/libGL.so.1 is generated from the Khronos OpenGL\n\
          registry (gl.xml, glx.xml; Copyright The Khronos Group Inc., Apache-2.0).\n\
+         /usr/lib/armor/aarch64-windows/armor-wow64.dll is armor's own code (MIT OR Apache-2.0).\n\
          The Windows engine (Wine, FEX, box64, DXVK, Wine Mono) is not part of this package:\n\
          `armor engine fetch` downloads it from its sources, with its own licences.\n",
     )?;

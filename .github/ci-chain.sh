@@ -11,7 +11,7 @@ export DEBIAN_FRONTEND=noninteractive
 apt-get update -q >/dev/null
 apt-get install -y -q --no-install-recommends ca-certificates curl git build-essential \
     gcc-x86-64-linux-gnu libc6-dev-amd64-cross binutils-x86-64-linux-gnu \
-    gcc-i686-linux-gnu libc6-dev-i386-cross nasm qemu-user xz-utils bzip2 >/dev/null
+    gcc-i686-linux-gnu libc6-dev-i386-cross nasm qemu-user xz-utils bzip2 lld llvm >/dev/null
 qemu-x86_64 --version | head -1
 # qemu runs the x86 programs that a test program starts with execve only
 # through binfmt_misc, as on the development machine (qemu-user-binfmt,
@@ -33,6 +33,8 @@ runuser -u builder -- bash -c '
   cd ~/armor
   curl --proto =https --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal >/dev/null 2>&1
   export PATH=$HOME/.cargo/bin:$PATH
+  # armor-wow64.dll (ADR-0047): the Windows target, linked with lld-link.
+  rustup target add aarch64-pc-windows-msvc >/dev/null 2>&1
   failed=0
   for step in "cargo fmt --all --check" \
       "cargo clippy --workspace --all-targets -- -D warnings" \
@@ -45,7 +47,8 @@ runuser -u builder -- bash -c '
       "env ARMOR_HOST_FEATURES=baseline cargo xtask difftest --report" \
       "cargo xtask difftest --native --report" \
       "cargo xtask encoder-check" \
-      "cargo xtask sandbox-check"; do
+      "cargo xtask sandbox-check" \
+      "cargo xtask wow64"; do
     echo "::group::$step"
     bash -c "$step"
     rc=$?

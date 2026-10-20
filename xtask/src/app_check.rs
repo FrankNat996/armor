@@ -1,4 +1,4 @@
-//! `cargo xtask app-check [--report] [id...]`: real applications installed
+//! `cargo xtask app-check [--report] [--x86-engine armor|fex] [id...]`: real applications installed
 //! and run as a user would, unattended (ADR-0045).
 //!
 //! Each application's installer is pinned by SHA-256 (downloaded into
@@ -10,6 +10,11 @@
 //! - **7-Zip**: the archive it makes of `tests/guest/` is byte-for-byte the
 //!   one its native ARM64 build makes of the same files with the same
 //!   options (level 3).
+//!
+//! Windows applications run their 32-bit code under FEX, or, with
+//! `--x86-engine armor`, under armor's WoW64 backend (ADR-0047; the check
+//! fails if its line at start is not in the log, since armor falls back to
+//! FEX without it).
 //!
 //! The data directory is removed afterwards. `--report` records each result
 //! in this machine's `docs/results/` file.
@@ -273,10 +278,11 @@ struct Place {
     data: PathBuf,
     config: PathBuf,
     log: PathBuf,
+    x86_engine: &'static str,
 }
 
 impl Place {
-    fn new(paths: &Paths, app: &App) -> Result<Place, String> {
+    fn new(paths: &Paths, app: &App, x86_engine: &'static str) -> Result<Place, String> {
         let base = paths.root.join("target/app-check").join(app.id);
         if base.exists() {
             fs::remove_dir_all(&base).map_err(|e| format!("{}: {e}", base.display()))?;
@@ -301,6 +307,7 @@ impl Place {
             data,
             config,
             log: base.join("log.txt"),
+            x86_engine,
         })
     }
 
@@ -318,6 +325,7 @@ impl Place {
             .env("XDG_CONFIG_HOME", &self.config)
             .env("TMPDIR", tmp)
             .env("DISPLAY", DISPLAY)
+            .env("ARMOR_WINDOWS_X86_ENGINE", self.x86_engine)
             .env_remove("WAYLAND_DISPLAY");
         cmd
     }
@@ -617,10 +625,27 @@ fn check_seven_zip_linux(
     })
 }
 
+/// Whether the application runs under Wine.
+fn is_windows(app: &App) -> bool {
+    !matches!(app.check, Check::SevenZipLinux { .. }) && !app.engine.starts_with("armor")
+}
+
+/// The engine of the record: with `--x86-engine armor`, a Windows
+/// application's 32-bit code runs under armor's WoW64 backend.
+fn engine_label(app: &App, x86_engine: &str) -> String {
+    if x86_engine != "armor" || !is_windows(app) {
+        app.engine.to_string()
+    } else if app.engine.contains("FEX WoW64") {
+        app.engine.replace("FEX WoW64", "armor WoW64")
+    } else {
+        format!("{}, 32-bit code under armor WoW64", app.engine)
+    }
+}
+
 /// Checks one application; its result line.
-fn check(paths: &Paths, app: &App) -> Result<String, String> {
+fn check(paths: &Paths, app: &App, x86_engine: &'static str) -> Result<String, String> {
     let file = installer(paths, app)?;
-    let place = Place::new(paths, app)?;
+    let place = Place::new(paths, app, x86_engine)?;
     let result = (|| {
         if let Check::SevenZipLinux { native } = app.check {
             return check_seven_zip_linux(paths, &place, app, &file, native);
@@ -642,16 +667,43 @@ fn check(paths: &Paths, app: &App) -> Result<String, String> {
             Check::SevenZipLinux { .. } => unreachable!("handled above"),
         }
     })();
+    // armor falls back to FEX when its backend is missing: the processes
+    // must have run under it (its line at start, in the log).
+    let result = result.map(|r| {
+        if x86_engine != "armor" || !is_windows(app) || r.starts_with("failed") {
+            return r;
+        }
+        let log = fs::read_to_string(&place.log).unwrap_or_default();
+        match log.matches("armor-wow64 ").count() {
+            0 => "failed: armor's WoW64 backend did not start".to_string(),
+            n => {
+                println!("{n} process(es) under armor's WoW64 backend");
+                r
+            }
+        }
+    });
     if result.as_ref().is_ok_and(|r| !r.starts_with("failed")) {
         place.remove();
     }
     result
 }
 
-/// `cargo xtask app-check [--report] [id...]`.
+/// `cargo xtask app-check [--report] [--x86-engine armor|fex] [id...]`.
 pub fn run(args: &[String]) -> Result<(), String> {
     let mut args = args.to_vec();
     let report = crate::results::take_flag(&mut args);
+    let x86_engine = match args.iter().position(|a| a == "--x86-engine") {
+        Some(i) => {
+            let engine = match args.get(i + 1).map(String::as_str) {
+                Some("armor") => "armor",
+                Some("fex") => "fex",
+                _ => return Err("--x86-engine takes armor or fex".to_string()),
+            };
+            args.drain(i..i + 2);
+            engine
+        }
+        None => "fex",
+    };
     let paths = Paths::new();
     let selected: Vec<&App> = APPS
         .iter()
@@ -672,12 +724,16 @@ pub fn run(args: &[String]) -> Result<(), String> {
     if !status.success() {
         return Err("building armor failed".to_string());
     }
+    // Next to target/release/armor, where `armor run` finds it.
+    if x86_engine == "armor" {
+        crate::wow64::build(&paths.root)?;
+    }
     let _display = Display::start()?;
     let mut records = Vec::new();
     let mut failed = 0;
     for app in selected {
         println!("== {} ({})", app.name, app.id);
-        let result = check(&paths, app).unwrap_or_else(|e| format!("failed: {e}"));
+        let result = check(&paths, app, x86_engine).unwrap_or_else(|e| format!("failed: {e}"));
         println!("{result}");
         if result.starts_with("failed") {
             failed += 1;
@@ -690,10 +746,14 @@ pub fn run(args: &[String]) -> Result<(), String> {
         records.push(crate::results::Record::now(
             "application",
             app.name,
-            app.engine,
+            &engine_label(app, x86_engine),
             reference,
             &result,
-            &format!("cargo xtask app-check {}", app.id),
+            &if x86_engine == "armor" {
+                format!("cargo xtask app-check --x86-engine armor {}", app.id)
+            } else {
+                format!("cargo xtask app-check {}", app.id)
+            },
         ));
     }
     if report {

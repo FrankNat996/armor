@@ -6,8 +6,9 @@
 //! stop armor with "not supported yet" (`check_control_word`). With
 //! exceptions masked, faults produce their masked responses (Intel SDM vol. 1, 8.5): an
 //! invalid operation or a stack fault gives the indefinite QNaN, and so on.
+use alloc::vec::Vec;
 
-use armor_mem::GuestMemory;
+use armor_guest::GuestMemory;
 use armor_x86::{X87Arith, X87Constant, X87Format, X87Op, X87Operand, X87Transcendental};
 
 use crate::f80::{self, Compare, Constant, F80, FLAG_INVALID, Mode, Out, Rounding};
@@ -68,9 +69,9 @@ pub struct X87 {
 
 /// Where the MMX state is inside `X87`, for the JIT (ADR-0021): the
 /// registers' array, the empty bits and TOP.
-pub(crate) const REGS_OFFSET: usize = std::mem::offset_of!(X87, regs);
-pub(crate) const EMPTY_OFFSET: usize = std::mem::offset_of!(X87, empty);
-pub(crate) const TOP_OFFSET: usize = std::mem::offset_of!(X87, top);
+pub(crate) const REGS_OFFSET: usize = core::mem::offset_of!(X87, regs);
+pub(crate) const EMPTY_OFFSET: usize = core::mem::offset_of!(X87, empty);
+pub(crate) const TOP_OFFSET: usize = core::mem::offset_of!(X87, top);
 
 impl Default for X87 {
     fn default() -> X87 {
@@ -678,6 +679,7 @@ impl Cpu {
                 f80::from_int(sign_extend(raw & 0xffff_ffff, armor_x86::Size::B32) as i64)
             }
             X87Format::I64 => f80::from_int(raw as i64),
+            X87Format::Bcd => from_bcd(bytes),
         };
         Ok(Some(value))
     }
@@ -715,6 +717,11 @@ impl Cpu {
                 let result = f80::to_int(value, bits, rc);
                 self.x87.flags(&result);
                 result.value.to_le_bytes()[..format_size(format)].to_vec()
+            }
+            X87Format::Bcd => {
+                let result = to_bcd(value, rc);
+                self.x87.flags(&result);
+                result.value.to_vec()
             }
         };
         mem.write(self.address(&m, next), &bytes)?;
@@ -863,7 +870,53 @@ fn format_size(format: X87Format) -> usize {
     match format {
         X87Format::F32 | X87Format::I32 => 4,
         X87Format::F64 | X87Format::I64 => 8,
-        X87Format::F80 => 10,
+        X87Format::F80 | X87Format::Bcd => 10,
         X87Format::I16 => 2,
+    }
+}
+
+/// The largest packed BCD integer, 18 nines.
+const BCD_MAX: u64 = 999_999_999_999_999_999;
+/// What fbstp stores for an invalid operand (SDM vol. 1, 4.7: the packed
+/// BCD integer indefinite, FFFF C000 0000 0000 0000h).
+const BCD_INDEFINITE: [u8; 10] = [0, 0, 0, 0, 0, 0, 0, 0xc0, 0xff, 0xff];
+
+/// fbld: exact, as 18 digits fit in 64 bits; the sign of zero is kept.
+/// Nibbles above 9 are undefined on x86; here they count with their value.
+fn from_bcd(bytes: [u8; 10]) -> F80 {
+    let magnitude = bytes[..9].iter().rev().fold(0u64, |n, &b| {
+        n * 100 + u64::from(b >> 4) * 10 + u64::from(b & 15)
+    });
+    let sign = bytes[9] & 0x80 != 0;
+    let value = f80::from_int(magnitude as i64);
+    F80 { sign, ..value }
+}
+
+/// fbstp: ST(0) rounded to an integer by `rc`, as 18 digits and the sign
+/// (also of a zero); a NaN, an infinity or more than 18 digits is invalid
+/// and stores the indefinite.
+fn to_bcd(value: F80, rc: Rounding) -> Out<[u8; 10]> {
+    let result = f80::to_int(value, 64, rc);
+    let magnitude = (result.value as i64).unsigned_abs();
+    if result.flags & FLAG_INVALID != 0 || magnitude > BCD_MAX {
+        return Out {
+            value: BCD_INDEFINITE,
+            flags: FLAG_INVALID,
+            rounded_up: false,
+        };
+    }
+    let mut bytes = [0u8; 10];
+    let mut n = magnitude;
+    for byte in &mut bytes[..9] {
+        *byte = (((n / 10 % 10) << 4) | (n % 10)) as u8;
+        n /= 100;
+    }
+    if value.sign {
+        bytes[9] = 0x80;
+    }
+    Out {
+        value: bytes,
+        flags: result.flags,
+        rounded_up: result.rounded_up,
     }
 }

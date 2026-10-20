@@ -11,5 +11,8 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
-armor-mem = { path = "../armor-mem" }
+armor-guest = { path = "../armor-guest" }
 armor-x86 = { path = "../armor-x86" }
+
+[dev-dependencies]
+armor-mem = { path = "../armor-mem" }

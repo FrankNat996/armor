@@ -1,0 +1,3 @@
+LIBRARY wow64.dll
+EXPORTS
+Wow64SystemServiceEx

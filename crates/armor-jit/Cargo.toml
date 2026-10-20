@@ -10,8 +10,15 @@ publish.workspace = true
 [lints]
 workspace = true
 
+[features]
+default = ["std"]
+# The Linux engine (`engine`, `buffer`, `lockstep`, `stats`); without it
+# the encoder and the translator alone, no_std (ADR-0047).
+std = ["dep:armor-mem", "dep:libc"]
+
 [dependencies]
 armor-cpu = { path = "../armor-cpu" }
-armor-mem = { path = "../armor-mem" }
+armor-guest = { path = "../armor-guest" }
+armor-mem = { path = "../armor-mem", optional = true }
 armor-x86 = { path = "../armor-x86" }
-libc = "0.2.190"
+libc = { version = "0.2.190", optional = true }

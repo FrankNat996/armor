@@ -1,0 +1,17 @@
+LIBRARY ntdll.dll
+EXPORTS
+NtAllocateVirtualMemory
+NtQueryInformationThread
+NtSetInformationThread
+NtTerminateProcess
+NtReadVirtualMemory
+NtSuspendThread
+RtlAllocateHeap
+RtlFreeHeap
+RtlReAllocateHeap
+RtlWow64GetCurrentCpuArea
+__wine_dbg_output
+__wine_unix_call_dispatcher DATA
+RtlCaptureContext
+NtRaiseException
+NtContinue

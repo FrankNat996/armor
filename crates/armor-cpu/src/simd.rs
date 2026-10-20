@@ -3,6 +3,7 @@
 //! (also the first source), `src` the second source. Lanes are numbered
 //! from the least significant.
 
+use alloc::vec::Vec;
 use armor_x86::{IntOp, Size};
 
 /// The value of `op dst, src`; `xmm0` is the mask of the variable blends.

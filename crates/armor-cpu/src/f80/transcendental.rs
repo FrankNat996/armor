@@ -13,8 +13,10 @@
 //! arguments of fsin, fcos and fptan with a 66-bit pi): results can differ
 //! from an Intel CPU in the last bit, more for large trigonometric
 //! arguments (docs/tech/floating-point.md).
+use alloc::vec;
+use alloc::vec::Vec;
 
-use std::cmp::Ordering;
+use core::cmp::Ordering;
 
 use super::{
     Class, F80, FLAG_DENORMAL, FLAG_INEXACT, FLAG_INVALID, FLAG_ZERO_DIVIDE, Mode, Out, Rounding,

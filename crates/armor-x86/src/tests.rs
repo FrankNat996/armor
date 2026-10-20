@@ -388,10 +388,23 @@ fn errors() {
     assert_eq!(decode(&[0xf0, 0x01, 0xd8]), Err(DecodeError::Invalid));
     // ud2.
     assert_eq!(decode(&[0x0f, 0x0b]), Err(DecodeError::Invalid));
-    // fbld (x87 BCD): not supported yet.
+    // fbld and fbstp (x87 packed BCD).
     assert!(matches!(
-        decode(&[0xdf, 0x20]),
-        Err(DecodeError::Unsupported(_))
+        decode(&[0xdf, 0x20]).unwrap().op,
+        Op::X87 {
+            op: X87Op::Load(X87Operand::Mem(_, X87Format::Bcd)),
+            ..
+        }
+    ));
+    assert!(matches!(
+        decode(&[0xdf, 0x30]).unwrap().op,
+        Op::X87 {
+            op: X87Op::Store {
+                dst: X87Operand::Mem(_, X87Format::Bcd),
+                pop: true
+            },
+            ..
+        }
     ));
     // The transcendentals (ADR-0030).
     assert_eq!(

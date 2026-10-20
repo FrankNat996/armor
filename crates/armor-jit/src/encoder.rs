@@ -6,7 +6,10 @@
 //! Register 31 means SP or the zero register depending on the
 //! instruction, as in the architecture; the methods document which.
 
-use std::fmt;
+use alloc::format;
+use alloc::string::String;
+use alloc::vec::Vec;
+use core::fmt;
 
 /// A general-purpose register number, 0..=31.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -151,9 +154,9 @@ impl fmt::Display for EncodeError {
     }
 }
 
-impl std::error::Error for EncodeError {}
+impl core::error::Error for EncodeError {}
 
-type Result<T> = std::result::Result<T, EncodeError>;
+type Result<T> = core::result::Result<T, EncodeError>;
 
 fn fail<T>(what: impl Into<String>) -> Result<T> {
     Err(EncodeError(what.into()))
@@ -243,7 +246,7 @@ impl Assembler {
 
     /// Any 64-bit constant, in one to four instructions.
     pub fn mov_imm64(&mut self, rd: Reg, value: u64) {
-        let halves: [u16; 4] = std::array::from_fn(|i| (value >> (16 * i)) as u16);
+        let halves: [u16; 4] = core::array::from_fn(|i| (value >> (16 * i)) as u16);
         let zeros = halves.iter().filter(|&&h| h == 0).count();
         let ones = halves.iter().filter(|&&h| h == 0xffff).count();
         let mut started = false;

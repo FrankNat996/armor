@@ -3,8 +3,9 @@
 //! Legacy (non-VEX) SSE instructions require 16-byte aligned memory operands
 //! for 128-bit accesses, except the explicitly unaligned moves (movups,
 //! movdqu, movupd); a misaligned access raises #GP.
+use alloc::vec::Vec;
 
-use armor_mem::GuestMemory;
+use armor_guest::GuestMemory;
 use armor_x86::{
     Conversion, Dup, FloatOp, IntOp, LaneOp, LogicOp, Mem, MmxConversion, Operand, Reg, ShiftKind,
     Size, SseOp, StateOp,
@@ -103,7 +104,7 @@ impl Cpu {
         );
         self.set_mxcsr(mxcsr)?;
         let word = |at: usize| u16::from_le_bytes([area[at], area[at + 1]]);
-        let stack = std::array::from_fn(|i| {
+        let stack = core::array::from_fn(|i| {
             let at = FXSAVE_ST + 16 * i;
             F80::from_bytes(area[at..at + 10].try_into().expect("10 bytes"))
         });

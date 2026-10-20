@@ -7,7 +7,7 @@
 //! executes with; `cargo xtask decoder-check` compares both with objdump,
 //! and `armor inspect` lists the extensions a program uses.
 
-use std::fmt;
+use core::fmt;
 
 use crate::{DecodeError, MAX_INSTRUCTION_LEN, Mode};
 

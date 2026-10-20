@@ -6,6 +6,8 @@
 //! decoded under; the address space changes the generation on every
 //! mapping change and every write to an executable page, so stale code is
 //! never executed (self-modifying code, `mprotect`, `munmap`).
+use alloc::boxed::Box;
+use alloc::vec;
 
 use armor_x86::Instruction;
 
@@ -66,8 +68,8 @@ impl PartialEq for DecodeCache {
 
 impl Eq for DecodeCache {}
 
-impl std::fmt::Debug for DecodeCache {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Debug for DecodeCache {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.write_str("DecodeCache")
     }
 }

@@ -560,6 +560,7 @@ impl Jit {
             concurrent,
             compat: self.mode == Mode::Compat32,
             host_reads,
+            page_table: true,
         };
         let translation = translate_block(&block, end, options)
             .unwrap_or_else(|e| panic!("armor bug: cannot encode the block at {rip:#x}: {e}"));
