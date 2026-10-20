@@ -18,8 +18,9 @@ use armor_guest::GuestMemory;
 use armor_jit::encoder::branch_word;
 use armor_jit::translator::{
     BlockEnd, CHAINED_ENTRY, Context, EXIT_CHAIN, EXIT_INTERPRET, FLAG_TABLE, GuestInstruction,
-    HostFeatures, MAX_BLOCK_INSTRUCTIONS, Options, TARGET_ENTRIES, ends_block, flags_routine,
-    supported, supported_concurrent, target_slot, translate_block, uses_mxcsr_control,
+    HostFeatures, MAX_BLOCK_INSTRUCTIONS, Options, TARGET_ENTRIES, ends_block, enter_routine,
+    flags_routine, leave_routine, supported, supported_concurrent, target_slot, translate_block,
+    uses_mxcsr_control,
 };
 use armor_x86::{MAX_INSTRUCTION_LEN, Mode, decode_in};
 
@@ -36,7 +37,8 @@ enum Entry {
     Interpret,
 }
 
-type BlockFn = unsafe extern "C" fn(*mut Cpu, *const u8, *mut Context) -> u64;
+/// `enter_routine`: `enter(cpu, page_table, context, block)`.
+type EnterFn = unsafe extern "C" fn(*mut Cpu, *const u8, *mut Context, *const u8) -> u64;
 
 pub struct Engine {
     base: *mut u8,
@@ -46,6 +48,8 @@ pub struct Engine {
     /// (executable address of a guest access, of its slow path), sorted.
     faults: Vec<(u64, u64)>,
     context: Context,
+    /// `enter_routine` in the buffer.
+    enter: *const u8,
     generation: u64,
     epoch: u64,
     default_mxcsr: bool,
@@ -118,6 +122,7 @@ impl Engine {
             targets: vec![[NO_RIP, 0]; TARGET_ENTRIES].into_boxed_slice(),
             faults: Vec::new(),
             context: Context::default(),
+            enter: core::ptr::null(),
             generation: 0,
             epoch: 0,
             default_mxcsr: true,
@@ -164,9 +169,15 @@ impl Engine {
         self.targets.fill([NO_RIP, 0]);
         self.faults.clear();
         self.used = 0;
-        let words = flags_routine().expect("the flags routine encodes");
-        let code = self.publish(&words).expect("fits in an empty buffer");
-        self.context.flags_routine = code as u64;
+        // The shared routines (compatibility mode: 32-bit code).
+        let flags = flags_routine().expect("the flags routine encodes");
+        let enter = enter_routine(true).expect("the entry routine encodes");
+        let leave = leave_routine(true).expect("the exit routine encodes");
+        let flags = self.publish(&flags).expect("fits in an empty buffer");
+        self.enter = self.publish(&enter).expect("fits in an empty buffer");
+        let leave = self.publish(&leave).expect("fits in an empty buffer");
+        self.context.flags_routine = flags as u64;
+        self.context.leave = leave as u64;
     }
 
     /// Concurrent mode from the second thread on (ADR-0023): ordered
@@ -215,8 +226,8 @@ impl Engine {
                     // guest memory, whose faults resume at slow paths.
                     let status = unsafe {
                         clear_fpsr();
-                        let block: BlockFn = core::mem::transmute(code);
-                        block(cpu, core::ptr::null(), &mut self.context)
+                        let enter: EnterFn = core::mem::transmute(self.enter);
+                        enter(cpu, core::ptr::null(), &mut self.context, code)
                     };
                     cpu.mxcsr |= mxcsr_flags(read_fpsr());
                     budget = self.context.budget;

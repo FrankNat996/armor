@@ -27,12 +27,12 @@ use armor_x86::{MAX_INSTRUCTION_LEN, Mode, decode_in};
 
 use crate::buffer::CodeBuffer;
 use crate::encoder::branch_word;
-use crate::translator::flags_routine;
 use crate::translator::{
     BlockEnd, CHAINED_ENTRY, Context, EXIT_CHAIN, EXIT_INTERPRET, FLAG_TABLE, GuestInstruction,
     HostFeatures, MAX_BLOCK_INSTRUCTIONS, Options, TARGET_ENTRIES, ends_block, supported,
     supported_concurrent, target_slot, translate_block, uses_mxcsr_control,
 };
+use crate::translator::{enter_routine, flags_routine, leave_routine};
 
 /// Clears FPSR, the host's cumulative floating-point exception flags, so
 /// that after a block it holds the flags of the guest's SSE floating point
@@ -205,6 +205,8 @@ pub struct Jit {
     /// was not emptied since its block ran.
     epoch: u64,
     context: Context,
+    /// `enter_routine` in this buffer.
+    enter: *const u8,
     /// Blocks called by the engine (chained ones not counted): tests use
     /// it to check that chaining happens.
     pub(crate) calls: u64,
@@ -230,7 +232,8 @@ pub struct Jit {
 
 /// A translated block: `extern "C" fn(cpu, page_table, context)
 /// -> status`.
-type BlockFn = unsafe extern "C" fn(*mut Cpu, *const u8, *mut Context) -> u64;
+/// `enter_routine`: `enter(cpu, page_table, context, block)`.
+type EnterFn = unsafe extern "C" fn(*mut Cpu, *const u8, *mut Context, *const u8) -> u64;
 
 impl Jit {
     pub fn new() -> io::Result<Jit> {
@@ -254,6 +257,7 @@ impl Jit {
             lockstep,
             epoch: 0,
             context: Context::default(),
+            enter: std::ptr::null(),
             calls: 0,
             targets: vec![[NO_RIP, 0]; TARGET_ENTRIES].into_boxed_slice(),
             mode: Mode::Long,
@@ -264,7 +268,7 @@ impl Jit {
         .map(|mut jit| {
             jit.context.targets = jit.targets.as_ptr() as u64;
             jit.context.flag_table = FLAG_TABLE.as_ptr() as u64;
-            jit.publish_flags_routine();
+            jit.publish_routines();
             jit
         })
     }
@@ -464,8 +468,8 @@ impl Jit {
         // checking the page table (ADR-0021).
         let status = unsafe {
             clear_fpsr();
-            let block: BlockFn = std::mem::transmute(code);
-            block(cpu, mem.page_table(), &mut self.context)
+            let enter: EnterFn = std::mem::transmute(self.enter);
+            enter(cpu, mem.page_table(), &mut self.context, code)
         };
         cpu.mxcsr |= mxcsr_flags(read_fpsr());
         (status, self.context.budget)
@@ -494,18 +498,25 @@ impl Jit {
         self.targets.fill([NO_RIP, 0]);
         self.faults.clear();
         self.buffer.reset();
-        self.publish_flags_routine();
+        self.publish_routines();
     }
 
-    /// Puts `flags_routine` at the start of the (empty) buffer, where
-    /// blocks find it through `Context::flags_routine`.
-    fn publish_flags_routine(&mut self) {
-        let words = flags_routine().expect("the flags routine encodes");
-        let code = self
-            .buffer
-            .publish(&words)
-            .expect("the flags routine fits in an empty buffer");
-        self.context.flags_routine = code as u64;
+    /// Puts the shared routines at the start of the (empty) buffer:
+    /// `flags_routine` and `leave_routine`, which blocks find through the
+    /// `Context`, and `enter_routine`, through which `execute` runs them.
+    fn publish_routines(&mut self) {
+        let compat = self.mode == Mode::Compat32;
+        let mut publish = |words: Vec<u32>| {
+            self.buffer
+                .publish(&words)
+                .expect("the routines fit in an empty buffer")
+        };
+        let flags = publish(flags_routine().expect("the flags routine encodes"));
+        let enter = publish(enter_routine(compat).expect("the entry routine encodes"));
+        let leave = publish(leave_routine(compat).expect("the exit routine encodes"));
+        self.context.flags_routine = flags as u64;
+        self.context.leave = leave as u64;
+        self.enter = enter;
     }
 
     /// Decodes and translates the block at `rip`.

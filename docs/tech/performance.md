@@ -613,4 +613,8 @@ From 13.65 to 10.47 s (−23%); box64 takes 6.8 s and FEX 8.5 s on this workload
 | checked addresses follow moved bases; pushes and pops | 724 ms | 640 ms | 10.36 s |
 | `test r, r` held | 726 ms | 645 ms | |
 | shifts by cl in place | 710 ms | 633 ms | 10.29 s |
+| immediates and `movzx` loads straight to `FB` and `[base, #offset]` | 708 ms | 625 ms | 10.29 s |
+| shared prologue and epilogue (`enter_routine`, `leave_routine`) | 691 ms | 622 ms | 10.33 s |
+
+The shared prologue and epilogue take Python's startup from 3.07 to 2.14 million AArch64 instructions (`ARMOR_JIT_STATS`, 16,779 blocks) and from 198 to 183 ms (best of 5), but its translation only from 96 to 92 ms: encoding them was not where the translator spends its time. `perf record --call-graph=dwarf` of the startup: translation 59% of the run, spread over the translator (`translate_block` 40%, of which `Translator::instruction` 20%), the decoder (10%), `malloc` (3.5%), the set of code pages (a `BTreeSet`, 2.2%) and `mov_imm64` (2.2%).
 

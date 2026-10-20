@@ -68,8 +68,9 @@ pub const EXIT_CHAIN: u64 = 2;
 /// The most guest instructions in one block.
 pub const MAX_BLOCK_INSTRUCTIONS: usize = 64;
 
-/// Offset of the entry that chained blocks jump to: after the prologue.
-pub const CHAINED_ENTRY: usize = 96;
+/// Offset of the entry that chained blocks jump to: the block's start (the
+/// prologue is `enter_routine`, shared).
+pub const CHAINED_ENTRY: usize = 0;
 
 /// What a block reads and writes besides the `Cpu`.
 #[derive(Debug, Default)]
@@ -98,6 +99,9 @@ pub struct Context {
     /// After `EXIT_CHAIN`: `KIND` as the exit left it, before the epilogue
     /// made `FLAGS` current (`Options::entry_kind` for the target).
     pub exit_kind: u64,
+    /// Executable address of `leave_routine`, where blocks go back to the
+    /// engine. Kept by the engine.
+    pub leave: u64,
 }
 
 /// Entries of the indirect-jump table (`Context::targets`).
@@ -1029,77 +1033,18 @@ pub fn translate_block(
     end: BlockEnd,
     options: Options,
 ) -> Result<Translation, EncodeError> {
-    let mut t = Translator {
-        a: Assembler::new(),
-        epilogue: None,
-        status_entries: Vec::new(),
-        slow_paths: Vec::with_capacity(block.len()),
-        side_exits: Vec::with_capacity(16),
-        last: false,
-        chain_stubs: Vec::with_capacity(16),
-        page_edges: Vec::with_capacity(block.len()),
-        unaligned: Vec::new(),
-        underflows: Vec::new(),
-        denormals: Vec::new(),
-        zero_counts: Vec::new(),
-        kind_carries: Vec::new(),
-        nzcv_valid: false,
-        nzcv_now: false,
-        access_slow: None,
-        simple_address: None,
-        checked: Vec::new(),
-        known_aligned: false,
-        faults: Vec::with_capacity(block.len()),
-        write_edges: Vec::with_capacity(16),
-        read_edges: Vec::new(),
-        misaligned: None,
-        misaligned_stubs: Vec::new(),
-        packed_underflows: Vec::new(),
-        live: STATUS_FLAGS,
-        skip_flags: false,
-        flags_emitted: 0,
-        options,
-        // Whatever the block before left pending, described by `KIND`.
-        lazy: Lazy::Dynamic,
-    };
+    let mut t = Translator::bare(options);
+    // Whatever the block before left pending, described by `KIND`.
+    t.lazy = Lazy::Dynamic;
+    t.slow_paths.reserve(block.len());
+    t.page_edges.reserve(block.len());
+    t.faults.reserve(block.len());
     let epilogue = t.a.new_label();
     t.epilogue = Some(epilogue);
-    // Save x19..x30 (callee-saved, and the return address).
-    t.a.pair(
-        false,
-        PairMode::PreIndex,
-        HostReg::new(19),
-        HostReg::new(20),
-        SP,
-        -96,
-    )?;
-    for (i, n) in [21u8, 23, 25, 27, 29].into_iter().enumerate() {
-        let offset = 16 * (i as i32 + 1);
-        t.a.pair(
-            false,
-            PairMode::Offset,
-            HostReg::new(n),
-            HostReg::new(n + 1),
-            SP,
-            offset,
-        )?;
-    }
-    t.guest_registers(true)?;
-    t.vector_registers(true)?;
-    t.a.ldr(MemSize::B64, FLAGS, CPU, field(offset_of!(Cpu, rflags)))?;
-    t.a.ldr(
-        MemSize::B64,
-        BUDGET,
-        CONTEXT,
-        field(offset_of!(Context, budget)),
-    )?;
-    // From the engine, `FLAGS` is current and `Context::kind` 0: every
-    // epilogue leaves it so (`materialize`, whose flag routine clears it).
-    assert_eq!(
-        t.a.len() * 4,
-        CHAINED_ENTRY,
-        "the prologue is twenty-two pairs and two loads"
-    );
+    // The block starts at its budget check: from the engine through
+    // `enter_routine` (registers loaded, `FLAGS` current and
+    // `Context::kind` 0, as `leave_routine` leaves them), from another
+    // block straight here (`CHAINED_ENTRY`).
     // The budget: when it runs out, back to the engine before this block.
     let start = block.first().expect("a block has an instruction").rip;
     let out_of_budget = t.a.new_label();
@@ -1263,8 +1208,71 @@ pub fn translate_block(
         t.set_status(status)?;
         t.a.b(epilogue);
     }
-    // Back to the engine: the flags must be in `rflags`.
+    // Back to the engine through the shared `leave_routine`.
     t.a.bind(epilogue);
+    t.a.ldr(MemSize::B64, T1, CONTEXT, field(offset_of!(Context, leave)))?;
+    t.a.br(T1);
+    let faults = core::mem::take(&mut t.faults)
+        .into_iter()
+        .map(|(at, slow)| {
+            let target = t.a.position(slow).expect("slow paths are bound");
+            (at as u32, target as u32)
+        })
+        .collect();
+    Ok(Translation {
+        words: t.a.finish()?,
+        faults,
+    })
+}
+
+/// Where the engine enters translated code: `enter(cpu, page_table,
+/// context, block)` saves x19–x30 (callee-saved, and the return address),
+/// loads the guest's registers, `FLAGS` and the budget, and branches to the
+/// block (its `CHAINED_ENTRY`), which leaves through `leave_routine`.
+/// Shared by every block of a code buffer (`compat`: compatibility mode,
+/// whose blocks keep r8–r15's host registers untouched).
+pub fn enter_routine(compat: bool) -> Result<Vec<u32>, EncodeError> {
+    let mut t = Translator::bare(routine_options(compat));
+    // The block's address, before x3 takes a guest register.
+    t.a.mov(Width::X, T1, HostReg::new(3));
+    t.a.pair(
+        false,
+        PairMode::PreIndex,
+        HostReg::new(19),
+        HostReg::new(20),
+        SP,
+        -96,
+    )?;
+    for (i, n) in [21u8, 23, 25, 27, 29].into_iter().enumerate() {
+        let offset = 16 * (i as i32 + 1);
+        t.a.pair(
+            false,
+            PairMode::Offset,
+            HostReg::new(n),
+            HostReg::new(n + 1),
+            SP,
+            offset,
+        )?;
+    }
+    t.guest_registers(true)?;
+    t.vector_registers(true)?;
+    t.a.ldr(MemSize::B64, FLAGS, CPU, field(offset_of!(Cpu, rflags)))?;
+    t.a.ldr(
+        MemSize::B64,
+        BUDGET,
+        CONTEXT,
+        field(offset_of!(Context, budget)),
+    )?;
+    t.a.br(T1);
+    t.a.finish()
+}
+
+/// Where translated code goes back to the engine (`Context::leave`), with
+/// the exit's rip in `EXIT_RIP` and its status in `Context::status`: the
+/// flags pending into `rflags`, the guest's registers and the budget back
+/// into the `Cpu` and the `Context`, x19–x30 restored, the status returned.
+pub fn leave_routine(compat: bool) -> Result<Vec<u32>, EncodeError> {
+    let mut t = Translator::bare(routine_options(compat));
     t.lazy = Lazy::Dynamic;
     t.materialize()?;
     t.a.str(MemSize::B64, FLAGS, CPU, field(offset_of!(Cpu, rflags)))?;
@@ -1304,17 +1312,19 @@ pub fn translate_block(
         field(offset_of!(Context, status)),
     )?;
     t.a.ret();
-    let faults = core::mem::take(&mut t.faults)
-        .into_iter()
-        .map(|(at, slow)| {
-            let target = t.a.position(slow).expect("slow paths are bound");
-            (at as u32, target as u32)
-        })
-        .collect();
-    Ok(Translation {
-        words: t.a.finish()?,
-        faults,
-    })
+    t.a.finish()
+}
+
+fn routine_options(compat: bool) -> Options {
+    Options {
+        features: HostFeatures::BASELINE,
+        chain: false,
+        concurrent: false,
+        compat,
+        host_reads: None,
+        page_table: true,
+        entry_kind: 0,
+    }
 }
 
 /// The routine that generated code calls (`blr`, address in
@@ -1323,46 +1333,15 @@ pub fn translate_block(
 /// start of a block, whatever the block before left pending. Clears
 /// `KIND`; uses `R` and `T1`–`T3`.
 pub fn flags_routine() -> Result<Vec<u32>, EncodeError> {
-    let mut t = Translator {
-        a: Assembler::new(),
-        epilogue: None,
-        status_entries: Vec::new(),
-        slow_paths: Vec::new(),
-        side_exits: Vec::new(),
-        last: false,
-        chain_stubs: Vec::new(),
-        page_edges: Vec::new(),
-        unaligned: Vec::new(),
-        underflows: Vec::new(),
-        denormals: Vec::new(),
-        zero_counts: Vec::new(),
-        kind_carries: Vec::new(),
-        nzcv_valid: false,
-        nzcv_now: false,
-        access_slow: None,
-        simple_address: None,
-        checked: Vec::new(),
-        known_aligned: false,
-        faults: Vec::new(),
-        write_edges: Vec::new(),
-        read_edges: Vec::new(),
-        misaligned: None,
-        misaligned_stubs: Vec::new(),
-        packed_underflows: Vec::new(),
-        live: STATUS_FLAGS,
-        skip_flags: false,
-        flags_emitted: 0,
-        options: Options {
-            features: HostFeatures::BASELINE,
-            chain: false,
-            concurrent: false,
-            compat: false,
-            host_reads: None,
-            page_table: true,
-            entry_kind: 0,
-        },
-        lazy: Lazy::Current,
-    };
+    let mut t = Translator::bare(Options {
+        features: HostFeatures::BASELINE,
+        chain: false,
+        concurrent: false,
+        compat: false,
+        host_reads: None,
+        page_table: true,
+        entry_kind: 0,
+    });
     // A table of branches indexed by `KIND` (codes are below 32): one
     // computed jump to the code for that operation.
     let table = t.a.new_label();
@@ -1732,6 +1711,42 @@ struct Translator {
 }
 
 impl Translator {
+    /// A translator with nothing emitted, the flags current.
+    fn bare(options: Options) -> Translator {
+        Translator {
+            a: Assembler::new(),
+            epilogue: None,
+            status_entries: Vec::new(),
+            slow_paths: Vec::new(),
+            side_exits: Vec::new(),
+            last: false,
+            chain_stubs: Vec::new(),
+            page_edges: Vec::new(),
+            unaligned: Vec::new(),
+            underflows: Vec::new(),
+            denormals: Vec::new(),
+            zero_counts: Vec::new(),
+            kind_carries: Vec::new(),
+            nzcv_valid: false,
+            nzcv_now: false,
+            access_slow: None,
+            simple_address: None,
+            checked: Vec::new(),
+            known_aligned: false,
+            faults: Vec::new(),
+            write_edges: Vec::new(),
+            read_edges: Vec::new(),
+            misaligned: None,
+            misaligned_stubs: Vec::new(),
+            packed_underflows: Vec::new(),
+            live: STATUS_FLAGS,
+            skip_flags: false,
+            flags_emitted: 0,
+            options,
+            lazy: Lazy::Current,
+        }
+    }
+
     /// Emits one instruction; returns whether execution falls through to
     /// the next one.
     fn instruction(&mut self, g: &GuestInstruction) -> Emit<bool> {
@@ -1862,9 +1877,16 @@ impl Translator {
                 match src {
                     Operand::Reg(reg) => self.read_reg(signed, rt, reg, src_size)?,
                     Operand::Mem(m) => {
-                        self.address(&m, next, true)?;
-                        self.check(Check::Read, bytes(src_size), at.rip, &mut slow)?;
-                        self.guest_load(signed, src_size, rt)?;
+                        match self.direct(&m, bytes(src_size), Check::Read, at.rip, &mut slow) {
+                            Some((base, offset)) => {
+                                self.load(signed, src_size, rt, base, offset)?
+                            }
+                            None => {
+                                self.address(&m, next, true)?;
+                                self.check(Check::Read, bytes(src_size), at.rip, &mut slow)?;
+                                self.guest_load(signed, src_size, rt)?;
+                            }
+                        }
                     }
                     Operand::Imm(_) => unreachable!("checked by supported"),
                 }
@@ -1908,7 +1930,14 @@ impl Translator {
                     }
                     _ => self.destination_in(dst, size, at, &mut slow, op != AluOp::Cmp)?,
                 };
-                let b = self.operand_in(B, src, size, at, &mut slow)?;
+                // A comparison's constant straight to `FB` too (after its
+                // only access).
+                let rt = if op == AluOp::Cmp && !self.skip_flags && matches!(src, Operand::Imm(_)) {
+                    FB
+                } else {
+                    B
+                };
+                let b = self.operand_in(rt, src, size, at, &mut slow)?;
                 let kind = match op {
                     AluOp::Add => {
                         self.arith(false, size, a, b)?;
@@ -4813,7 +4842,7 @@ impl Translator {
         // the instruction's only access, and a load that faults leaves its
         // register as it was, so the slow path still finds the flags
         // pending before (in `FA`/`FB`) intact.
-        let rt = if arith && defer && src.is_mem() {
+        let rt = if arith && defer && matches!(src, Operand::Mem(_) | Operand::Imm(_)) {
             FB
         } else {
             B
@@ -5159,7 +5188,9 @@ impl Translator {
             if a != FA {
                 self.a.mov(w, FA, a);
             }
-            self.a.mov(w, FB, b);
+            if b != FB {
+                self.a.mov(w, FB, b);
+            }
         }
         self.lazy = Lazy::Static(Pending::new(kind, size, mask));
     }

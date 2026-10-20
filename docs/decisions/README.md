@@ -58,6 +58,7 @@ Every significant decision has its own file `NNNN-title.md`. ADRs are never dele
 | [0045](0045-matrix-from-recorded-measurements.md) | The compatibility matrix generated from recorded measurements | Accepted (2026-10-15) |
 | [0046](0046-permission-checks-by-the-host-mmu.md) | Permission checks by the host's MMU on hosts with 4K pages | Accepted (2026-10-20) |
 | [0047](0047-armor-as-the-windows-engine.md) | armor as the engine of Windows programs, behind Wine's WoW64 and ARM64EC interfaces | Accepted (2026-10-20) |
+| [0048](0048-translations-cached-on-disk.md) | Translations cached on disk | Proposed |
 
 ## Template
 ```markdown
