@@ -149,6 +149,7 @@ impl CodeBuffer {
     /// Addresses returned before become invalid; the caller must drop them
     /// (calling one would run whatever is published there later).
     pub fn reset(&mut self) {
+        crate::stats::perf_map_forget(self.exec.as_ptr(), self.used);
         self.used = 0;
     }
 

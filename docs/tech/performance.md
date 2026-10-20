@@ -76,7 +76,7 @@ perf report -i /tmp/perf.data --no-children --percent-limit 1.5 --stdio
 `perf_event_paranoid` is 2 on the host: you can profile your own processes in user space.
 
 ### Profiling the translated code (since 2026-10-15)
-With **`ARMOR_PERF_MAP=1`** armor appends one line per translated block to `/tmp/perf-<pid>.map`, the file `perf report` reads for code without symbols: host address, size, and the block's guest address and length (`x86 0x77ae75c3e0 (16 instructions)`). The guest address minus the program's load address (`/proc/<pid>/maps`, or the first block of the program) is the offset to disassemble with `x86_64-linux-gnu-objdump -d --start-address=…`. ✅ 2026-10-15, on 7-Zip (below). Limits: when the code buffer fills up and is flushed, new blocks reuse old addresses and the older lines stay in the file; the file is never removed.
+With **`ARMOR_PERF_MAP=1`** armor appends one line per translated block to `/tmp/perf-<pid>.map`, the file `perf report` reads for code without symbols: host address, size, and the block's guest address and length (`x86 0x77ae75c3e0 (16 instructions)`). The guest address minus the program's load address (`/proc/<pid>/maps`, or the first block of the program) is the offset to disassemble with `x86_64-linux-gnu-objdump -d --start-address=…`. ✅ 2026-10-15, on 7-Zip (below). When a code buffer is emptied (full, a new code generation, concurrent mode, a change of MXCSR's control bits), its lines are dropped from the file (since 2026-10-20: before, perf named samples after whichever old block it found at the address, and two blocks of `libm`'s startup looked like 12% of 7-Zip's instructions); samples taken before the last emptying are then named after the blocks that came later. The file is never removed.
 ```bash
 ARMOR_PERF_MAP=1 perf record -F 2000 -o /tmp/perf.data target/release/armor --jit --root target/guest/rootfs-games target/bench/7zip-x64/7zz a -txz -mx=9 -mmt=1 -so -an "$PWD/target/bench/7zip-input.bin" > /dev/null
 perf report -i /tmp/perf.data --no-children --sort sym --stdio
@@ -582,3 +582,23 @@ armor is now faster than box64 on `start-static` and `threads` (where box64 fail
 
 ## Writes checked by the host (ADR-0046, 2026-10-20)
 `jit.md`, "Writes checked by the host, the stack with writeback". Single runs of the bench commands on the same day, before (350064f) and after: 7-Zip 13.9 → 13.6 s; Python's integer loop 937 → about 800 ms (780–825), its float loop 792 → about 700 ms (695–720). Python's dictionary lookup starts with six pushes, each from 7 AArch64 instructions (an address, the table check with its dependent load, the store, the new rsp) to 3.
+
+## 7-Zip under the per-block comparison (M11, 2026-10-20)
+The `7zip` workload (`7zz a -txz -mx=9 -mmt=1` of `target/bench/7zip-input.bin`), measured with `perf stat` and `perf record` on the Pi 5 (4K pages), each engine alone on the machine:
+- ✅ **Two threads.** Even with `-mmt=1`, 7-Zip's xz encoder runs its binary-tree match finder in a thread of its own: the CPU time is larger than the elapsed time under every engine (native 9.0 s of CPU, box64 10.8 s, armor 20.7 s before the changes below), and with two threads armor translates in concurrent mode (ADR-0023). The match finder's thread is the busier one under armor.
+- ✅ **Instructions, not stalls:** 26.2 G instructions natively, 38.6 G under box64, 104.2 G under armor, at 1.5 and 2.1 instructions per cycle: armor's extra cycles come from the extra instructions.
+- **Where they go:** `perf record -e instructions:u --user-regs=lr` attributes the samples of the flag routine to its callers through the return address: **14.6% of all instructions** were the routine, called from three blocks of the match finder (`0x22c4e0`, `0x22c42b`, `0x22c4c0`) whose first instruction is `inc` or `dec` while CF of the flags pending from the block before is live (it must be exact at the block's side exits and slow paths). box64's code for the same addresses (`BOX64_DYNAREC_DUMP=1`, one block per function with its jumps inside) has no check on the accesses, no exits between those blocks and immediate offsets in its loads; armor's main path for the encoder's block at `0x5e44b` (35 x86 instructions) had about 95 AArch64 instructions against box64's 55: two for the check of each access, copies into `FA`/`FB`, zero-extensions of 32-bit offsets, the exits.
+- ✅ **What two hypotheses cost, measured by switching them off in a build made for the purpose (not modes of armor):** the check of the region on reads 3.7% (13.65 → 13.12 s); concurrent mode's ordered accesses 6.5% (10.47 → 9.80 s, at the end of the changes below).
+- The perf map named some samples wrongly: the code buffer is emptied twice in this run (a new code generation, then concurrent mode), and perf named a sample after whichever old block it found at the address. Fixed: an emptied buffer's lines leave the map (above, "How it is measured").
+
+**Changes** (`jit.md`, "Carries at block entry, operands from memory, 32-bit offsets, alignment in the host check"), times of the same command, two runs each, under 1% apart, the archive identical (SHA-256 `1611e3a6…`):
+
+| Change | 7zip |
+|---|---|
+| before | 13.65 s |
+| CF from the kind left pending (the routine falls from 14.6% to 2.4% of the instructions) | 11.44 s |
+| memory operands straight into `FA`/`FB` | 11.31 s |
+| 32-bit offsets in W registers (for 32-bit code; no change here) | 11.35 s |
+| alignment tested with the region in concurrent mode | 10.47 s |
+
+From 13.65 to 10.47 s (−23%); box64 takes 6.8 s and FEX 8.5 s on this workload (`bench` of 2026-10-20, above).

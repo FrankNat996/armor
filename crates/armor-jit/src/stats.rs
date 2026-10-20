@@ -120,19 +120,57 @@ pub fn interpreted_summary() -> String {
 static PERF_MAP: std::sync::OnceLock<Option<std::sync::Mutex<std::fs::File>>> =
     std::sync::OnceLock::new();
 
+fn perf_map_file() -> Option<&'static std::sync::Mutex<std::fs::File>> {
+    PERF_MAP
+        .get_or_init(|| {
+            std::env::var_os("ARMOR_PERF_MAP")?;
+            let path = format!("/tmp/perf-{}.map", std::process::id());
+            std::fs::OpenOptions::new()
+                .create(true)
+                .read(true)
+                .append(true)
+                .open(path)
+                .ok()
+                .map(std::sync::Mutex::new)
+        })
+        .as_ref()
+}
+
+/// Drops the perf map's lines for code in `[start, start + len)`: a code
+/// buffer was emptied, and its addresses will name other blocks (perf
+/// would otherwise name a sample after whichever old block it finds).
+pub fn perf_map_forget(start: *const u8, len: usize) {
+    let Some(file) = perf_map_file() else {
+        return;
+    };
+    use std::io::{Read, Seek, Write};
+    let mut file = file.lock().expect("perf map lock");
+    let mut text = String::new();
+    if file
+        .rewind()
+        .and_then(|_| file.read_to_string(&mut text))
+        .is_err()
+    {
+        return;
+    }
+    let range = start as usize..start as usize + len;
+    let kept: String = text
+        .lines()
+        .filter(|line| {
+            let address = line.split(' ').next().unwrap_or("");
+            usize::from_str_radix(address, 16).map_or(true, |a| !range.contains(&a))
+        })
+        .flat_map(|line| [line, "\n"])
+        .collect();
+    // Append mode writes at the end, which is now the start.
+    let _ = file
+        .set_len(0)
+        .and_then(|_| file.write_all(kept.as_bytes()));
+}
+
 /// Records a published block in the perf map, if there is one.
 pub fn perf_map(code: *const u8, bytes: usize, rip: u64, instructions: usize) {
-    let map = PERF_MAP.get_or_init(|| {
-        std::env::var_os("ARMOR_PERF_MAP")?;
-        let path = format!("/tmp/perf-{}.map", std::process::id());
-        std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)
-            .ok()
-            .map(std::sync::Mutex::new)
-    });
-    if let Some(file) = map {
+    if let Some(file) = perf_map_file() {
         use std::io::Write;
         let line = format!(
             "{:x} {bytes:x} x86 {rip:#x} ({instructions} instructions)\n",

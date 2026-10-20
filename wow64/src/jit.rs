@@ -223,6 +223,7 @@ impl Engine {
                     if status == EXIT_CHAIN {
                         self.chain(self.context.site, epoch, cpu.rip, mem);
                     }
+                    self.context.exit_kind = 0;
                     status == EXIT_INTERPRET
                 }
             };
@@ -316,6 +317,7 @@ impl Engine {
             // and the host's protections are the guest's.
             host_reads: Some(32),
             page_table: false,
+            entry_kind: core::mem::take(&mut self.context.exit_kind),
         };
         let Ok(translation) = translate_block(&block, end, options) else {
             return Entry::Interpret;

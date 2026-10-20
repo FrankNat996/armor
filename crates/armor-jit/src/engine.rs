@@ -330,6 +330,7 @@ impl Jit {
                     if status == EXIT_CHAIN {
                         self.chain(self.context.site, epoch, cpu.rip, mem);
                     }
+                    self.context.exit_kind = 0;
                     status == EXIT_INTERPRET
                 }
             };
@@ -561,6 +562,9 @@ impl Jit {
             compat: self.mode == Mode::Compat32,
             host_reads,
             page_table: true,
+            // What the exit that led here left pending (after a chain
+            // exit; 0 otherwise).
+            entry_kind: core::mem::take(&mut self.context.exit_kind),
         };
         let translation = translate_block(&block, end, options)
             .unwrap_or_else(|e| panic!("armor bug: cannot encode the block at {rip:#x}: {e}"));

@@ -94,6 +94,9 @@ pub struct Context {
     /// address, executable address of that block's `CHAINED_ENTRY`),
     /// indexed by `target_slot`. Kept by the engine.
     pub targets: u64,
+    /// After `EXIT_CHAIN`: `KIND` as the exit left it, before the epilogue
+    /// made `FLAGS` current (`Options::entry_kind` for the target).
+    pub exit_kind: u64,
 }
 
 /// Entries of the indirect-jump table (`Context::targets`).
@@ -128,6 +131,11 @@ pub struct Options {
     /// Windows backend, ADR-0047) a misaligned write that crosses a page
     /// goes to the interpreter.
     pub page_table: bool,
+    /// `Context::kind` when the block was first reached: what the blocks
+    /// before it usually leave pending. An instruction that needs only CF
+    /// of those flags computes it inline when `KIND` still says so, and
+    /// calls the flag routine otherwise (`carry_from_kind`). 0: none.
+    pub entry_kind: u64,
 }
 
 /// A translated block: its words, and its guest loads that may fault on
@@ -994,11 +1002,15 @@ pub fn translate_block(
         underflows: Vec::new(),
         denormals: Vec::new(),
         zero_counts: Vec::new(),
+        kind_carries: Vec::new(),
         nzcv_valid: false,
         nzcv_now: false,
         access_slow: None,
         faults: Vec::with_capacity(block.len()),
         write_edges: Vec::with_capacity(16),
+        read_edges: Vec::new(),
+        misaligned: None,
+        misaligned_stubs: Vec::new(),
         packed_underflows: Vec::new(),
         live: STATUS_FLAGS,
         skip_flags: false,
@@ -1069,6 +1081,7 @@ pub fn translate_block(
             t.a.dmb(Barrier::Ish);
         }
         fell_through = t.instruction(g)?;
+        t.flush_misaligned();
         if vector_access {
             t.a.dmb(Barrier::IshLd);
         }
@@ -1096,12 +1109,22 @@ pub fn translate_block(
         t.a.mov_imm64(EXIT_RIP, rip);
         t.a.adr(T1, site);
         t.a.str(MemSize::B64, T1, CONTEXT, field(offset_of!(Context, site)))?;
+        t.a.ldr(MemSize::B64, T1, CONTEXT, field(offset_of!(Context, kind)))?;
+        t.a.str(
+            MemSize::B64,
+            T1,
+            CONTEXT,
+            field(offset_of!(Context, exit_kind)),
+        )?;
         let entry = t.status_entry(EXIT_CHAIN);
         t.a.b(entry);
     }
     // Unaligned writes the host checks: outside the region, the slow path;
     // within one page, the host; across two, both pages from the table.
-    for (edge, back, bytes, outside, slow) in core::mem::take(&mut t.write_edges) {
+    // In concurrent mode the unaligned case goes on to the plain access
+    // and barrier (`misaligned`), not back to the store-release.
+    for (edge, back, bytes, outside, slow, unaligned) in core::mem::take(&mut t.write_edges) {
+        let back = unaligned.unwrap_or(back);
         t.a.bind(edge);
         t.a.logic_imm(Logic::Ands, Width::X, ZR, ADDR, outside)?;
         t.a.b_cond(Cond::Ne, slow);
@@ -1117,9 +1140,27 @@ pub fn translate_block(
         t.a.tbz(false, T1, PAGE_WRITABLE_DATA_SPAN_BIT, slow);
         t.a.b(back);
     }
+    // Unaligned reads in concurrent mode: outside the region, the slow
+    // path; otherwise the plain load and barrier.
+    for (edge, outside, slow, unaligned) in core::mem::take(&mut t.read_edges) {
+        t.a.bind(edge);
+        t.a.logic_imm(Logic::Ands, Width::X, ZR, ADDR, outside)?;
+        t.a.b_cond(Cond::Ne, slow);
+        t.a.b(unaligned);
+    }
+    for (unaligned, after) in core::mem::take(&mut t.misaligned_stubs) {
+        t.a.bind(unaligned);
+        t.a.b(after);
+    }
     // Checks near the end of a page.
     for (edge, back, alone, bytes, slow) in core::mem::take(&mut t.page_edges) {
         t.page_edge(edge, back, alone, bytes, slow)?;
+    }
+    for (generic, back) in core::mem::take(&mut t.kind_carries) {
+        t.a.bind(generic);
+        t.lazy = Lazy::Dynamic;
+        t.materialize()?;
+        t.a.b(back);
     }
     // Ordered accesses to unaligned addresses (concurrent mode).
     for (entry, back, access) in core::mem::take(&mut t.unaligned) {
@@ -1239,11 +1280,15 @@ pub fn flags_routine() -> Result<Vec<u32>, EncodeError> {
         underflows: Vec::new(),
         denormals: Vec::new(),
         zero_counts: Vec::new(),
+        kind_carries: Vec::new(),
         nzcv_valid: false,
         nzcv_now: false,
         access_slow: None,
         faults: Vec::new(),
         write_edges: Vec::new(),
+        read_edges: Vec::new(),
+        misaligned: None,
+        misaligned_stubs: Vec::new(),
         packed_underflows: Vec::new(),
         live: STATUS_FLAGS,
         skip_flags: false,
@@ -1255,6 +1300,7 @@ pub fn flags_routine() -> Result<Vec<u32>, EncodeError> {
             compat: false,
             host_reads: None,
             page_table: true,
+            entry_kind: 0,
         },
         lazy: Lazy::Current,
     };
@@ -1503,6 +1549,27 @@ impl Pending {
         };
         Some(kind | size << 2 | u16::from(self.mask & FLAG_CF == 0) << 4)
     }
+
+    /// The operation of a `KIND` value (`code`'s inverse), operands in
+    /// `FA`/`FB`.
+    fn from_code(code: u64) -> Option<Pending> {
+        let kind = match code & 3 {
+            1 => FlagKind::Add,
+            2 => FlagKind::Sub,
+            3 => FlagKind::Logic,
+            _ => return None,
+        };
+        if code >> 5 != 0 {
+            return None;
+        }
+        let size = [Size::B8, Size::B16, Size::B32, Size::B64][(code >> 2 & 3) as usize];
+        let mask = if code & 16 != 0 {
+            STATUS_FLAGS & !FLAG_CF
+        } else {
+            STATUS_FLAGS
+        };
+        Some(Pending::new(kind, size, mask))
+    }
 }
 
 /// Where the status flags are, at a point of the generated code.
@@ -1549,6 +1616,9 @@ struct Translator {
     /// flags before it): the pending flags into `FLAGS`, where the shift's
     /// deferred flags then find them (`lazy_shift`).
     zero_counts: Vec<(Label, Label, Lazy)>,
+    /// Out of line: CF when `KIND` is not the expected one (entry, back):
+    /// the flag routine (`carry_from_kind`).
+    kind_carries: Vec<(Label, Label)>,
     /// The host NZCV holds the pending operation's flags, redone for a
     /// condition (`redo_nzcv`), up to the end of the current instruction.
     nzcv_valid: bool,
@@ -1564,7 +1634,19 @@ struct Translator {
     faults: Vec<(usize, Label)>,
     /// Out of line: writes the host checks whose address is not aligned
     /// (entry, back, size, the bits outside the region, slow path).
-    write_edges: Vec<(Label, Label, u32, u64, Label)>,
+    write_edges: Vec<(Label, Label, u32, u64, Label, Option<Label>)>,
+    /// Out of line: reads the host checks whose address is not aligned, in
+    /// concurrent mode (entry, the bits outside the region, slow path,
+    /// where an unaligned access goes: `misaligned`).
+    read_edges: Vec<(Label, u64, Label, Label)>,
+    /// In concurrent mode with host protection, the check of the access
+    /// about to be made also tested its alignment (`check`): where its
+    /// unaligned case goes (taken by `guest_load` or `guest_store` for
+    /// their out-of-line access), and the point right after the check.
+    misaligned: Option<(Label, Label)>,
+    /// Out of line: an unaligned case no ordered access took (an access
+    /// of another kind): back to right after the check.
+    misaligned_stubs: Vec<(Label, Label)>,
     /// Out of line: UFC after packed floating point (entry, slow path;
     /// `slow_if_underflow`).
     packed_underflows: Vec<(Label, Label)>,
@@ -1729,10 +1811,8 @@ impl Translator {
                     (Some(h), Base::Gpr(n)) if register_host(n).is_some() => h,
                     _ => ADDR,
                 };
-                self.address_into(rd, &src, next, false)?;
-                if w == Width::W {
-                    self.a.mov(Width::W, rd, rd);
-                }
+                // A 32-bit offset computed in W registers (zero-extended).
+                self.address_into_w(rd, &src, next, false, w == Width::W)?;
                 if rd == ADDR {
                     self.store_reg(dst, size, ADDR)?;
                 }
@@ -1745,7 +1825,17 @@ impl Translator {
                 self.alu_in_place(op, h, src, size, at, &mut slow)?;
             }
             Op::Alu { op, dst, src } => {
-                let a = self.destination_in(dst, size, at, &mut slow, op != AluOp::Cmp)?;
+                let a = match dst {
+                    // A comparison's memory operand straight to `FA`, as in
+                    // `alu_in_place`: its only access.
+                    Operand::Mem(m) if op == AluOp::Cmp && !self.skip_flags => {
+                        self.address(&m, at.next, true)?;
+                        self.check(Check::Read, bytes(size), at.rip, &mut slow)?;
+                        self.guest_load(false, size, FA)?;
+                        FA
+                    }
+                    _ => self.destination_in(dst, size, at, &mut slow, op != AluOp::Cmp)?,
+                };
                 let b = self.operand_in(B, src, size, at, &mut slow)?;
                 let kind = match op {
                     AluOp::Add => {
@@ -3757,15 +3847,16 @@ impl Translator {
             return self.load(signed, size, rt, ADDR, 0);
         }
         let fault = self.access_slow;
-        let back = self.unaligned_test(
+        let access = Unaligned::Load {
+            signed,
             size,
-            Unaligned::Load {
-                signed,
-                size,
-                rt,
-                fault,
-            },
-        );
+            rt,
+            fault,
+        };
+        let back = match self.misaligned.take() {
+            Some((entry, _)) => Some(self.unaligned_at(entry, access)),
+            None => self.unaligned_test(size, access),
+        };
         self.mark_access();
         if self.options.features.rcpc {
             self.a.ldapr(mem_size(size), rt, ADDR);
@@ -3791,7 +3882,11 @@ impl Translator {
             return self.a.str(mem_size(size), rt, ADDR, 0);
         }
         let fault = self.access_slow;
-        let back = self.unaligned_test(size, Unaligned::Store { size, rt, fault });
+        let access = Unaligned::Store { size, rt, fault };
+        let back = match self.misaligned.take() {
+            Some((entry, _)) => Some(self.unaligned_at(entry, access)),
+            None => self.unaligned_test(size, access),
+        };
         self.mark_access();
         self.a.stlr(mem_size(size), rt, ADDR);
         if let Some(back) = back {
@@ -3814,6 +3909,22 @@ impl Translator {
         }
         self.unaligned.push((entry, back, access));
         Some(back)
+    }
+
+    /// The out-of-line `access` for an unaligned address that `check`
+    /// already sends to `entry`; returns where it comes back.
+    fn unaligned_at(&mut self, entry: Label, access: Unaligned) -> Label {
+        let back = self.a.new_label();
+        self.unaligned.push((entry, back, access));
+        back
+    }
+
+    /// An unaligned case of `check` that no ordered access took goes back
+    /// to right after the check (the access made there allows it).
+    fn flush_misaligned(&mut self) {
+        if let Some(stub) = self.misaligned.take() {
+            self.misaligned_stubs.push(stub);
+        }
     }
 
     /// The out-of-line part of an unaligned ordered access: a plain access
@@ -4331,6 +4442,26 @@ impl Translator {
     /// requires a mapped base, so that no partial sum overwrites a
     /// register still to be read. Uses `T1`.
     fn address_into(&mut self, rd: HostReg, mem: &Mem, next: u64, segment: bool) -> Emit {
+        self.address_into_w(rd, mem, next, segment, false)
+    }
+
+    /// `address_into`, as a 32-bit offset when `w32` (lea of a 32-bit
+    /// register) or the address is 32 bits: computed modulo 2^32 in W
+    /// registers, whose writes clear the top half, without a zero-extension
+    /// after.
+    fn address_into_w(
+        &mut self,
+        rd: HostReg,
+        mem: &Mem,
+        next: u64,
+        segment: bool,
+        w32: bool,
+    ) -> Emit {
+        let w = if w32 || mem.addr32 {
+            Width::W
+        } else {
+            Width::X
+        };
         let mut disp = mem.disp as u64;
         let shift = u32::from(mem.scale).trailing_zeros();
         match mem.base {
@@ -4346,10 +4477,10 @@ impl Translator {
                 match mem.index {
                     Some(index) => {
                         let index = self.register_in(T1, index)?;
-                        self.a.add(Width::X, rd, base, index, Shift::Lsl, shift)?;
+                        self.a.add(w, rd, base, index, Shift::Lsl, shift)?;
                     }
                     None => {
-                        self.offset_into(rd, base, disp)?;
+                        self.offset_into_w(rd, base, disp, w)?;
                         disp = 0;
                     }
                 }
@@ -4365,19 +4496,17 @@ impl Translator {
                     Some(index) => {
                         // The scaled index first: `rd` may be the index.
                         let index = self.register_in(T1, index)?;
-                        self.a.shift_imm(Shift::Lsl, Width::X, rd, index, shift)?;
-                        self.add_constant(rd, value)?;
+                        self.a.shift_imm(Shift::Lsl, w, rd, index, shift)?;
+                        self.add_constant_w(rd, value, w)?;
                     }
+                    None if w == Width::W => self.a.mov_imm64(rd, value & u64::from(u32::MAX)),
                     None => self.a.mov_imm64(rd, value),
                 }
             }
         }
-        self.add_constant(rd, disp)?;
         // The address-size prefix, and every address in compatibility
-        // mode: a 32-bit offset.
-        if mem.addr32 {
-            self.zero_extend_32(rd)?;
-        }
+        // mode: a 32-bit offset, already zero-extended by the W operations.
+        self.add_constant_w(rd, disp, w)?;
         if segment {
             let base = match mem.segment {
                 Segment::Default => None,
@@ -4386,12 +4515,14 @@ impl Translator {
             };
             if let Some(offset) = base {
                 self.a.ldr(MemSize::B64, T1, CPU, field(offset))?;
-                self.a.add(Width::X, ADDR, ADDR, T1, Shift::Lsl, 0)?;
                 // In compatibility mode the sum wraps at 4 GiB too (i386
                 // glibc reads its TLS at negative offsets from gs).
-                if self.options.compat {
-                    self.zero_extend_32(ADDR)?;
-                }
+                let w = if self.options.compat {
+                    Width::W
+                } else {
+                    Width::X
+                };
+                self.a.add(w, ADDR, ADDR, T1, Shift::Lsl, 0)?;
             }
         }
         Ok(())
@@ -4409,23 +4540,33 @@ impl Translator {
         }
     }
 
-    /// `rd` = `base` + `value`, in one instruction when it fits an
-    /// immediate. Uses `T1` otherwise.
-    fn offset_into(&mut self, rd: HostReg, base: HostReg, value: u64) -> Emit {
-        let negated = value.wrapping_neg();
+    /// `rd` = `base` + `value` at width `w`, in one instruction when it
+    /// fits an immediate (uses `T1` otherwise); with W, modulo 2^32 and
+    /// zero-extended (a copy too, when `rd` is `base`).
+    fn offset_into_w(&mut self, rd: HostReg, base: HostReg, value: u64, w: Width) -> Emit {
+        let value = if w == Width::W {
+            value & u64::from(u32::MAX)
+        } else {
+            value
+        };
+        let negated = if w == Width::W {
+            u64::from((value as u32).wrapping_neg())
+        } else {
+            value.wrapping_neg()
+        };
         if value < 1 << 12 {
             if value == 0 {
-                if rd != base {
-                    self.a.mov(Width::X, rd, base);
+                if rd != base || w == Width::W {
+                    self.a.mov(w, rd, base);
                 }
                 return Ok(());
             }
-            self.a.add_imm(Width::X, rd, base, value as u32)
+            self.a.add_imm(w, rd, base, value as u32)
         } else if negated < 1 << 12 {
-            self.a.sub_imm(Width::X, rd, base, negated as u32)
+            self.a.sub_imm(w, rd, base, negated as u32)
         } else {
             self.a.mov_imm64(T1, value);
-            self.a.add(Width::X, rd, base, T1, Shift::Lsl, 0)
+            self.a.add(w, rd, base, T1, Shift::Lsl, 0)
         }
     }
 
@@ -4464,11 +4605,21 @@ impl Translator {
             }
             _ => None,
         };
+        let defer = !self.skip_flags;
+        // A memory operand of an addition, subtraction or comparison goes
+        // straight to `FB`, where the deferred flags keep it: the load is
+        // the instruction's only access, and a load that faults leaves its
+        // register as it was, so the slow path still finds the flags
+        // pending before (in `FA`/`FB`) intact.
+        let rt = if arith && defer && src.is_mem() {
+            FB
+        } else {
+            B
+        };
         let b = match imm {
             Some(_) => None,
-            None => Some(self.operand_in(B, src, size, at, slow)?),
+            None => Some(self.operand_in(rt, src, size, at, slow)?),
         };
-        let defer = !self.skip_flags;
         if arith {
             if defer {
                 // The operands stay where they are (`Held`): the second a
@@ -4477,6 +4628,7 @@ impl Translator {
                 // addition or a subtraction. Unless the two are the same
                 // register: then nothing could give the first back.
                 let b_held = match (b, src) {
+                    (Some(FB), _) => Some(Held::Fb),
                     (Some(B), _) => {
                         self.a.mov(w, FB, B);
                         Some(Held::Fb)
@@ -4594,24 +4746,29 @@ impl Translator {
         self.lazy = Lazy::Static(Pending::new(FlagKind::Logic, size, STATUS_FLAGS));
     }
 
-    /// `reg &= 0xffff_ffff`.
-    fn zero_extend_32(&mut self, reg: HostReg) -> Emit {
-        self.a
-            .logic_imm(Logic::And, Width::X, reg, reg, u64::from(u32::MAX))
-    }
-
     /// `reg += value` (modulo 2^64).
     fn add_constant(&mut self, reg: HostReg, value: u64) -> Emit {
-        let negated = value.wrapping_neg();
+        self.add_constant_w(reg, value, Width::X)
+    }
+
+    /// `reg += value` at width `w` (with W, modulo 2^32: `reg` must already
+    /// be zero-extended, as nothing is written for 0).
+    fn add_constant_w(&mut self, reg: HostReg, value: u64, w: Width) -> Emit {
+        let (value, negated) = if w == Width::W {
+            let v = value as u32;
+            (u64::from(v), u64::from(v.wrapping_neg()))
+        } else {
+            (value, value.wrapping_neg())
+        };
         if value == 0 {
             Ok(())
         } else if value < 1 << 12 {
-            self.a.add_imm(Width::X, reg, reg, value as u32)
+            self.a.add_imm(w, reg, reg, value as u32)
         } else if negated < 1 << 12 {
-            self.a.sub_imm(Width::X, reg, reg, negated as u32)
+            self.a.sub_imm(w, reg, reg, negated as u32)
         } else {
             self.a.mov_imm64(T1, value);
-            self.a.add(Width::X, reg, reg, T1, Shift::Lsl, 0)
+            self.a.add(w, reg, reg, T1, Shift::Lsl, 0)
         }
     }
 
@@ -4621,12 +4778,27 @@ impl Translator {
     /// take the slow path too, so that the interpreter invalidates the
     /// translated code (self-modifying code).
     fn check(&mut self, check: Check, bytes: u32, rip: u64, slow: &mut Option<Label>) -> Emit {
+        self.flush_misaligned();
         let slow = self.slow_path(rip, slow);
         // ADR-0046: the host checks reads below the guest's region's end;
         // above it, the interpreter.
         if let Some(bits) = self.options.host_reads {
             let outside = !((1u64 << bits) - 1);
             self.access_slow = Some(slow);
+            let misaligned = u64::from(bytes.next_power_of_two() - 1);
+            if check == Check::Read && bytes > 1 && self.options.concurrent {
+                // Ordered loads need alignment: one test for both, the
+                // unaligned case out of line (`read_edges`).
+                let (edge, after, unaligned) =
+                    (self.a.new_label(), self.a.new_label(), self.a.new_label());
+                self.a
+                    .logic_imm(Logic::Ands, Width::X, ZR, ADDR, outside | misaligned)?;
+                self.a.b_cond(Cond::Ne, edge);
+                self.a.bind(after);
+                self.read_edges.push((edge, outside, slow, unaligned));
+                self.misaligned = Some((unaligned, after));
+                return Ok(());
+            }
             if check == Check::Read || bytes == 1 {
                 // A read faults or not as a whole; a byte cannot cross.
                 self.a.logic_imm(Logic::Ands, Width::X, ZR, ADDR, outside)?;
@@ -4638,12 +4810,16 @@ impl Translator {
             // nothing. An aligned one cannot cross: one test for both, the
             // rest out of line (`write_edges`).
             let (edge, back) = (self.a.new_label(), self.a.new_label());
-            let misaligned = u64::from(bytes.next_power_of_two() - 1);
             self.a
                 .logic_imm(Logic::Ands, Width::X, ZR, ADDR, outside | misaligned)?;
             self.a.b_cond(Cond::Ne, edge);
             self.a.bind(back);
-            self.write_edges.push((edge, back, bytes, outside, slow));
+            let unaligned = self.options.concurrent.then(|| self.a.new_label());
+            if let Some(unaligned) = unaligned {
+                self.misaligned = Some((unaligned, back));
+            }
+            self.write_edges
+                .push((edge, back, bytes, outside, slow, unaligned));
             return Ok(());
         }
         self.a
@@ -4753,7 +4929,9 @@ impl Translator {
         if kind == FlagKind::Logic {
             self.a.mov(Width::X, FA, R);
         } else {
-            self.a.mov(w, FA, a);
+            if a != FA {
+                self.a.mov(w, FA, a);
+            }
             self.a.mov(w, FB, b);
         }
         self.lazy = Lazy::Static(Pending::new(kind, size, mask));
@@ -4803,8 +4981,47 @@ impl Translator {
                     .cset(Width::X, T1, if sub { Cond::Lo } else { Cond::Hs });
                 self.a.bfm_insert(Width::X, FLAGS, T1, 0, 0)
             }
+            Lazy::Dynamic => match Pending::from_code(self.options.entry_kind) {
+                Some(p) => self.carry_from_kind(p),
+                None => self.materialize(),
+            },
             _ => self.materialize(),
         }
+    }
+
+    /// CF into `FLAGS` from the operation `KIND` describes, inline for `p`
+    /// (the one expected there), the flag routine otherwise. The flags stay
+    /// `Lazy::Dynamic`: `KIND` and `FA`/`FB` still describe them, and CF in
+    /// `FLAGS` agrees with them (the routine, when it runs, makes all of
+    /// `FLAGS` current and clears `KIND`). Uses `R`, `T1`, `T3`, `T4`.
+    fn carry_from_kind(&mut self, p: Pending) -> Emit {
+        let code = p.code().expect("a plain operation");
+        let (generic, back) = (self.a.new_label(), self.a.new_label());
+        self.a
+            .ldr(MemSize::B64, T1, CONTEXT, field(offset_of!(Context, kind)))?;
+        self.a.subs_imm(Width::X, ZR, T1, u32::from(code))?;
+        self.a.b_cond(Cond::Ne, generic);
+        if p.mask & FLAG_CF != 0 {
+            match p.kind {
+                FlagKind::Logic => {
+                    self.a
+                        .logic_imm(Logic::And, Width::X, FLAGS, FLAGS, !FLAG_CF)?;
+                }
+                kind => {
+                    self.redo(p)?;
+                    let sub = kind == FlagKind::Sub;
+                    self.a
+                        .cset(Width::X, T1, if sub { Cond::Lo } else { Cond::Hs });
+                    self.a.bfm_insert(Width::X, FLAGS, T1, 0, 0)?;
+                }
+            }
+        }
+        // (An increment's or decrement's pending flags leave CF in `FLAGS`.)
+        self.a.bind(back);
+        self.kind_carries.push((generic, back));
+        self.nzcv_valid = false;
+        self.nzcv_now = false;
+        Ok(())
     }
 
     /// The register holding `h`, a constant loaded into `scratch`.

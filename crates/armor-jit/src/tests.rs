@@ -1306,6 +1306,7 @@ fn concurrent_mode_emits_ordered_accesses() {
                 compat: false,
                 host_reads: None,
                 page_table: true,
+                entry_kind: 0,
             },
         )
         .unwrap()
@@ -1344,6 +1345,7 @@ fn concurrent_mode_emits_lse_atomics() {
             compat: false,
             host_reads: None,
             page_table: true,
+            entry_kind: 0,
         };
         translate(&block, end, options).unwrap()
     };
@@ -1402,6 +1404,7 @@ fn dead_flags_are_not_computed() {
         compat: false,
         host_reads: None,
         page_table: true,
+        entry_kind: 0,
     };
     let words = translate(&block, BlockEnd::Continue(0x1000 + at as u64), options).unwrap();
     let is_mrs_nzcv = |w: &u32| w & 0xFFFF_FFE0 == 0xD53B_4200;
@@ -2013,6 +2016,7 @@ fn dump_translation() {
                 .ok()
                 .map(|b| b.parse().unwrap()),
             page_table: true,
+            entry_kind: 0,
         },
     )
     .unwrap();
@@ -2023,6 +2027,34 @@ fn dump_translation() {
         block.len(),
         words.len()
     );
+}
+
+/// A block entered with flags pending from blocks of different kinds
+/// (an 8-bit subtraction, a 32-bit addition, a logical operation, an
+/// increment that keeps CF), whose `inc` needs only CF of them: inline for
+/// the kind seen when it was translated, through the flag routine for the
+/// others (`carry_from_kind`). `adc` sums the carries; the first entry,
+/// and so the expected kind, depends on the count.
+#[test]
+fn carry_from_the_kind_left_pending() {
+    let guest = Guest::new();
+    let mut rng = Rng(53);
+    #[rustfmt::skip]
+    let code = [
+        0x89, 0xc8, 0x83, 0xe0, 0x03, 0x74, 0x0f, 0x83, 0xf8, 0x01, 0x74, 0x0e, // mov eax, ecx; and eax, 3; jz a; cmp eax, 1; je b
+        0x83, 0xf8, 0x02, 0x74, 0x0e, 0x45, 0x38, 0xec, 0xeb, 0x0e, // cmp eax, 2; je c; cmp r12b, r13b; jmp join
+        0x01, 0xf2, 0xeb, 0x0a, // a: add edx, esi; jmp join
+        0x4d, 0x21, 0xda, 0xeb, 0x05, // b: and r10, r11; jmp join
+        0x49, 0xff, 0xc1, 0xeb, 0x00, // c: inc r9; jmp join
+        0x48, 0xff, 0xc7, 0x49, 0x83, 0xd0, 0x00, // join: inc rdi; adc r8, 0
+        0x49, 0xc1, 0xc4, 0x07, 0x4d, 0x01, 0xe5, 0x44, 0x01, 0xe6, // rol r12, 7; add r13, r12; add esi, r12d
+        0xff, 0xc9, 0x75, 0xc7, // dec ecx; jnz loop
+    ];
+    for round in 0..64u64 {
+        let mut cpu = guest.cpu(&mut rng);
+        cpu.regs[1] = 200 + round;
+        guest.compare(&code, &cpu, round);
+    }
 }
 
 /// The flags that wait as operands and are computed by whoever observes
