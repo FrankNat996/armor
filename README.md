@@ -90,7 +90,7 @@ Cortex-A76, 4K pages, Debian GNU/Linux 13 (native) — `cargo xtask bench --box6
 
 `7zip`: 7-Zip 26.04's Linux build compressing 12 MB; `integer`, `float`, `simd`, `syscall`, `memory`, `threads`: small C programs, one per kind of work (`tests/bench/`); `python-*`: Python 3.13 starting, and looping on integers and floats; `start-*`: a hello world. Reproduce with `cargo xtask bench --box64 --fex` ([how it works](docs/tech/performance.md)).
 
-What the numbers say: box64 is the fastest translator on computation; armor comes second on most workloads, starts a static program fastest and beats qemu everywhere. FEX takes about a second to start each program in this setup, which dominates the short workloads; on 7-Zip, the longest, FEX is at 1.4 times native and armor at 2.7. box64 crashes on the `threads` workload. On the correctness test cases, measured on 2026-10-20 with `difftest --engine` on the same machine and pages: armor 470/470, FEX 412/470, box64 254/470 ([details](docs/tech/engines.md)).
+What the numbers say: box64 is the fastest translator on computation; armor comes second on most workloads, starts a static program fastest and beats qemu everywhere. FEX takes about a second to start each program in this setup, which dominates the short workloads; on 7-Zip, the longest, box64 is at 1.13 times native, FEX at 1.4 and armor at 1.7 (2.7 before the JIT changes of 2026-10-20). box64 crashes on the `threads` workload. On the correctness test cases, measured on 2026-10-20 with `difftest --engine` on the same machine and pages: armor 470/470, FEX 412/470, box64 254/470 ([details](docs/tech/engines.md)).
 
 ## Tested on
 
