@@ -19,7 +19,7 @@ Every significant decision has its own file `NNNN-title.md`. ADRs are never dele
 | [0006](0006-license.md) | License: MIT OR Apache-2.0 | Accepted (2026-10-12) |
 | [0007](0007-project-name.md) | Project name: armor | Accepted (2026-10-12) |
 | [0008](0008-dependencies.md) | Dependencies: `libc` for host syscalls, our own ELF parser | Accepted (2026-10-12) |
-| [0009](0009-4k-permission-table.md) | 4K pages in M1: software permission table, host pages always RW | Accepted (2026-10-12) |
+| [0009](0009-4k-permission-table.md) | 4K pages in M1: software permission table, host pages always RW | Accepted (2026-10-12); superseded by 0046 on hosts with 4K pages |
 | [0010](0010-cpuid-model.md) | CPUID: qemu64 model reduced to the implemented features | Accepted (2026-10-12) |
 | [0011](0011-dynamic-linking-rootfs.md) | Dynamic linking: the real x86-64 `ld.so` from a guest rootfs; M5 brought forward | Accepted (2026-10-12) |
 | [0012](0012-file-mmap-by-copy.md) | File `mmap`: copy into anonymous memory (4K on 16K hosts) | Accepted (2026-10-12); superseded by 0022 for `MAP_SHARED` |
@@ -56,6 +56,8 @@ Every significant decision has its own file `NNNN-title.md`. ADRs are never dele
 | [0043](0043-other-distributions.md) | Other distributions: one archive of armor, Debian's libraries and Hangover's Debian build everywhere | Accepted (2026-10-15) |
 | [0044](0044-every-x86-64-syscall-handled.md) | Every x86-64 syscall handled: as the kernel would answer | Accepted (2026-10-15) |
 | [0045](0045-matrix-from-recorded-measurements.md) | The compatibility matrix generated from recorded measurements | Accepted (2026-10-15) |
+| [0046](0046-permission-checks-by-the-host-mmu.md) | Permission checks by the host's MMU on hosts with 4K pages | Accepted (2026-10-20) |
+| [0047](0047-armor-as-the-windows-engine.md) | armor as the engine of Windows programs, behind Wine's WoW64 and ARM64EC interfaces | Accepted (2026-10-20) |
 
 ## Template
 ```markdown

@@ -1,6 +1,6 @@
 # 0009 — 4K pages in M1: software permission table, host pages always RW
 
-- **Status:** Accepted (2026-10-12)
+- **Status:** Accepted (2026-10-12); superseded by 0046 on hosts with 4K pages
 - **Date:** 2026-10-12
 
 ## Context
