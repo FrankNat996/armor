@@ -1325,6 +1325,19 @@ fn translations_come_back_from_the_cache() {
     run_all();
     let (hits, stored) = cache::counts();
     assert!(stored > 0, "nothing recorded");
+    // A child of fork inherits the unsaved records: they are not its to
+    // save (a shell under armor forks for every command).
+    // SAFETY: the child only saves and exits.
+    let child = unsafe { libc::fork() };
+    if child == 0 {
+        cache::save();
+        // SAFETY: ends the child without running the test harness's exit.
+        unsafe { libc::_exit(0) };
+    }
+    let mut status = 0;
+    // SAFETY: waits for the child just forked.
+    assert_eq!(unsafe { libc::waitpid(child, &mut status, 0) }, child);
+    assert!(!path.exists(), "a forked child saved its parent's records");
     cache::save();
     assert!(path.is_file(), "no cache file");
     // A later run reads the file.

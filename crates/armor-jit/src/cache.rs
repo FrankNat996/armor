@@ -40,6 +40,9 @@ const MAX_FILE: u64 = 256 << 20;
 /// the files used least recently (by modification time, which `lookup`
 /// renews when it reads a file).
 const MAX_DIR: u64 = 1 << 30;
+/// Records not yet saved, at most: a guest that keeps generating code (a
+/// JIT of its own) stops adding past it.
+const MAX_NEW: usize = 64 << 20;
 /// Bytes of a record before its body: the body's length (u32), its
 /// checksum (u64).
 const HEADER: usize = 12;
@@ -97,6 +100,24 @@ struct State {
     /// Where the file's last whole record ends, when bytes follow it (a
     /// write cut short): `save` cuts them before appending.
     tail: Option<usize>,
+    /// The process `new` belongs to: a child of `fork` inherits the
+    /// parent's unsaved records, which are the parent's to save.
+    pid: u32,
+}
+
+impl State {
+    /// Drops what a forked child inherited of its parent's unsaved
+    /// records.
+    fn own(&mut self) {
+        let pid = std::process::id();
+        if pid != self.pid {
+            self.pid = pid;
+            self.new.clear();
+            for places in self.index.values_mut() {
+                places.retain(|p| matches!(p, Place::File(_)));
+            }
+        }
+    }
 }
 
 static STATE: Mutex<Option<State>> = Mutex::new(None);
@@ -113,6 +134,7 @@ pub fn configure(path: PathBuf) {
         index: Index::default(),
         new: Vec::new(),
         tail: None,
+        pid: std::process::id(),
     });
 }
 
@@ -131,6 +153,7 @@ pub fn counts() -> (u64, u64) {
 pub fn lookup(rip: u64, key: u64, fetch: impl Fn(u64, &mut [u8]) -> usize) -> Option<Hit> {
     let mut guard = STATE.lock().expect("cache lock");
     let state = guard.as_mut()?;
+    state.own();
     if !state.loaded {
         state.loaded = true;
         state.data = fs::read(&state.path).unwrap_or_default();
@@ -182,6 +205,10 @@ pub fn insert(rip: u64, key: u64, bytes: &[u8], words: &[u32], faults: &[(u32, u
     let Some(state) = guard.as_mut() else {
         return;
     };
+    state.own();
+    if state.new.len() > MAX_NEW {
+        return;
+    }
     let at = state.new.len();
     encode(&mut state.new, rip, key, n as u32, bytes, words, faults);
     push(&mut state.index, rip, key, Place::New(at));
@@ -205,6 +232,7 @@ pub fn save() {
     let Some(state) = guard.as_mut() else {
         return;
     };
+    state.own();
     if state.new.is_empty() {
         return;
     }
