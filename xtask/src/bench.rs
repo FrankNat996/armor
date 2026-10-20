@@ -80,7 +80,11 @@ const C_BENCHMARKS: &[(&str, &str, &[&str])] = &[
 /// What runs a workload.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 enum Runner {
+    /// With the JIT's cache on disk (ADR-0048) as later runs find it: the
+    /// first round fills it, the median is of warm runs.
     Jit,
+    /// The first run of a program: an empty cache each time.
+    JitCold,
     Interpreter,
     Qemu,
     Native,
@@ -94,6 +98,7 @@ impl Runner {
     fn label(self) -> &'static str {
         match self {
             Runner::Jit => "armor --jit",
+            Runner::JitCold => "armor --jit, first run",
             Runner::Interpreter => "armor (interpreter)",
             Runner::Qemu => "qemu-x86_64",
             Runner::Native => "native",
@@ -158,7 +163,11 @@ pub fn run(args: &[String]) -> Result<(), String> {
         return Err(format!("no benchmark matches {filter:?}\n{USAGE}"));
     }
 
-    let mut runners = vec![Runner::Jit, Runner::Qemu, Runner::Native];
+    let mut runners = vec![Runner::Jit, Runner::JitCold, Runner::Qemu, Runner::Native];
+    // A cache made by an earlier build is not reused anyway (its name
+    // names armor's build), but starting empty makes the first round's
+    // cost the same every time.
+    let _ = fs::remove_dir_all(jit_cache(false));
     if interpreter {
         runners.insert(1, Runner::Interpreter);
     }
@@ -204,7 +213,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
                     ));
                 }
                 check_output(workload, runner, &output.stdout, &mut expected)?;
-                let translating = (runner == Runner::Jit)
+                let translating = matches!(runner, Runner::Jit | Runner::JitCold)
                     .then(|| translation_time(&output.stderr))
                     .flatten();
                 samples
@@ -484,17 +493,33 @@ fn build_native(src: &Path, out: &Path, flags: &[&str]) -> Result<PathBuf, Strin
     Ok(out.to_path_buf())
 }
 
+/// The JIT's cache directories of the benchmark: warm (kept across runs)
+/// or cold (emptied before each run).
+fn jit_cache(cold: bool) -> PathBuf {
+    Paths::new().root.join(if cold {
+        "target/bench/jit-cache-cold"
+    } else {
+        "target/bench/jit-cache"
+    })
+}
+
 /// The command for one run, or `None` if `runner` has no version of the
 /// workload.
 fn command(runner: Runner, armor: &Path, workload: &Workload) -> Option<Command> {
     let mut cmd = match runner {
-        Runner::Jit | Runner::Interpreter => {
+        Runner::Jit | Runner::JitCold | Runner::Interpreter => {
             let mut cmd = Command::new(armor);
             cmd.env("ARMOR_ROOT", &workload.root);
-            if runner == Runner::Jit {
-                cmd.arg("--jit").env("ARMOR_JIT_STATS", "1");
-            } else {
+            if runner == Runner::Interpreter {
                 cmd.arg("--interpreter");
+            } else {
+                let cold = runner == Runner::JitCold;
+                if cold {
+                    let _ = fs::remove_dir_all(jit_cache(true));
+                }
+                cmd.arg("--jit")
+                    .env("ARMOR_JIT_STATS", "1")
+                    .env("ARMOR_JIT_CACHE_DIR", jit_cache(cold));
             }
             cmd.arg(&workload.guest).args(&workload.args);
             cmd
@@ -686,7 +711,7 @@ fn print_table(runners: &[Runner], table: &[Row], runs: usize) {
     for runner in runners {
         header.push_str(&format!(" {} |", runner.label()));
     }
-    header.push_str(" armor/qemu | translating (jit) |");
+    header.push_str(" armor/qemu | translating (first run) |");
     println!("{header}");
     println!("|{}", "---|".repeat(runners.len() + 3));
     for (workload, samples, broken) in table {
@@ -709,10 +734,11 @@ fn print_table(runners: &[Runner], table: &[Row], runs: usize) {
             }
             _ => line.push_str(" — |"),
         }
+        // Translation weighs on a first run; later ones reuse the cache.
         let translating: Option<Vec<Duration>> = samples
-            .get(&Runner::Jit)
+            .get(&Runner::JitCold)
             .map(|s| s.iter().filter_map(|x| x.translating).collect());
-        match (translating, mid(Runner::Jit)) {
+        match (translating, mid(Runner::JitCold)) {
             (Some(mut t), Some(total)) if !t.is_empty() => {
                 let t = median(&mut t);
                 line.push_str(&format!(

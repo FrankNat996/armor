@@ -49,7 +49,7 @@ Add `--report` to `difftest`, `app-check`, `distro-check` or `bench`: the result
 - **Other distributions:** `cargo xtask distro-check` installs armor's archive in Fedora and Arch Linux ARM containers (ADR-0043).
 
 ## 8. Speed
-`cargo xtask bench [--box64] [--fex]` times armor's JIT, qemu, the native build and, if given, box64 and FEX on the same workloads; `ARMOR_JIT_STATS=interpreted` lists what the JIT left to the interpreter, by kind; `perf` profiles armor itself (`tech/performance.md`).
+`cargo xtask bench [--box64] [--fex]` times armor's JIT (with its cache of translations warm, and on a first run with the cache empty, ADR-0048), qemu, the native build and, if given, box64 and FEX on the same workloads; `ARMOR_JIT_STATS=interpreted` lists what the JIT left to the interpreter, by kind; `perf` profiles armor itself (`tech/performance.md`).
 
 ## 9. Reporting a problem
 Include armor's version (`armor --version`; `armor update --check` also says whether a newer one is out), the output of `armor inspect` on the program, the `--diagnose` report or the application's `last-run.log`, and the machine (CPU, page size, distribution). armor's own stop messages name what is missing ("syscall N", "ioctl request 0x…", an instruction): that line is the most useful one.

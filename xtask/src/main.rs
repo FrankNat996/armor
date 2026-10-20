@@ -476,6 +476,15 @@ impl Runner {
             }
             Runner::Under(engine) => {
                 cmd.arg(&paths.armor).env("ARMOR_ROOT", root);
+                // The JIT's cache (ADR-0048) of the test runs, never the
+                // user's: kept across runs, so that a second run finds it
+                // warm (unless ARMOR_JIT_CACHE_DIR says otherwise).
+                if env::var_os("ARMOR_JIT_CACHE_DIR").is_none() {
+                    cmd.env(
+                        "ARMOR_JIT_CACHE_DIR",
+                        paths.root.join("target/difftest/jit-cache"),
+                    );
+                }
                 cmd.args(engine.flag());
             }
         };

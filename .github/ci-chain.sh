@@ -43,6 +43,7 @@ runuser -u builder -- bash -c '
       "cargo xtask fetch-busybox" "cargo xtask fetch-rootfs" "cargo xtask fetch-rootfs --i386" \
       "cargo xtask build-guest" \
       "cargo xtask difftest --report" \
+      "cargo xtask difftest --jit" \
       "cargo xtask difftest --lockstep --report" \
       "env ARMOR_HOST_FEATURES=baseline cargo xtask difftest --report" \
       "cargo xtask difftest --native --report" \

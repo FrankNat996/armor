@@ -323,6 +323,13 @@ impl Place {
         let _ = fs::create_dir_all(&tmp);
         cmd.env("XDG_DATA_HOME", &self.data)
             .env("XDG_CONFIG_HOME", &self.config)
+            .env(
+                "XDG_CACHE_HOME",
+                self.data
+                    .parent()
+                    .expect("inside target/app-check")
+                    .join("cache"),
+            )
             .env("TMPDIR", tmp)
             .env("DISPLAY", DISPLAY)
             .env("ARMOR_WINDOWS_X86_ENGINE", self.x86_engine)
@@ -607,7 +614,8 @@ fn check_seven_zip_linux(
     let mut ours = Command::new(paths.root.join("target/release/armor"));
     // 7zz needs libstdc++, which the games root has (fetch-rootfs --games).
     ours.arg(x86_dir.join("7zz"))
-        .env("ARMOR_ROOT", paths.root.join("target/guest/rootfs-games"));
+        .env("ARMOR_ROOT", paths.root.join("target/guest/rootfs-games"))
+        .env("ARMOR_JIT_CACHE_DIR", work.join("jit-cache"));
     let a = seven_zip(ours, &work.join("x64.7z"), &input, &place.log)?;
     let b = seven_zip(
         Command::new(arm_dir.join("7zz")),

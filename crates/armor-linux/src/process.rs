@@ -311,7 +311,14 @@ pub fn exec_native(path: &[u8], args: &[Vec<u8>], env: &[Vec<u8>]) -> i64 {
     }
 }
 
+/// Run before armor replaces itself (`execve`): the JIT's cache is
+/// written then (ADR-0048), as the process does not exit.
+pub static BEFORE_EXEC: std::sync::OnceLock<fn()> = std::sync::OnceLock::new();
+
 fn exec_host(path: &[u8], args: &[Vec<u8>], env: &[Vec<u8>]) -> Result<i64, i64> {
+    if let Some(hook) = BEFORE_EXEC.get() {
+        hook();
+    }
     // A native program dumps cores as it would without armor; a new armor
     // limits its own again.
     crate::restore_core_dumps();

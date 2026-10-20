@@ -1281,6 +1281,70 @@ fn random_code_matches_the_interpreter_with_host_protection() {
     assert_eq!(host[1], 0x1234_5678, "the guest wrote armor's memory");
 }
 
+/// ADR-0048: translations recorded in the cache file come back in a later
+/// "run" (the state configured again, as a new process would), give what
+/// the interpreter gives, and a damaged file is read without harm. In a
+/// process of its own: the cache is process-wide.
+#[test]
+fn translations_come_back_from_the_cache() {
+    const CHILD: &str = "ARMOR_JIT_CACHE_TEST_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::translations_come_back_from_the_cache",
+                "--test-threads=1",
+            ])
+            .env(CHILD, "1")
+            .status()
+            .unwrap();
+        assert!(status.success(), "the test in its own process failed");
+        return;
+    }
+    use crate::cache;
+    let dir = std::env::temp_dir().join(format!("armor-jit-cache-test-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let path = dir.join("test.jit");
+    let guest = Guest::new();
+    let mut rng = Rng(0x2545_f491_4f6c_dd1d);
+    let programs: Vec<(Vec<u8>, Cpu)> = (0..3)
+        .map(|_| {
+            let mut code = Vec::new();
+            for _ in 0..1 + rng.below(24) {
+                random_instruction(&mut rng, &mut code);
+            }
+            (code, guest.cpu(&mut rng))
+        })
+        .collect();
+    let run_all = || {
+        for (i, (code, cpu)) in programs.iter().enumerate() {
+            guest.compare(code, cpu, i as u64 + 1);
+        }
+    };
+    cache::configure(path.clone());
+    run_all();
+    let (hits, stored) = cache::counts();
+    assert!(stored > 0, "nothing recorded");
+    cache::save();
+    assert!(path.is_file(), "no cache file");
+    // A later run reads the file.
+    cache::configure(path.clone());
+    run_all();
+    let (hits_after, _) = cache::counts();
+    assert!(hits_after > hits, "nothing reused from the file");
+    // Every record damaged where it always runs: none is used, and the
+    // programs give what the interpreter gives.
+    let mut data = std::fs::read(&path).unwrap();
+    cache::damage_first_words(&mut data);
+    std::fs::write(&path, &data).unwrap();
+    cache::configure(path.clone());
+    let (before, _) = cache::counts();
+    run_all();
+    let (after, _) = cache::counts();
+    assert_eq!(after, before, "a damaged record was used");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// The same in concurrent mode with ARMv8.0 alone (ADR-0032): LDAR for
 /// LDAPR, exclusive loops for the LSE atomics (the generator's locked
 /// instructions on aligned memory take them).

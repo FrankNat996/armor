@@ -9,6 +9,7 @@
 //! - `lockstep`: the debugging mode that checks every translated
 //!   instruction against the interpreter;
 //! - `stats`: translation counters (`ARMOR_JIT_STATS`);
+//! - `cache`: translations kept on disk for later runs (ADR-0048);
 //! - `check`: the encoder's samples for `cargo xtask encoder-check`.
 //!
 //! All of armor's code-generation `unsafe` lives in `buffer` and `engine`.
@@ -23,6 +24,8 @@ extern crate alloc;
 
 #[cfg(feature = "std")]
 pub mod buffer;
+#[cfg(feature = "std")]
+pub mod cache;
 #[cfg(feature = "std")]
 #[doc(hidden)]
 pub mod check;

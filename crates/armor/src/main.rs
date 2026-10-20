@@ -48,6 +48,7 @@ use std::ffi::OsStr;
 use std::ffi::OsString;
 use std::fs;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc;
@@ -499,6 +500,17 @@ fn main() -> ExitCode {
     let mut process = syscall::Process::new(exe_path, image.brk_start, root, armor_exe);
     process.jit = jit;
     process.lockstep = lockstep;
+    // ADR-0048: translations of earlier runs of this program, kept on
+    // disk. Not in lockstep, and not in the sandbox, whose guest is not
+    // trusted with host code.
+    if jit
+        && !lockstep
+        && sandbox != Some(true)
+        && let Some(path) = jit_cache_path(Path::new(program), image.mode == Mode::Compat32)
+    {
+        armor_jit::cache::configure(path);
+        let _ = armor_linux::process::BEFORE_EXEC.set(armor_jit::cache::save);
+    }
     process.diagnose = diagnose_arg.map(OsString::into_vec);
     let i386 = image.mode == Mode::Compat32;
     let engine = if lockstep {
@@ -751,11 +763,58 @@ fn exit_thread(guest: &'static Guest, thread: &syscall::Thread, status: i32, mai
     }
 }
 
+/// The JIT's cache file for `program` (ADR-0048): in `ARMOR_JIT_CACHE_DIR`,
+/// else `$XDG_CACHE_HOME/armor/jit`, else `~/.cache/armor/jit`, named after
+/// armor's own build (its executable's size and modification time), the
+/// program (its canonical path, size and modification time) and its mode.
+/// `None` with `ARMOR_JIT_CACHE=off`, or when one of them cannot be read.
+fn jit_cache_path(program: &Path, i386: bool) -> Option<PathBuf> {
+    use std::os::unix::fs::MetadataExt;
+    if env::var_os("ARMOR_JIT_CACHE").is_some_and(|v| v == "off") {
+        return None;
+    }
+    let nonempty = |v: OsString| (!v.is_empty()).then(|| PathBuf::from(v));
+    let dir = env::var_os("ARMOR_JIT_CACHE_DIR")
+        .and_then(nonempty)
+        .or_else(|| {
+            env::var_os("XDG_CACHE_HOME")
+                .and_then(nonempty)
+                .map(|d| d.join("armor/jit"))
+        })
+        .or_else(|| {
+            env::var_os("HOME")
+                .and_then(nonempty)
+                .map(|h| h.join(".cache/armor/jit"))
+        })?;
+    let armor = fs::metadata(env::current_exe().ok()?).ok()?;
+    let canonical = fs::canonicalize(program).ok()?;
+    let file = fs::metadata(&canonical).ok()?;
+    let mut id = Vec::new();
+    for value in [
+        armor.size(),
+        armor.mtime() as u64,
+        armor.mtime_nsec() as u64,
+        file.size(),
+        file.mtime() as u64,
+        file.mtime_nsec() as u64,
+        u64::from(i386),
+    ] {
+        id.extend_from_slice(&value.to_le_bytes());
+    }
+    id.extend_from_slice(canonical.as_os_str().as_bytes());
+    Some(dir.join(format!("{:016x}.jit", armor_jit::cache::fnv1a(&id))))
+}
+
 /// The guest process exits with `status`. With `ARMOR_JIT_STATS` set in
 /// armor's environment, the JIT's translation counters go to stderr first.
 fn exit_process(status: i32) -> ! {
+    armor_jit::cache::save();
     if env::var_os(JIT_STATS_VARIABLE).is_some() {
         eprintln!("armor: {}", armor_jit::stats::summary());
+        if armor_jit::cache::enabled() {
+            let (reused, recorded) = armor_jit::cache::counts();
+            eprintln!("armor: jit cache: {reused} blocks reused, {recorded} recorded");
+        }
         if armor_jit::stats::counting_interpreted() {
             eprintln!("armor: {}", armor_jit::stats::interpreted_summary());
         }

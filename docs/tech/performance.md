@@ -622,3 +622,8 @@ The shared prologue and epilogue take Python's startup from 3.07 to 2.14 million
 
 **Tried and left out (2026-10-20): following direct jumps.** Decoding on at the target of a direct `jmp` instead of ending the block (not in lockstep; a jump back into the block ends it) took 7-Zip from 10.29 to 10.12 s, but translated more code twice: Python's startup translated 294,742 x86 instructions instead of 243,864 (15,461 blocks), in 107 ms instead of 92, and its loops did not gain (698 and 624 ms against 695 and 612). Without knowing which paths are hot, the duplication costs more where translation already weighs most.
 
+## Translations cached on disk (ADR-0048, 2026-10-20)
+`cargo xtask bench` now runs armor twice per round: with the cache of translations as later runs find it (`armor --jit`: the first round fills it, the median is of warm runs) and as a first run (`armor --jit, first run`: an empty cache before every run); the "translating" column is the first run's. Python's startup, best of 5 by hand: 185 ms without the cache, 218 ms on a first run, 114 ms after (box64 105 ms); the loops `python-int` 690 → 623 ms and `python-float` 617 → 537 ms warm. The first run's extra cost (`perf stat`): 19 ms of user time encoding 16,092 records and 16 ms of system time, of which 7 ms writing the 10.5 MB file (one `write`, NVMe); a warm run spends 32 ms of system time reading it and in page faults.
+
+Startups of real programs of the test root (`target/guest/rootfs`), best of 5, without the cache, on a first run (an empty cache each time) and warm: `python3.13 -c pass` 187, 217, 115 ms; `perl -e 1` 55, 62, 35 ms; `sort --version` 27, 31, 18 ms.
+

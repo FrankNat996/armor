@@ -609,7 +609,8 @@ fn speed(sheet: &Sheet, machine: &str) -> String {
         first.commit
     );
     for engine in &engines {
-        table.push_str(&format!(" {} |", cell(engine.trim_end_matches(" --jit"))));
+        let name = engine.trim_end_matches(" --jit").replace(" --jit,", ",");
+        table.push_str(&format!(" {} |", cell(&name)));
     }
     table.push_str("\n|---|");
     table.push_str(&"---:|".repeat(engines.len()));

@@ -26,6 +26,7 @@ use armor_mem::{GuestMemory, MemView};
 use armor_x86::{MAX_INSTRUCTION_LEN, Mode, decode_in};
 
 use crate::buffer::CodeBuffer;
+use crate::cache;
 use crate::encoder::branch_word;
 use crate::translator::{
     BlockEnd, CHAINED_ENTRY, Context, EXIT_CHAIN, EXIT_INTERPRET, EXIT_SYSCALL, FLAG_TABLE,
@@ -530,6 +531,33 @@ impl Jit {
         // atomics; those without one go to the interpreter, which makes
         // them atomic on the host (`supported_concurrent`).
         let concurrent = mem.is_concurrent();
+        let host_reads = mem.host_protection().map(|end| {
+            install_fault_handler();
+            64 - (end - 1).leading_zeros()
+        });
+        let options = Options {
+            features: self.features,
+            chain: !self.lockstep,
+            concurrent,
+            compat: self.mode == Mode::Compat32,
+            host_reads,
+            page_table: true,
+            // What the exit that led here left pending (after a chain
+            // exit; 0 otherwise).
+            entry_kind: core::mem::take(&mut self.context.exit_kind),
+        };
+        // ADR-0048: a translation of the same bytes, at the same address,
+        // with the same options, from an earlier run (not in lockstep).
+        let key = self.cache_key(&options);
+        let cached = !self.lockstep && cache::enabled();
+        if cached && let Some(hit) = cache::lookup(rip, key, |at, buf| mem.fetch(at, buf)) {
+            return self.publish_translation(
+                rip,
+                &hit.words,
+                &hit.faults,
+                hit.instructions as usize,
+            );
+        }
         let mut block = Vec::with_capacity(MAX_BLOCK_INSTRUCTIONS);
         let mut at = rip;
         let limit = if self.lockstep {
@@ -565,25 +593,36 @@ impl Jit {
         if block.is_empty() {
             return Entry::Interpret;
         }
-        let host_reads = mem.host_protection().map(|end| {
-            install_fault_handler();
-            64 - (end - 1).leading_zeros()
-        });
-        let options = Options {
-            features: self.features,
-            chain: !self.lockstep,
-            concurrent,
-            compat: self.mode == Mode::Compat32,
-            host_reads,
-            page_table: true,
-            // What the exit that led here left pending (after a chain
-            // exit; 0 otherwise).
-            entry_kind: core::mem::take(&mut self.context.exit_kind),
-        };
         let translation = translate_block(&block, end, options)
             .unwrap_or_else(|e| panic!("armor bug: cannot encode the block at {rip:#x}: {e}"));
-        let words = &translation.words;
-        crate::stats::record(block.len(), words.len(), start.elapsed());
+        crate::stats::record(block.len(), translation.words.len(), start.elapsed());
+        if cached {
+            let last = block.last().expect("a block has an instruction");
+            let len = last.rip.wrapping_sub(rip) as usize + last.insn.len;
+            let mut bytes = vec![0; len];
+            if mem.fetch(rip, &mut bytes) == len {
+                cache::insert(
+                    rip,
+                    key,
+                    &bytes,
+                    &translation.words,
+                    &translation.faults,
+                    block.len(),
+                );
+            }
+        }
+        self.publish_translation(rip, &translation.words, &translation.faults, block.len())
+    }
+
+    /// Publishes a translation of the block at `rip` (`instructions` guest
+    /// instructions), with its fault table.
+    fn publish_translation(
+        &mut self,
+        rip: u64,
+        words: &[u32],
+        faults: &[(u32, u32)],
+        instructions: usize,
+    ) -> Entry {
         let code = match self.buffer.publish(words) {
             Ok(code) => code,
             Err(_) => {
@@ -595,13 +634,26 @@ impl Jit {
             }
         };
         let at = |offset: u32| code as u64 + 4 * u64::from(offset);
-        self.faults.extend(
-            translation
-                .faults
-                .iter()
-                .map(|&(load, slow)| (at(load), at(slow))),
-        );
-        crate::stats::perf_map(code, words.len() * 4, rip, block.len());
+        self.faults
+            .extend(faults.iter().map(|&(load, slow)| (at(load), at(slow))));
+        crate::stats::perf_map(code, words.len() * 4, rip, instructions);
         Entry::Code(code)
+    }
+
+    /// What a translation depends on besides its bytes and address: the
+    /// options (but the entry kind, a hint whose code is correct for any
+    /// kind) and MXCSR's default (which decides what is translated).
+    fn cache_key(&self, options: &Options) -> u64 {
+        let bits = [
+            u8::from(options.features.lse),
+            u8::from(options.features.rcpc),
+            u8::from(options.chain),
+            u8::from(options.concurrent),
+            u8::from(options.compat),
+            options.host_reads.map_or(0, |b| b as u8),
+            u8::from(options.page_table),
+            u8::from(self.default_mxcsr),
+        ];
+        cache::fnv1a(&bits)
     }
 }

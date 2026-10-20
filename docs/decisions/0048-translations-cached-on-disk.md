@@ -1,6 +1,6 @@
 # 0048 — Translations cached on disk
 
-- **Status:** Proposed
+- **Status:** Accepted (2026-10-20)
 - **Date:** 2026-10-20
 
 ## Context
@@ -29,3 +29,7 @@ armor keeps the translations of file-backed code in a cache on disk and reuses t
 - − Disk space, and a file format to keep valid across armor versions (the build hash makes old caches misses).
 - − Host code read from disk: a process of the same user that can write the cache can make armor run code of its choice. It could equally replace armor's executable; the sandbox does not use the cache.
 - − First runs are as slow as now; the matrix must say which runs were warm.
+
+## Implementation notes
+- **2026-10-20:** `crates/armor-jit/src/cache.rs` (`tech/jit.md`, "Translations cached on disk"). Two details differ from the decision above, both stricter or simpler: a record's validity is checked against the **exact guest bytes** at the block's address (stored in the record), with the address, the options and armor's build in the key, rather than against the file's identity (armor's address space does not keep which file a mapping came from); so every block is cached, not only those of file mappings, with at most four records per address and options. One file per program (named after armor's build, the program and its mode) instead of one per mapping; new records are appended rather than the file rewritten. The directory is limited to 1 GiB (the least recently used files go), a file to 256 MiB.
+
