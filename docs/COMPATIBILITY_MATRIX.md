@@ -63,22 +63,22 @@ Kernel `6.18.50+rpt-rpi-v8`.
 | suite | difftest | box64 | qemu-x86_64 10.0.13 | 254/470 | 2026-10-20 | f7e4a55 | `cargo xtask difftest --engine box64` |
 | suite | difftest | fex | qemu-x86_64 10.0.13 | 412/470 | 2026-10-20 | f7e4a55 | `cargo xtask difftest --engine fex` |
 
-Performance against the native AArch64 build, same machine (`cargo xtask bench --box64 --fex`, 2026-10-20, 11404fd): time, and the multiple of the native time, median of 5.
+Performance against the native AArch64 build, same machine (`cargo xtask bench --box64 --fex`, 2026-10-20, f51b93b): time, and the multiple of the native time, median of 5.
 
-| Workload | FEX | armor --jit | box64 | qemu-x86_64 |
-|---|---|---|---|---|
-| 7zip | 8.529 s, 1.40× | 10.344 s, 1.70× | 6.881 s, 1.13× | 28.778 s, 4.72× |
-| float | 1.131 s, 22.15× | 0.189 s, 3.70× | 0.135 s, 2.64× | 0.718 s, 14.06× |
-| integer | 1.191 s, 10.19× | 0.186 s, 1.59× | 0.165 s, 1.42× | 0.333 s, 2.85× |
-| memory | 1.211 s, 8.11× | 0.265 s, 1.77× | 0.237 s, 1.59× | 0.395 s, 2.64× |
-| python-float | 1.674 s, 9.14× | 0.628 s, 3.43× | 0.447 s, 2.44× | 4.482 s, 24.48× |
-| python-int | 1.768 s, 7.76× | 0.709 s, 3.12× | 0.489 s, 2.15× | 5.087 s, 22.34× |
-| python-start | 1.347 s, 91.02× | 0.186 s, 12.54× | 0.105 s, 7.10× | 0.491 s, 33.19× |
-| simd | 1.076 s, 33.08× | 0.137 s, 4.22× | 0.092 s, 2.81× | 0.360 s, 11.05× |
-| start-dynamic | 1.057 s, 1871.57× | 0.017 s, 30.93× | 0.012 s, 21.98× | 0.032 s, 55.96× |
-| start-static | 1.033 s, 2754.36× | 0.008 s, 21.27× | 0.025 s, 67.89× | 0.020 s, 52.05× |
-| syscall | 1.204 s, 10.39× | 0.206 s, 1.78× | 0.168 s, 1.45× | 0.344 s, 2.97× |
-| threads | 1.146 s, 12.69× | 0.121 s, 1.34× | fails (signal: 11 (SIGSEGV)) | 0.295 s, 3.26× |
+| Workload | FEX | armor --jit | armor --jit, first run | box64 | qemu-x86_64 |
+|---|---|---|---|---|---|
+| 7zip | 8.475 s, 1.39× | 10.210 s, 1.68× | 10.348 s, 1.70× | 6.901 s, 1.13× | 28.760 s, 4.73× |
+| float | 1.133 s, 22.21× | 0.186 s, 3.65× | 0.191 s, 3.74× | 0.135 s, 2.65× | 0.721 s, 14.12× |
+| integer | 1.191 s, 10.19× | 0.185 s, 1.58× | 0.189 s, 1.62× | 0.165 s, 1.41× | 0.332 s, 2.84× |
+| memory | 1.223 s, 7.96× | 0.270 s, 1.76× | 0.268 s, 1.74× | 0.247 s, 1.61× | 0.400 s, 2.60× |
+| python-float | 1.688 s, 9.44× | 0.541 s, 3.02× | 0.662 s, 3.70× | 0.448 s, 2.50× | 4.445 s, 24.84× |
+| python-int | 1.754 s, 7.44× | 0.625 s, 2.65× | 0.767 s, 3.26× | 0.505 s, 2.14× | 5.069 s, 21.51× |
+| python-start | 1.346 s, 91.70× | 0.118 s, 8.01× | 0.221 s, 15.03× | 0.103 s, 6.99× | 0.489 s, 33.32× |
+| simd | 1.075 s, 32.67× | 0.128 s, 3.91× | 0.139 s, 4.24× | 0.092 s, 2.79× | 0.360 s, 10.94× |
+| start-dynamic | 1.061 s, 1818.47× | 0.012 s, 20.45× | 0.021 s, 35.55× | 0.013 s, 21.62× | 0.032 s, 54.47× |
+| start-static | 1.041 s, 2350.66× | 0.008 s, 17.56× | 0.013 s, 29.54× | 0.033 s, 75.56× | 0.028 s, 63.27× |
+| syscall | 1.206 s, 10.41× | 0.205 s, 1.77× | 0.208 s, 1.79× | 0.167 s, 1.44× | 0.340 s, 2.93× |
+| threads | 1.143 s, 12.47× | 0.117 s, 1.28× | 0.121 s, 1.32× | fails (signal: 11 (SIGSEGV)) | 0.295 s, 3.21× |
 
 ### Cortex-A76, 16K pages, Debian GNU/Linux 13 (KVM virtual machine)
 Kernel `6.12.111+deb13-arm64-16k`.

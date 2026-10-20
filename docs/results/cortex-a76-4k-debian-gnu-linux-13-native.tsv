@@ -16,54 +16,66 @@ application	Notepad++ 8.9.8.1 for Windows x64	Hangover 11.16 (FEX ARM64EC)	a win
 application	Notepad++ 8.9.8.1 for Windows x64	Hangover 11.16 (FEX ARM64EC), 32-bit code under armor WoW64	a window on an X display (Xvfb)	level 1: its window (Notepad++) appeared 2 s after armor run	2026-10-20	11404fd	cargo xtask app-check --x86-engine armor notepad-plus-plus
 application	Spotify 1.3.4.258 (.deb, x86-64, Chromium)	armor (JIT), Debian's x86-64 libraries	a window on an X display (Xvfb)	level 1: its window (Spotify) appeared 20 s after armor run	2026-10-15	97f001d	cargo xtask app-check spotify
 application	XnView MP 1.12.2 (.deb, x86-64)	armor (JIT), Debian's x86-64 libraries	a window on an X display (Xvfb)	level 1: its window (XnView) appeared 1 s after armor run	2026-10-15	97f001d	cargo xtask app-check xnviewmp
-performance	7zip	FEX	the native AArch64 build, same machine	8.529 s, 1.40× the native time (median of 5)	2026-10-20	11404fd	cargo xtask bench --box64 --fex
-performance	7zip	armor --jit	the native AArch64 build, same machine	10.344 s, 1.70× the native time (median of 5)	2026-10-20	11404fd	cargo xtask bench --box64 --fex
-performance	7zip	box64	the native AArch64 build, same machine	6.881 s, 1.13× the native time (median of 5)	2026-10-20	11404fd	cargo xtask bench --box64 --fex
-performance	7zip	qemu-x86_64	the native AArch64 build, same machine	28.778 s, 4.72× the native time (median of 5)	2026-10-20	11404fd	cargo xtask bench --box64 --fex
-performance	float	FEX	the native AArch64 build, same machine	1.131 s, 22.15× the native time (median of 5)	2026-10-20	11404fd	cargo xtask bench --box64 --fex
-performance	float	armor --jit	the native AArch64 build, same machine	0.189 s, 3.70× the native time (median of 5)	2026-10-20	11404fd	cargo xtask bench --box64 --fex
-performance	float	box64	the native AArch64 build, same machine	0.135 s, 2.64× the native time (median of 5)	2026-10-20	11404fd	cargo xtask bench --box64 --fex
-performance	float	qemu-x86_64	the native AArch64 build, same machine	0.718 s, 14.06× the native time (median of 5)	2026-10-20	11404fd	cargo xtask bench --box64 --fex
-performance	integer	FEX	the native AArch64 build, same machine	1.191 s, 10.19× the native time (median of 5)	2026-10-20	11404fd	cargo xtask bench --box64 --fex
-performance	integer	armor --jit	the native AArch64 build, same machine	0.186 s, 1.59× the native time (median of 5)	2026-10-20	11404fd	cargo xtask bench --box64 --fex
-performance	integer	box64	the native AArch64 build, same machine	0.165 s, 1.42× the native time (median of 5)	2026-10-20	11404fd	cargo xtask bench --box64 --fex
-performance	integer	qemu-x86_64	the native AArch64 build, same machine	0.333 s, 2.85× the native time (median of 5)	2026-10-20	11404fd	cargo xtask bench --box64 --fex
-performance	memory	FEX	the native AArch64 build, same machine	1.211 s, 8.11× the native time (median of 5)	2026-10-20	11404fd	cargo xtask bench --box64 --fex
-performance	memory	armor --jit	the native AArch64 build, same machine	0.265 s, 1.77× the native time (median of 5)	2026-10-20	11404fd	cargo xtask bench --box64 --fex
-performance	memory	box64	the native AArch64 build, same machine	0.237 s, 1.59× the native time (median of 5)	2026-10-20	11404fd	cargo xtask bench --box64 --fex
-performance	memory	qemu-x86_64	the native AArch64 build, same machine	0.395 s, 2.64× the native time (median of 5)	2026-10-20	11404fd	cargo xtask bench --box64 --fex
-performance	python-float	FEX	the native AArch64 build, same machine	1.674 s, 9.14× the native time (median of 5)	2026-10-20	11404fd	cargo xtask bench --box64 --fex
-performance	python-float	armor --jit	the native AArch64 build, same machine	0.628 s, 3.43× the native time (median of 5)	2026-10-20	11404fd	cargo xtask bench --box64 --fex
-performance	python-float	box64	the native AArch64 build, same machine	0.447 s, 2.44× the native time (median of 5)	2026-10-20	11404fd	cargo xtask bench --box64 --fex
-performance	python-float	qemu-x86_64	the native AArch64 build, same machine	4.482 s, 24.48× the native time (median of 5)	2026-10-20	11404fd	cargo xtask bench --box64 --fex
-performance	python-int	FEX	the native AArch64 build, same machine	1.768 s, 7.76× the native time (median of 5)	2026-10-20	11404fd	cargo xtask bench --box64 --fex
-performance	python-int	armor --jit	the native AArch64 build, same machine	0.709 s, 3.12× the native time (median of 5)	2026-10-20	11404fd	cargo xtask bench --box64 --fex
-performance	python-int	box64	the native AArch64 build, same machine	0.489 s, 2.15× the native time (median of 5)	2026-10-20	11404fd	cargo xtask bench --box64 --fex
-performance	python-int	qemu-x86_64	the native AArch64 build, same machine	5.087 s, 22.34× the native time (median of 5)	2026-10-20	11404fd	cargo xtask bench --box64 --fex
-performance	python-start	FEX	the native AArch64 build, same machine	1.347 s, 91.02× the native time (median of 5)	2026-10-20	11404fd	cargo xtask bench --box64 --fex
-performance	python-start	armor --jit	the native AArch64 build, same machine	0.186 s, 12.54× the native time (median of 5)	2026-10-20	11404fd	cargo xtask bench --box64 --fex
-performance	python-start	box64	the native AArch64 build, same machine	0.105 s, 7.10× the native time (median of 5)	2026-10-20	11404fd	cargo xtask bench --box64 --fex
-performance	python-start	qemu-x86_64	the native AArch64 build, same machine	0.491 s, 33.19× the native time (median of 5)	2026-10-20	11404fd	cargo xtask bench --box64 --fex
-performance	simd	FEX	the native AArch64 build, same machine	1.076 s, 33.08× the native time (median of 5)	2026-10-20	11404fd	cargo xtask bench --box64 --fex
-performance	simd	armor --jit	the native AArch64 build, same machine	0.137 s, 4.22× the native time (median of 5)	2026-10-20	11404fd	cargo xtask bench --box64 --fex
-performance	simd	box64	the native AArch64 build, same machine	0.092 s, 2.81× the native time (median of 5)	2026-10-20	11404fd	cargo xtask bench --box64 --fex
-performance	simd	qemu-x86_64	the native AArch64 build, same machine	0.360 s, 11.05× the native time (median of 5)	2026-10-20	11404fd	cargo xtask bench --box64 --fex
-performance	start-dynamic	FEX	the native AArch64 build, same machine	1.057 s, 1871.57× the native time (median of 5)	2026-10-20	11404fd	cargo xtask bench --box64 --fex
-performance	start-dynamic	armor --jit	the native AArch64 build, same machine	0.017 s, 30.93× the native time (median of 5)	2026-10-20	11404fd	cargo xtask bench --box64 --fex
-performance	start-dynamic	box64	the native AArch64 build, same machine	0.012 s, 21.98× the native time (median of 5)	2026-10-20	11404fd	cargo xtask bench --box64 --fex
-performance	start-dynamic	qemu-x86_64	the native AArch64 build, same machine	0.032 s, 55.96× the native time (median of 5)	2026-10-20	11404fd	cargo xtask bench --box64 --fex
-performance	start-static	FEX	the native AArch64 build, same machine	1.033 s, 2754.36× the native time (median of 5)	2026-10-20	11404fd	cargo xtask bench --box64 --fex
-performance	start-static	armor --jit	the native AArch64 build, same machine	0.008 s, 21.27× the native time (median of 5)	2026-10-20	11404fd	cargo xtask bench --box64 --fex
-performance	start-static	box64	the native AArch64 build, same machine	0.025 s, 67.89× the native time (median of 5)	2026-10-20	11404fd	cargo xtask bench --box64 --fex
-performance	start-static	qemu-x86_64	the native AArch64 build, same machine	0.020 s, 52.05× the native time (median of 5)	2026-10-20	11404fd	cargo xtask bench --box64 --fex
-performance	syscall	FEX	the native AArch64 build, same machine	1.204 s, 10.39× the native time (median of 5)	2026-10-20	11404fd	cargo xtask bench --box64 --fex
-performance	syscall	armor --jit	the native AArch64 build, same machine	0.206 s, 1.78× the native time (median of 5)	2026-10-20	11404fd	cargo xtask bench --box64 --fex
-performance	syscall	box64	the native AArch64 build, same machine	0.168 s, 1.45× the native time (median of 5)	2026-10-20	11404fd	cargo xtask bench --box64 --fex
-performance	syscall	qemu-x86_64	the native AArch64 build, same machine	0.344 s, 2.97× the native time (median of 5)	2026-10-20	11404fd	cargo xtask bench --box64 --fex
-performance	threads	FEX	the native AArch64 build, same machine	1.146 s, 12.69× the native time (median of 5)	2026-10-20	11404fd	cargo xtask bench --box64 --fex
-performance	threads	armor --jit	the native AArch64 build, same machine	0.121 s, 1.34× the native time (median of 5)	2026-10-20	11404fd	cargo xtask bench --box64 --fex
-performance	threads	box64	the native AArch64 build, same machine	fails (signal: 11 (SIGSEGV))	2026-10-20	11404fd	cargo xtask bench --box64 --fex
-performance	threads	qemu-x86_64	the native AArch64 build, same machine	0.295 s, 3.26× the native time (median of 5)	2026-10-20	11404fd	cargo xtask bench --box64 --fex
+performance	7zip	FEX	the native AArch64 build, same machine	8.475 s, 1.39× the native time (median of 5)	2026-10-20	f51b93b	cargo xtask bench --box64 --fex
+performance	7zip	armor --jit	the native AArch64 build, same machine	10.210 s, 1.68× the native time (median of 5)	2026-10-20	f51b93b	cargo xtask bench --box64 --fex
+performance	7zip	armor --jit, first run	the native AArch64 build, same machine	10.348 s, 1.70× the native time (median of 5)	2026-10-20	f51b93b	cargo xtask bench --box64 --fex
+performance	7zip	box64	the native AArch64 build, same machine	6.901 s, 1.13× the native time (median of 5)	2026-10-20	f51b93b	cargo xtask bench --box64 --fex
+performance	7zip	qemu-x86_64	the native AArch64 build, same machine	28.760 s, 4.73× the native time (median of 5)	2026-10-20	f51b93b	cargo xtask bench --box64 --fex
+performance	float	FEX	the native AArch64 build, same machine	1.133 s, 22.21× the native time (median of 5)	2026-10-20	f51b93b	cargo xtask bench --box64 --fex
+performance	float	armor --jit	the native AArch64 build, same machine	0.186 s, 3.65× the native time (median of 5)	2026-10-20	f51b93b	cargo xtask bench --box64 --fex
+performance	float	armor --jit, first run	the native AArch64 build, same machine	0.191 s, 3.74× the native time (median of 5)	2026-10-20	f51b93b	cargo xtask bench --box64 --fex
+performance	float	box64	the native AArch64 build, same machine	0.135 s, 2.65× the native time (median of 5)	2026-10-20	f51b93b	cargo xtask bench --box64 --fex
+performance	float	qemu-x86_64	the native AArch64 build, same machine	0.721 s, 14.12× the native time (median of 5)	2026-10-20	f51b93b	cargo xtask bench --box64 --fex
+performance	integer	FEX	the native AArch64 build, same machine	1.191 s, 10.19× the native time (median of 5)	2026-10-20	f51b93b	cargo xtask bench --box64 --fex
+performance	integer	armor --jit	the native AArch64 build, same machine	0.185 s, 1.58× the native time (median of 5)	2026-10-20	f51b93b	cargo xtask bench --box64 --fex
+performance	integer	armor --jit, first run	the native AArch64 build, same machine	0.189 s, 1.62× the native time (median of 5)	2026-10-20	f51b93b	cargo xtask bench --box64 --fex
+performance	integer	box64	the native AArch64 build, same machine	0.165 s, 1.41× the native time (median of 5)	2026-10-20	f51b93b	cargo xtask bench --box64 --fex
+performance	integer	qemu-x86_64	the native AArch64 build, same machine	0.332 s, 2.84× the native time (median of 5)	2026-10-20	f51b93b	cargo xtask bench --box64 --fex
+performance	memory	FEX	the native AArch64 build, same machine	1.223 s, 7.96× the native time (median of 5)	2026-10-20	f51b93b	cargo xtask bench --box64 --fex
+performance	memory	armor --jit	the native AArch64 build, same machine	0.270 s, 1.76× the native time (median of 5)	2026-10-20	f51b93b	cargo xtask bench --box64 --fex
+performance	memory	armor --jit, first run	the native AArch64 build, same machine	0.268 s, 1.74× the native time (median of 5)	2026-10-20	f51b93b	cargo xtask bench --box64 --fex
+performance	memory	box64	the native AArch64 build, same machine	0.247 s, 1.61× the native time (median of 5)	2026-10-20	f51b93b	cargo xtask bench --box64 --fex
+performance	memory	qemu-x86_64	the native AArch64 build, same machine	0.400 s, 2.60× the native time (median of 5)	2026-10-20	f51b93b	cargo xtask bench --box64 --fex
+performance	python-float	FEX	the native AArch64 build, same machine	1.688 s, 9.44× the native time (median of 5)	2026-10-20	f51b93b	cargo xtask bench --box64 --fex
+performance	python-float	armor --jit	the native AArch64 build, same machine	0.541 s, 3.02× the native time (median of 5)	2026-10-20	f51b93b	cargo xtask bench --box64 --fex
+performance	python-float	armor --jit, first run	the native AArch64 build, same machine	0.662 s, 3.70× the native time (median of 5)	2026-10-20	f51b93b	cargo xtask bench --box64 --fex
+performance	python-float	box64	the native AArch64 build, same machine	0.448 s, 2.50× the native time (median of 5)	2026-10-20	f51b93b	cargo xtask bench --box64 --fex
+performance	python-float	qemu-x86_64	the native AArch64 build, same machine	4.445 s, 24.84× the native time (median of 5)	2026-10-20	f51b93b	cargo xtask bench --box64 --fex
+performance	python-int	FEX	the native AArch64 build, same machine	1.754 s, 7.44× the native time (median of 5)	2026-10-20	f51b93b	cargo xtask bench --box64 --fex
+performance	python-int	armor --jit	the native AArch64 build, same machine	0.625 s, 2.65× the native time (median of 5)	2026-10-20	f51b93b	cargo xtask bench --box64 --fex
+performance	python-int	armor --jit, first run	the native AArch64 build, same machine	0.767 s, 3.26× the native time (median of 5)	2026-10-20	f51b93b	cargo xtask bench --box64 --fex
+performance	python-int	box64	the native AArch64 build, same machine	0.505 s, 2.14× the native time (median of 5)	2026-10-20	f51b93b	cargo xtask bench --box64 --fex
+performance	python-int	qemu-x86_64	the native AArch64 build, same machine	5.069 s, 21.51× the native time (median of 5)	2026-10-20	f51b93b	cargo xtask bench --box64 --fex
+performance	python-start	FEX	the native AArch64 build, same machine	1.346 s, 91.70× the native time (median of 5)	2026-10-20	f51b93b	cargo xtask bench --box64 --fex
+performance	python-start	armor --jit	the native AArch64 build, same machine	0.118 s, 8.01× the native time (median of 5)	2026-10-20	f51b93b	cargo xtask bench --box64 --fex
+performance	python-start	armor --jit, first run	the native AArch64 build, same machine	0.221 s, 15.03× the native time (median of 5)	2026-10-20	f51b93b	cargo xtask bench --box64 --fex
+performance	python-start	box64	the native AArch64 build, same machine	0.103 s, 6.99× the native time (median of 5)	2026-10-20	f51b93b	cargo xtask bench --box64 --fex
+performance	python-start	qemu-x86_64	the native AArch64 build, same machine	0.489 s, 33.32× the native time (median of 5)	2026-10-20	f51b93b	cargo xtask bench --box64 --fex
+performance	simd	FEX	the native AArch64 build, same machine	1.075 s, 32.67× the native time (median of 5)	2026-10-20	f51b93b	cargo xtask bench --box64 --fex
+performance	simd	armor --jit	the native AArch64 build, same machine	0.128 s, 3.91× the native time (median of 5)	2026-10-20	f51b93b	cargo xtask bench --box64 --fex
+performance	simd	armor --jit, first run	the native AArch64 build, same machine	0.139 s, 4.24× the native time (median of 5)	2026-10-20	f51b93b	cargo xtask bench --box64 --fex
+performance	simd	box64	the native AArch64 build, same machine	0.092 s, 2.79× the native time (median of 5)	2026-10-20	f51b93b	cargo xtask bench --box64 --fex
+performance	simd	qemu-x86_64	the native AArch64 build, same machine	0.360 s, 10.94× the native time (median of 5)	2026-10-20	f51b93b	cargo xtask bench --box64 --fex
+performance	start-dynamic	FEX	the native AArch64 build, same machine	1.061 s, 1818.47× the native time (median of 5)	2026-10-20	f51b93b	cargo xtask bench --box64 --fex
+performance	start-dynamic	armor --jit	the native AArch64 build, same machine	0.012 s, 20.45× the native time (median of 5)	2026-10-20	f51b93b	cargo xtask bench --box64 --fex
+performance	start-dynamic	armor --jit, first run	the native AArch64 build, same machine	0.021 s, 35.55× the native time (median of 5)	2026-10-20	f51b93b	cargo xtask bench --box64 --fex
+performance	start-dynamic	box64	the native AArch64 build, same machine	0.013 s, 21.62× the native time (median of 5)	2026-10-20	f51b93b	cargo xtask bench --box64 --fex
+performance	start-dynamic	qemu-x86_64	the native AArch64 build, same machine	0.032 s, 54.47× the native time (median of 5)	2026-10-20	f51b93b	cargo xtask bench --box64 --fex
+performance	start-static	FEX	the native AArch64 build, same machine	1.041 s, 2350.66× the native time (median of 5)	2026-10-20	f51b93b	cargo xtask bench --box64 --fex
+performance	start-static	armor --jit	the native AArch64 build, same machine	0.008 s, 17.56× the native time (median of 5)	2026-10-20	f51b93b	cargo xtask bench --box64 --fex
+performance	start-static	armor --jit, first run	the native AArch64 build, same machine	0.013 s, 29.54× the native time (median of 5)	2026-10-20	f51b93b	cargo xtask bench --box64 --fex
+performance	start-static	box64	the native AArch64 build, same machine	0.033 s, 75.56× the native time (median of 5)	2026-10-20	f51b93b	cargo xtask bench --box64 --fex
+performance	start-static	qemu-x86_64	the native AArch64 build, same machine	0.028 s, 63.27× the native time (median of 5)	2026-10-20	f51b93b	cargo xtask bench --box64 --fex
+performance	syscall	FEX	the native AArch64 build, same machine	1.206 s, 10.41× the native time (median of 5)	2026-10-20	f51b93b	cargo xtask bench --box64 --fex
+performance	syscall	armor --jit	the native AArch64 build, same machine	0.205 s, 1.77× the native time (median of 5)	2026-10-20	f51b93b	cargo xtask bench --box64 --fex
+performance	syscall	armor --jit, first run	the native AArch64 build, same machine	0.208 s, 1.79× the native time (median of 5)	2026-10-20	f51b93b	cargo xtask bench --box64 --fex
+performance	syscall	box64	the native AArch64 build, same machine	0.167 s, 1.44× the native time (median of 5)	2026-10-20	f51b93b	cargo xtask bench --box64 --fex
+performance	syscall	qemu-x86_64	the native AArch64 build, same machine	0.340 s, 2.93× the native time (median of 5)	2026-10-20	f51b93b	cargo xtask bench --box64 --fex
+performance	threads	FEX	the native AArch64 build, same machine	1.143 s, 12.47× the native time (median of 5)	2026-10-20	f51b93b	cargo xtask bench --box64 --fex
+performance	threads	armor --jit	the native AArch64 build, same machine	0.117 s, 1.28× the native time (median of 5)	2026-10-20	f51b93b	cargo xtask bench --box64 --fex
+performance	threads	armor --jit, first run	the native AArch64 build, same machine	0.121 s, 1.32× the native time (median of 5)	2026-10-20	f51b93b	cargo xtask bench --box64 --fex
+performance	threads	box64	the native AArch64 build, same machine	fails (signal: 11 (SIGSEGV))	2026-10-20	f51b93b	cargo xtask bench --box64 --fex
+performance	threads	qemu-x86_64	the native AArch64 build, same machine	0.295 s, 3.21× the native time (median of 5)	2026-10-20	f51b93b	cargo xtask bench --box64 --fex
 suite	difftest	armor interpreter, jit	qemu-x86_64 10.0.13	476/476	2026-10-20	b4922bb	cargo xtask difftest
 suite	difftest	armor interpreter, jit	the same source built for AArch64, run natively	3/3	2026-10-15	97f001d	cargo xtask difftest --native
 suite	difftest	armor interpreter, jit	x86-64 hardware: Intel(R) Xeon(R) CPU           X5675  @ 3.07GHz, Linux 7.0.2-6-pve	281/281	2026-10-15	97f001d	cargo xtask difftest --oracle
