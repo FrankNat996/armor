@@ -602,3 +602,15 @@ The `7zip` workload (`7zz a -txz -mx=9 -mmt=1` of `target/bench/7zip-input.bin`)
 | alignment tested with the region in concurrent mode | 10.47 s |
 
 From 13.65 to 10.47 s (−23%); box64 takes 6.8 s and FEX 8.5 s on this workload (`bench` of 2026-10-20, above).
+
+**Then** (`jit.md`, "Region tests once per base, accesses at an offset, test and shifts in place"), best of 5, `python3.13 -c` of the `bench` loops, and 7-Zip as above:
+
+| Change | python-int | python-float | 7zip |
+|---|---|---|---|
+| before (7dbfe55) | 783 ms | 685 ms | 10.47 s |
+| region tests once per base | 771 ms | 674 ms | 10.37 s |
+| covered accesses straight to `[base, #offset]` | 761 ms | 668 ms | 10.38 s |
+| checked addresses follow moved bases; pushes and pops | 724 ms | 640 ms | 10.36 s |
+| `test r, r` held | 726 ms | 645 ms | |
+| shifts by cl in place | 710 ms | 633 ms | 10.29 s |
+

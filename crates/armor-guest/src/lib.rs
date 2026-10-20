@@ -10,6 +10,12 @@ use core::ops::BitOr;
 
 pub const GUEST_PAGE_SIZE: u64 = 4096;
 
+/// ADR-0046: inaccessible bytes reserved right above the guest's region.
+/// An access that starts below the region's end and runs past it faults
+/// there, and so does any access within this distance above an address
+/// that passed the region's test (the JIT's checks rely on it).
+pub const REGION_GUARD: u64 = 0x1_0000;
+
 /// Guest page permissions, as in `PROT_*`.
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
 pub struct Prot(u8);

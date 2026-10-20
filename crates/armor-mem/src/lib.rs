@@ -277,8 +277,7 @@ pub struct AddressSpace {
 /// Linux's default `vm.mmap_min_addr`.
 const PLACEMENT_FLOOR: u64 = 0x1_0000;
 
-/// ADR-0046: inaccessible bytes reserved right above the guest's region.
-pub const REGION_GUARD: u64 = 0x1_0000;
+pub use armor_guest::REGION_GUARD;
 
 #[derive(Default)]
 struct Tables {

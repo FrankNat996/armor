@@ -41,6 +41,7 @@ use armor_cpu::{
 };
 use armor_guest::{
     PAGE_READABLE_BIT, PAGE_READABLE_SPAN_BIT, PAGE_WRITABLE_DATA_BIT, PAGE_WRITABLE_DATA_SPAN_BIT,
+    REGION_GUARD,
 };
 use armor_x86::{
     AluOp, Base, BitTestOp, Cond as X86Cond, Conversion, FloatOp, Instruction, IntOp, LaneOp,
@@ -673,6 +674,45 @@ fn registers_written(insn: &Instruction) -> u32 {
     }
 }
 
+/// A mapped register that `insn` moves by a constant, and by how much:
+/// `push` and `pop` (rsp, 64-bit stack), and `add`, `sub` of an immediate
+/// and `lea` from itself plus a constant, at 64 bits. For the checked
+/// addresses (`Translator::checked`), which follow it.
+fn base_moved(insn: &Instruction) -> Option<(HostReg, i64)> {
+    if insn.size != Size::B64 {
+        return None;
+    }
+    let rsp = register_host(RSP as u8)?;
+    match insn.op {
+        Op::Push(_) => Some((rsp, -8)),
+        Op::Pop(Operand::Reg(Reg::Gpr(n))) if usize::from(n) != RSP => Some((rsp, 8)),
+        Op::Alu {
+            op: op @ (AluOp::Add | AluOp::Sub),
+            dst: Operand::Reg(Reg::Gpr(n)),
+            src: Operand::Imm(imm),
+        } => {
+            let delta = if op == AluOp::Add {
+                imm
+            } else {
+                imm.wrapping_neg()
+            };
+            Some((register_host(n)?, delta))
+        }
+        Op::Lea {
+            dst: Reg::Gpr(n),
+            src:
+                Mem {
+                    base: Base::Gpr(b),
+                    index: None,
+                    addr32: false,
+                    disp,
+                    ..
+                },
+        } if n == b => Some((register_host(n)?, disp)),
+        _ => None,
+    }
+}
+
 /// The count of a shift masked as x86 masks it, when it is a constant.
 fn shift_constant(count: ShiftCount, size: Size) -> Option<u32> {
     let mask = if size == Size::B64 { 0x3f } else { 0x1f };
@@ -1006,6 +1046,9 @@ pub fn translate_block(
         nzcv_valid: false,
         nzcv_now: false,
         access_slow: None,
+        simple_address: None,
+        checked: Vec::new(),
+        known_aligned: false,
         faults: Vec::with_capacity(block.len()),
         write_edges: Vec::with_capacity(16),
         read_edges: Vec::new(),
@@ -1082,6 +1125,19 @@ pub fn translate_block(
         }
         fell_through = t.instruction(g)?;
         t.flush_misaligned();
+        // Checked addresses follow a base that moved by a constant; those
+        // of any other base the instruction wrote are dropped.
+        let mut written = registers_written(&g.insn);
+        if let Some((moved, delta)) = base_moved(&g.insn) {
+            written &= !(1 << moved.bits());
+            for (base, disp, _) in &mut t.checked {
+                if *base == moved {
+                    *disp = disp.wrapping_sub(delta as u64);
+                }
+            }
+        }
+        t.checked
+            .retain(|&(base, _, _)| written & (1 << base.bits()) == 0);
         if vector_access {
             t.a.dmb(Barrier::IshLd);
         }
@@ -1284,6 +1340,9 @@ pub fn flags_routine() -> Result<Vec<u32>, EncodeError> {
         nzcv_valid: false,
         nzcv_now: false,
         access_slow: None,
+        simple_address: None,
+        checked: Vec::new(),
+        known_aligned: false,
         faults: Vec::new(),
         write_edges: Vec::new(),
         read_edges: Vec::new(),
@@ -1630,6 +1689,19 @@ struct Translator {
     /// (`Options::host_reads`): the next guest load records it in
     /// `faults` (`mark_access`).
     access_slow: Option<Label>,
+    /// The address `address_into` just left in `ADDR`, when it is a mapped
+    /// base register plus a constant: (base, constant, the assembler's
+    /// position right after it, so that `check` uses it only for that
+    /// address).
+    simple_address: Option<(HostReg, u64, usize)>,
+    /// Addresses whose region test passed in this block, with the base
+    /// register unchanged since (base, constant, the alignment tested):
+    /// an access near one needs none (`REGION_GUARD`). Dropped when an
+    /// instruction writes the base.
+    checked: Vec<(HostReg, u64, u32)>,
+    /// `check` found the access covered by `checked`, aligned to its size:
+    /// the next ordered access needs no alignment test.
+    known_aligned: bool,
     /// Guest loads the host checks: (word offset, slow path).
     faults: Vec<(usize, Label)>,
     /// Out of line: writes the host checks whose address is not aligned
@@ -1889,6 +1961,21 @@ impl Translator {
                 }
                 if op != AluOp::Cmp && !stored {
                     self.write_destination(dst, size, R)?;
+                }
+            }
+            // test of a mapped register with itself, at 32 or 64 bits: the
+            // result is the register, held there (`Held`) until it changes.
+            Op::Test { a, b }
+                if a == b
+                    && matches!(size, Size::B32 | Size::B64)
+                    && whole_register(a, size).is_some() =>
+            {
+                if !self.skip_flags {
+                    let h = whole_register(a, size).expect("checked by the guard");
+                    self.flags_emitted |= STATUS_FLAGS;
+                    let mut pending = Pending::new(FlagKind::Logic, size, STATUS_FLAGS);
+                    pending.a = Held::Reg(h);
+                    self.lazy = Lazy::Static(pending);
                 }
             }
             Op::Test { a, b } => {
@@ -2249,9 +2336,12 @@ impl Translator {
                 ) && h != rsp
                 {
                     let slow = self.slow_path(at.rip, &mut slow);
-                    self.a
-                        .logic_imm(Logic::Ands, Width::X, ZR, rsp, !((1u64 << bits) - 1))?;
-                    self.a.b_cond(Cond::Ne, slow);
+                    if !self.covered(rsp, 0, 8, 1) {
+                        self.a
+                            .logic_imm(Logic::Ands, Width::X, ZR, rsp, !((1u64 << bits) - 1))?;
+                        self.a.b_cond(Cond::Ne, slow);
+                        self.checked.push((rsp, 0, 1));
+                    }
                     self.access_slow = Some(slow);
                     self.mark_access();
                     self.a
@@ -2327,9 +2417,12 @@ impl Translator {
                     && 8 + u32::from(pop) <= 255
                 {
                     let slow = self.slow_path(at.rip, &mut slow);
-                    self.a
-                        .logic_imm(Logic::Ands, Width::X, ZR, rsp, !((1u64 << bits) - 1))?;
-                    self.a.b_cond(Cond::Ne, slow);
+                    if !self.covered(rsp, 0, 8, 1) {
+                        self.a
+                            .logic_imm(Logic::Ands, Width::X, ZR, rsp, !((1u64 << bits) - 1))?;
+                        self.a.b_cond(Cond::Ne, slow);
+                        self.checked.push((rsp, 0, 1));
+                    }
                     self.access_slow = Some(slow);
                     self.mark_access();
                     self.a.load_store_indexed(
@@ -2420,7 +2513,6 @@ impl Translator {
         let bits = size.bits();
         let mask = if size == Size::B64 { 0x3f } else { 0x1f };
         let done = self.a.new_label();
-        self.load_reg(A, reg, size)?;
         let shift = match op {
             ShiftOp::Shl => Shift::Lsl,
             ShiftOp::Shr => Shift::Lsr,
@@ -2445,6 +2537,37 @@ impl Translator {
             }
             return Ok(());
         }
+        // shl, shr, sar by cl of a register mapped whole: in place too.
+        // A count of 0 writes nothing (not even the top half at 32 bits).
+        if let (None, false, Some(h)) = (constant, rotate, whole_register(Operand::Reg(reg), size))
+        {
+            match register_host(RCX as u8) {
+                Some(rcx) => self.a.logic_imm(Logic::And, Width::X, T3, rcx, mask)?,
+                None => {
+                    self.load_reg(T3, Reg::Gpr(RCX as u8), Size::B8)?;
+                    self.a.logic_imm(Logic::And, Width::X, T3, T3, mask)?;
+                }
+            }
+            if self.skip_flags {
+                if w == Width::W {
+                    self.a.cbz(false, Width::X, T3, done);
+                }
+                self.a.shift_reg(shift, w, h, h, T3);
+                self.a.bind(done);
+                return Ok(());
+            }
+            // The value before, for the deferred flags; the flags pending
+            // before stay as they are for a count of 0 (`zero_counts`).
+            self.a.mov(Width::X, A, h);
+            let (zero, back) = (self.a.new_label(), self.a.new_label());
+            self.zero_counts.push((zero, back, self.lazy));
+            self.a.cbz(false, Width::X, T3, zero);
+            self.a.shift_reg(shift, w, h, h, T3);
+            self.a.bind(back);
+            self.defer_operation(FlagKind::Shift(op, None), size, A, Some(T3));
+            return Ok(());
+        }
+        self.load_reg(A, reg, size)?;
         match constant {
             Some(0) => return Ok(()),
             Some(n) if !rotate => {
@@ -3855,6 +3978,7 @@ impl Translator {
         };
         let back = match self.misaligned.take() {
             Some((entry, _)) => Some(self.unaligned_at(entry, access)),
+            None if core::mem::take(&mut self.known_aligned) => None,
             None => self.unaligned_test(size, access),
         };
         self.mark_access();
@@ -3885,6 +4009,7 @@ impl Translator {
         let access = Unaligned::Store { size, rt, fault };
         let back = match self.misaligned.take() {
             Some((entry, _)) => Some(self.unaligned_at(entry, access)),
+            None if core::mem::take(&mut self.known_aligned) => None,
             None => self.unaligned_test(size, access),
         };
         self.mark_access();
@@ -3911,6 +4036,59 @@ impl Translator {
         Some(back)
     }
 
+    /// Whether an access of `bytes` at `base + disp`, aligned to `align`
+    /// as tested, needs no region test: near an address that passed, with
+    /// the same base (`checked`). Below that address the access is in the
+    /// region or faults (nothing is mapped below the region, and an address
+    /// that wrapped is not canonical); above it, within `REGION_GUARD`.
+    fn covered(&self, base: HostReg, disp: u64, bytes: u32, align: u32) -> bool {
+        self.checked.iter().any(|&(b, d, tested)| {
+            let delta = disp.wrapping_sub(d) as i64;
+            b == base
+                && delta.unsigned_abs() + u64::from(bytes) <= REGION_GUARD
+                && (align == 1 || (tested >= align && delta.rem_euclid(i64::from(align)) == 0))
+        })
+    }
+
+    /// A plain access of `bytes` at `mem` that can go straight to the
+    /// host's `[base, #offset]`, without computing the address: host
+    /// protection, not concurrent mode, a mapped base plus a constant that
+    /// the instruction encodes (scaled by the size), and covered by an
+    /// earlier check (`covered`). The slow path is recorded for the fault.
+    fn direct(
+        &mut self,
+        mem: &Mem,
+        bytes: u32,
+        check: Check,
+        rip: u64,
+        slow: &mut Option<Label>,
+    ) -> Option<(HostReg, u32)> {
+        if self.options.host_reads.is_none() || self.options.concurrent || mem.addr32 {
+            return None;
+        }
+        let (Base::Gpr(n), None, Segment::Default) = (mem.base, mem.index, mem.segment) else {
+            return None;
+        };
+        let base = register_host(n)?;
+        let disp = mem.disp as u64;
+        let n = u64::from(bytes);
+        if mem.disp < 0 || !disp.is_multiple_of(n) || disp / n >= 4096 {
+            return None;
+        }
+        let align = if bytes > 1 && check == Check::Write {
+            bytes.next_power_of_two()
+        } else {
+            1
+        };
+        if !self.covered(base, disp, bytes, align) {
+            return None;
+        }
+        self.flush_misaligned();
+        self.access_slow = Some(self.slow_path(rip, slow));
+        self.mark_access();
+        Some((base, disp as u32))
+    }
+
     /// The out-of-line `access` for an unaligned address that `check`
     /// already sends to `entry`; returns where it comes back.
     fn unaligned_at(&mut self, entry: Label, access: Unaligned) -> Label {
@@ -3925,6 +4103,7 @@ impl Translator {
         if let Some(stub) = self.misaligned.take() {
             self.misaligned_stubs.push(stub);
         }
+        self.known_aligned = false;
     }
 
     /// The out-of-line part of an unaligned ordered access: a plain access
@@ -4103,6 +4282,11 @@ impl Translator {
         match operand {
             Operand::Reg(reg) => self.load_reg(rt, reg, size),
             Operand::Mem(m) => {
+                if let Some((base, offset)) =
+                    self.direct(&m, bytes(size), Check::Read, at.rip, slow)
+                {
+                    return self.load(false, size, rt, base, offset);
+                }
                 self.address(&m, at.next, true)?;
                 self.check(Check::Read, bytes(size), at.rip, slow)?;
                 self.guest_load(false, size, rt)
@@ -4162,6 +4346,11 @@ impl Translator {
         match operand {
             Operand::Reg(reg) => self.store_reg(reg, size, rt),
             Operand::Mem(m) => {
+                if let Some((base, offset)) =
+                    self.direct(&m, bytes(size), Check::Write, at.rip, slow)
+                {
+                    return self.a.str(mem_size(size), rt, base, offset);
+                }
                 self.address(&m, at.next, true)?;
                 self.check(Check::Write, bytes(size), at.rip, slow)?;
                 self.guest_store(size, rt)
@@ -4417,9 +4606,13 @@ impl Translator {
             && value != rsp
         {
             let slow = self.slow_path(rip, slow);
-            self.a
-                .logic_imm(Logic::Ands, Width::X, ZR, rsp, !((1u64 << bits) - 1) | 7)?;
-            self.a.b_cond(Cond::Ne, slow);
+            // Unless an earlier check of rsp covers the slot (`covered`).
+            if !self.covered(rsp, (-8i64) as u64, 8, 8) {
+                self.a
+                    .logic_imm(Logic::Ands, Width::X, ZR, rsp, !((1u64 << bits) - 1) | 7)?;
+                self.a.b_cond(Cond::Ne, slow);
+                self.checked.push((rsp, 0, 8));
+            }
             self.access_slow = Some(slow);
             self.mark_access();
             return self
@@ -4461,6 +4654,11 @@ impl Translator {
             Width::W
         } else {
             Width::X
+        };
+        self.simple_address = None;
+        let simple = match (mem.base, mem.index) {
+            (Base::Gpr(n), None) if rd == ADDR && w == Width::X => register_host(n),
+            _ => None,
         };
         let mut disp = mem.disp as u64;
         let shift = u32::from(mem.scale).trailing_zeros();
@@ -4523,7 +4721,11 @@ impl Translator {
                     Width::X
                 };
                 self.a.add(w, ADDR, ADDR, T1, Shift::Lsl, 0)?;
+                return Ok(());
             }
+        }
+        if let Some(base) = simple {
+            self.simple_address = Some((base, mem.disp as u64, self.a.len()));
         }
         Ok(())
     }
@@ -4786,6 +4988,31 @@ impl Translator {
             let outside = !((1u64 << bits) - 1);
             self.access_slow = Some(slow);
             let misaligned = u64::from(bytes.next_power_of_two() - 1);
+            // The alignment this access needs tested: writes, and ordered
+            // reads, must not cross into a page they may not touch.
+            let align = if bytes > 1 && (check == Check::Write || self.options.concurrent) {
+                bytes.next_power_of_two()
+            } else {
+                1
+            };
+            let here = self.a.len();
+            let simple = self
+                .simple_address
+                .take()
+                .filter(|&(_, _, at)| at == here)
+                .map(|(base, disp, _)| (base, disp));
+            if let Some((base, disp)) = simple {
+                if self.covered(base, disp, bytes, align) {
+                    self.known_aligned = align > 1;
+                    return Ok(());
+                }
+                let tested = if bytes > 1 && (check == Check::Write || self.options.concurrent) {
+                    align
+                } else {
+                    1
+                };
+                self.checked.push((base, disp, tested));
+            }
             if check == Check::Read && bytes > 1 && self.options.concurrent {
                 // Ordered loads need alignment: one test for both, the
                 // unaligned case out of line (`read_edges`).

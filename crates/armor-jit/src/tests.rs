@@ -1257,6 +1257,28 @@ fn random_code_matches_the_interpreter_with_host_protection() {
         let cpu = guest.cpu(&mut rng);
         guest.compare(&code, &cpu, 7);
     }
+    // An access near one whose region test passed needs none, until its
+    // base changes: here to host memory above the region (armor's own),
+    // which the next access must not read.
+    let host = Box::new([0x1234_5678u64; 4]);
+    let host_address = host.as_ptr() as u64;
+    let end = guest.mem.host_protection().expect("host protection");
+    if host_address >= end {
+        for second in [
+            &[0x8b, 0x43, 0x08][..],   // mov eax, [rbx+8]
+            &[0x89, 0x43, 0x08],       // mov [rbx+8], eax
+            &[0x48, 0x03, 0x43, 0x10], // add rax, [rbx+16]
+            &[0x83, 0x43, 0x08, 0x01], // add dword [rbx+8], 1
+        ] {
+            let mut code = vec![0x8b, 0x03, 0x48, 0x89, 0xcb]; // mov eax, [rbx]; mov rbx, rcx
+            code.extend_from_slice(second);
+            let mut cpu = guest.cpu(&mut rng);
+            cpu.regs[3] = guest.data;
+            cpu.regs[1] = host_address;
+            guest.compare(&code, &cpu, 8);
+        }
+    }
+    assert_eq!(host[1], 0x1234_5678, "the guest wrote armor's memory");
 }
 
 /// The same in concurrent mode with ARMv8.0 alone (ADR-0032): LDAR for
@@ -1276,6 +1298,104 @@ fn random_code_matches_the_interpreter_on_armv8_0() {
         let cpu = guest.cpu(&mut rng);
         guest.compare(&code, &cpu, case + 1);
     }
+}
+
+/// With host protection, an access near one whose region test passed,
+/// with the same base, needs none (`Translator::checked`), also after the
+/// base moved by a constant (`push`, `pop`, `add`, `sub`, `lea`); far from
+/// it, or after another write of the base, it does. Counts the tests (an
+/// `ands` with the region's bits, into the zero register) on the main path.
+#[test]
+fn region_tests_cover_nearby_accesses() {
+    use crate::translator::{BlockEnd, GuestInstruction, Options, translate};
+    let tests = |code: &[&[u8]]| {
+        let block: Vec<GuestInstruction> = code
+            .iter()
+            .scan(0x1000u64, |rip, bytes| {
+                let insn = armor_x86::decode(bytes).unwrap();
+                let g = GuestInstruction { rip: *rip, insn };
+                *rip += insn.len as u64;
+                Some(g)
+            })
+            .collect();
+        let words = translate(
+            &block,
+            BlockEnd::Continue(0x2000),
+            Options {
+                features: crate::translator::HostFeatures {
+                    lse: true,
+                    rcpc: true,
+                },
+                chain: false,
+                concurrent: false,
+                compat: false,
+                host_reads: Some(38),
+                page_table: true,
+                entry_kind: 0,
+            },
+        )
+        .unwrap();
+        // ANDS (immediate, 64-bit, N = 1) into xzr, on the main path: up
+        // to the first unconditional branch (the exit).
+        words
+            .iter()
+            .take_while(|&&w| w & 0xfc00_0000 != 0x1400_0000)
+            .filter(|&&w| w >> 23 == 0b1_1110_0100 && w & 0x1f == 31 && w >> 22 & 1 == 1)
+            .count()
+    };
+    let load = [0x8b, 0x03]; // mov eax, [rbx]
+    let load_8 = [0x8b, 0x43, 0x08]; // mov eax, [rbx+8]
+    let store_4 = [0x89, 0x4b, 0x04]; // mov [rbx+4], ecx
+    let store_12 = [0x89, 0x4b, 0x0c]; // mov [rbx+12], ecx
+    // Near: one test. A read tests no alignment, so a write after it
+    // tests again; a write's test covers reads and aligned writes.
+    assert_eq!(tests(&[&load, &load_8]), 1);
+    assert_eq!(tests(&[&load, &load_8, &store_4]), 2);
+    assert_eq!(tests(&[&store_4, &load, &load_8, &store_12]), 1);
+    // rbx written: the test again.
+    assert_eq!(tests(&[&load, &[0x48, 0x89, 0xcb], &load_8]), 2);
+    // add rbx, 0x9000, then [rbx+0x9000]: 0x12000 from the first.
+    assert_eq!(
+        tests(&[
+            &load,
+            &[0x48, 0x81, 0xc3, 0x00, 0x90, 0, 0],
+            &[0x8b, 0x83, 0x00, 0x90, 0, 0]
+        ]),
+        2
+    );
+    // sub rbx, 0x9000, then [rbx+0x9000]: the first address.
+    assert_eq!(
+        tests(&[
+            &load,
+            &[0x48, 0x81, 0xeb, 0x00, 0x90, 0, 0],
+            &[0x8b, 0x83, 0x00, 0x90, 0, 0]
+        ]),
+        1
+    );
+    // lea rbx, [rbx+8], then [rbx-8].
+    assert_eq!(
+        tests(&[&load, &[0x48, 0x8d, 0x5b, 0x08], &[0x8b, 0x43, 0xf8]]),
+        1
+    );
+    // Pushes, then a load from the slots, and pops: one test of rsp.
+    assert_eq!(
+        tests(&[
+            &[0x50],
+            &[0x53],
+            &[0x51],
+            &[0x48, 0x8b, 0x44, 0x24, 0x10],
+            &[0x59],
+            &[0x5b]
+        ]),
+        1
+    );
+    // After a push, the rsp tested is 8 above rsp: [rsp+0xfff8] is
+    // within the guard's distance of it, [rsp+0x10008] is not.
+    assert_eq!(tests(&[&[0x50], &[0x8b, 0x84, 0x24, 0xf8, 0xff, 0, 0]]), 1);
+    assert_eq!(tests(&[&[0x50], &[0x8b, 0x84, 0x24, 0x08, 0, 1, 0]]), 2);
+    // A store 4 bytes off the tested alignment of 8: tested again.
+    assert_eq!(tests(&[&[0x50], &[0x89, 0x4c, 0x24, 0xfc]]), 1);
+    assert_eq!(tests(&[&[0x50], &[0x48, 0x89, 0x4c, 0x24, 0xfc]]), 2);
 }
 
 /// The concurrent-mode translation of `mov rax, [rbx]; mov [rbx], rcx`
