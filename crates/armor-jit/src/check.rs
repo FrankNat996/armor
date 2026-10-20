@@ -5,7 +5,7 @@
 
 use crate::encoder::{
     Assembler, AtomicOp, Barrier, Cond, Data1, FpOp, Lanes, Logic, MemSize, PairMode, Reg, SP,
-    Select, Shift, VReg, VShift, Vec3, Width, ZR,
+    Select, Shift, VReg, VShift, Vec3, VecFp, VecUnary, Width, ZR,
 };
 
 pub struct Sample {
@@ -760,6 +760,96 @@ pub fn samples() -> Vec<Sample> {
             a.ext(v(0), v(1), v(31), index).unwrap()
         });
     }
+    for (load, m) in [(true, "ldp"), (false, "stp")] {
+        for (t1, t2, n, offset) in [
+            (16u8, 17u8, 0u8, 160i32),
+            (30, 31, 0, 400),
+            (0, 1, 7, -1024),
+            (2, 3, 30, 1008),
+        ] {
+            s.add(format!("{m} q{t1}, q{t2}, [x{n}, #{offset}]"), |a| {
+                a.pair_q(load, v(t1), v(t2), r(n), offset).unwrap()
+            });
+        }
+    }
+    for (lanes, t, g, top) in [
+        (Lanes::B, "b", "w", 15u32),
+        (Lanes::H, "h", "w", 7),
+        (Lanes::S, "s", "w", 3),
+        (Lanes::D, "d", "x", 1),
+    ] {
+        for (d, i, n, j) in [(16u8, 0u32, 2u8, top), (31, top, 0, 0), (5, 1, 17, 1)] {
+            s.add(format!("mov v{d}.{t}[{i}], v{n}.{t}[{j}]"), |a| {
+                a.ins_element(lanes, v(d), i, v(n), j).unwrap()
+            });
+            s.add(format!("mov v{d}.{t}[{i}], {g}{n}"), |a| {
+                a.ins_gpr(lanes, v(d), i, r(n)).unwrap()
+            });
+            s.add(format!("umov {g}{n}, v{d}.{t}[{i}]"), |a| {
+                a.umov(lanes, r(n), v(d), i).unwrap()
+            });
+        }
+    }
+    for (double, p, g) in [(false, "s", "w"), (true, "d", "x")] {
+        s.add(format!("fmov {p}16, {g}5"), |a| {
+            a.fmov_from_gpr(double, v(16), r(5))
+        });
+        s.add(format!("fmov {p}0, {g}30"), |a| {
+            a.fmov_from_gpr(double, v(0), r(30))
+        });
+    }
+    for (d, n) in [(16u8, 2u8), (0, 31)] {
+        s.add(format!("mov v{d}.16b, v{n}.16b"), |a| {
+            a.mov_vector(v(d), v(n))
+        });
+    }
+    for (double, t) in [(false, "4s"), (true, "2d")] {
+        for (op, m) in [
+            (VecFp::Add, "fadd"),
+            (VecFp::Sub, "fsub"),
+            (VecFp::Mul, "fmul"),
+            (VecFp::Div, "fdiv"),
+            (VecFp::Cmeq, "fcmeq"),
+            (VecFp::Cmge, "fcmge"),
+            (VecFp::Cmgt, "fcmgt"),
+        ] {
+            for (d, n, mm) in [(2u8, 16u8, 1u8), (31, 0, 30)] {
+                s.add(format!("{m} v{d}.{t}, v{n}.{t}, v{mm}.{t}"), |a| {
+                    a.vec_fp(op, double, v(d), v(n), v(mm))
+                });
+            }
+        }
+        for (op, m) in [
+            (VecUnary::Fsqrt { double }, "fsqrt"),
+            (VecUnary::Scvtf { double }, "scvtf"),
+            (VecUnary::Fcvtzs { double }, "fcvtzs"),
+            (VecUnary::Fcvtns { double }, "fcvtns"),
+        ] {
+            s.add(format!("{m} v2.{t}, v17.{t}"), |a| {
+                a.vec_unary(op, v(2), v(17))
+            });
+        }
+        let x = if double { "2d" } else { "4s" };
+        s.add(format!("cmhi v3.{x}, v4.{x}, v20.{x}"), |a| {
+            a.cmhi(double, v(3), v(4), v(20))
+        });
+        let g = if double { "x" } else { "w" };
+        s.add(format!("dup v5.{x}, {g}10"), |a| a.dup(double, v(5), r(10)));
+    }
+    for (op, text) in [
+        (VecUnary::Fcvtl, "fcvtl v2.2d, v17.2s"),
+        (VecUnary::Fcvtn, "fcvtn v2.2s, v17.2d"),
+        (VecUnary::Sxtl, "sshll v2.2d, v17.2s, #0"),
+        (VecUnary::Xtn, "xtn v2.2s, v17.2d"),
+        (VecUnary::Not, "mvn v2.16b, v17.16b"),
+        (VecUnary::Uminv, "uminv s2, v17.4s"),
+        (VecUnary::Umaxv, "umaxv s2, v17.4s"),
+    ] {
+        s.add(text.into(), |a| a.vec_unary(op, v(2), v(17)));
+    }
+    s.add("bsl v3.16b, v16.16b, v1.16b".into(), |a| {
+        a.bsl(v(3), v(16), v(1))
+    });
     s.add("movi v0.2d, #0".into(), |a| a.movi_zero(v(0)));
     s.add("movi v31.2d, #0".into(), |a| a.movi_zero(v(31)));
     for (size, suffix, reg) in [

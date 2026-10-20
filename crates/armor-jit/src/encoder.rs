@@ -169,7 +169,12 @@ pub struct Assembler {
 
 impl Assembler {
     pub fn new() -> Assembler {
-        Assembler::default()
+        // Room for a typical block, so that emitting does not reallocate.
+        Assembler {
+            words: Vec::with_capacity(1024),
+            labels: Vec::with_capacity(256),
+            fixups: Vec::with_capacity(256),
+        }
     }
 
     /// The encoded words; every label used must be bound.
@@ -233,7 +238,7 @@ impl Assembler {
 
     /// Any 64-bit constant, in one to four instructions.
     pub fn mov_imm64(&mut self, rd: Reg, value: u64) {
-        let halves: Vec<u16> = (0..4).map(|i| (value >> (16 * i)) as u16).collect();
+        let halves: [u16; 4] = std::array::from_fn(|i| (value >> (16 * i)) as u16);
         let zeros = halves.iter().filter(|&&h| h == 0).count();
         let ones = halves.iter().filter(|&&h| h == 0xffff).count();
         let mut started = false;
@@ -1023,6 +1028,137 @@ impl Assembler {
         Ok(())
     }
 
+    /// LDP Qt1, Qt2 / STP Qt1, Qt2 with a signed offset, a multiple of 16
+    /// from -1024 to 1008.
+    pub fn pair_q(&mut self, load: bool, vt1: VReg, vt2: VReg, rn: Reg, offset: i32) -> Result<()> {
+        if offset % 16 != 0 || !(-1024..=1008).contains(&offset) {
+            return fail(format!("offset {offset} not encodable for a Q pair"));
+        }
+        let imm7 = ((offset / 16) as u32) & 0x7f;
+        let base = if load { 0xAD40_0000 } else { 0xAD00_0000 };
+        self.emit(base | (imm7 << 15) | (vt2.bits() << 10) | (rn.bits() << 5) | vt1.bits());
+        Ok(())
+    }
+
+    /// The imm5 field of the element instructions: the lane size and
+    /// `index`.
+    fn element(lanes: Lanes, index: u32) -> Result<u32> {
+        let size = lanes.size();
+        if index >= 16 >> size {
+            return fail(format!("lane {index} out of range"));
+        }
+        Ok((index << (size + 1)) | (1 << size))
+    }
+
+    /// INS vd.T[dst], vn.T[src] (MOV element): one lane of vn into one
+    /// lane of vd; the other lanes stay.
+    pub fn ins_element(
+        &mut self,
+        lanes: Lanes,
+        vd: VReg,
+        dst: u32,
+        vn: VReg,
+        src: u32,
+    ) -> Result<()> {
+        let imm5 = Self::element(lanes, dst)?;
+        Self::element(lanes, src)?;
+        let imm4 = src << lanes.size();
+        self.emit(0x6E00_0400 | (imm5 << 16) | (imm4 << 11) | (vn.bits() << 5) | vd.bits());
+        Ok(())
+    }
+
+    /// INS vd.T[index], rn (MOV from a general register): the low bits of
+    /// rn (W, X for D lanes) into one lane; the other lanes stay.
+    pub fn ins_gpr(&mut self, lanes: Lanes, vd: VReg, index: u32, rn: Reg) -> Result<()> {
+        let imm5 = Self::element(lanes, index)?;
+        self.emit(0x4E00_1C00 | (imm5 << 16) | (rn.bits() << 5) | vd.bits());
+        Ok(())
+    }
+
+    /// UMOV rd, vn.T[index]: one lane, zero-extended (W, X for D lanes).
+    pub fn umov(&mut self, lanes: Lanes, rd: Reg, vn: VReg, index: u32) -> Result<()> {
+        let imm5 = Self::element(lanes, index)?;
+        let q = u32::from(lanes == Lanes::D) << 30;
+        self.emit(0x0E00_3C00 | q | (imm5 << 16) | (vn.bits() << 5) | rd.bits());
+        Ok(())
+    }
+
+    /// FMOV Sd, Wn / Dd, Xn: the low lane of vd = rn, the rest of vd
+    /// zeroed.
+    pub fn fmov_from_gpr(&mut self, double: bool, vd: VReg, rn: Reg) {
+        let word = if double { 0x9E67_0000 } else { 0x1E27_0000 };
+        self.emit(word | (rn.bits() << 5) | vd.bits());
+    }
+
+    /// MOV vd.16B, vn.16B (ORR with itself).
+    pub fn mov_vector(&mut self, vd: VReg, vn: VReg) {
+        self.emit(0x4EA0_1C00 | (vn.bits() << 16) | (vn.bits() << 5) | vd.bits());
+    }
+
+    /// Floating point on every lane of 128-bit vectors (`double`: 2D,
+    /// otherwise 4S): FADD, FSUB, FMUL, FDIV; FCMEQ (quiet), FCMGE and
+    /// FCMGT (signaling: any NaN raises IOC) give all ones where true.
+    pub fn vec_fp(&mut self, op: VecFp, double: bool, vd: VReg, vn: VReg, vm: VReg) {
+        let base = match op {
+            VecFp::Add => 0x4E20_D400,
+            VecFp::Sub => 0x4EA0_D400,
+            VecFp::Mul => 0x6E20_DC00,
+            VecFp::Div => 0x6E20_FC00,
+            VecFp::Cmeq => 0x4E20_E400,
+            VecFp::Cmge => 0x6E20_E400,
+            VecFp::Cmgt => 0x6EA0_E400,
+        };
+        self.emit(
+            base | (u32::from(double) << 22) | (vm.bits() << 16) | (vn.bits() << 5) | vd.bits(),
+        );
+    }
+
+    /// One-operand operations on every lane of a 128-bit vector.
+    pub fn vec_unary(&mut self, op: VecUnary, vd: VReg, vn: VReg) {
+        let word = match op {
+            VecUnary::Fsqrt { double } => 0x6EA1_F800 | (u32::from(double) << 22),
+            // Signed integer lanes to floating point (4S or 2D).
+            VecUnary::Scvtf { double } => 0x4E21_D800 | (u32::from(double) << 22),
+            // Floating point to signed integer lanes, saturated: toward
+            // zero, or to nearest with ties to even.
+            VecUnary::Fcvtzs { double } => 0x4EA1_B800 | (u32::from(double) << 22),
+            VecUnary::Fcvtns { double } => 0x4E21_A800 | (u32::from(double) << 22),
+            // The two low singles to doubles.
+            VecUnary::Fcvtl => 0x0E61_7800,
+            // Two doubles to the low singles, the high half zeroed.
+            VecUnary::Fcvtn => 0x0E61_6800,
+            // The two low int32 lanes sign-extended to int64 (SSHLL #0).
+            VecUnary::Sxtl => 0x0F20_A400,
+            // The two int64 lanes narrowed to the low int32 lanes, the high
+            // half zeroed (XTN).
+            VecUnary::Xtn => 0x0EA1_2800,
+            // NOT of every byte.
+            VecUnary::Not => 0x6E20_5800,
+            // The unsigned minimum or maximum of the four 32-bit lanes,
+            // into the low lane (UMINV, UMAXV).
+            VecUnary::Uminv => 0x6EB1_A800,
+            VecUnary::Umaxv => 0x6EB0_A800,
+        };
+        self.emit(word | (vn.bits() << 5) | vd.bits());
+    }
+
+    /// BSL: vd = (vd & vn) | (!vd & vm), the bits of vd selecting.
+    pub fn bsl(&mut self, vd: VReg, vn: VReg, vm: VReg) {
+        self.emit(0x6E60_1C00 | (vm.bits() << 16) | (vn.bits() << 5) | vd.bits());
+    }
+
+    /// CMHI: all ones where vn > vm, unsigned (4S or, `double`, 2D).
+    pub fn cmhi(&mut self, double: bool, vd: VReg, vn: VReg, vm: VReg) {
+        let size = if double { 3 } else { 2 };
+        self.emit(0x6E20_3400 | (size << 22) | (vm.bits() << 16) | (vn.bits() << 5) | vd.bits());
+    }
+
+    /// DUP vd.4S (or `double`, 2D), rn: every lane = rn.
+    pub fn dup(&mut self, double: bool, vd: VReg, rn: Reg) {
+        let imm5 = if double { 0b01000 } else { 0b00100 };
+        self.emit(0x4E00_0C00 | (imm5 << 16) | (rn.bits() << 5) | vd.bits());
+    }
+
     /// vd = vn op vm, lane by lane.
     pub fn vec3(&mut self, op: Vec3, lanes: Lanes, vd: VReg, vn: VReg, vm: VReg) -> Result<()> {
         let size = lanes.size();
@@ -1245,6 +1381,34 @@ impl Assembler {
         );
         Ok(())
     }
+}
+
+/// Floating point on vector lanes (`Assembler::vec_fp`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VecFp {
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Cmeq,
+    Cmge,
+    Cmgt,
+}
+
+/// One-operand vector operations (`Assembler::vec_unary`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VecUnary {
+    Fsqrt { double: bool },
+    Scvtf { double: bool },
+    Fcvtzs { double: bool },
+    Fcvtns { double: bool },
+    Fcvtl,
+    Fcvtn,
+    Sxtl,
+    Xtn,
+    Not,
+    Uminv,
+    Umaxv,
 }
 
 /// Scalar floating-point arithmetic.

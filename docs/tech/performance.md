@@ -533,3 +533,27 @@ Found in the translation of Python's dictionary lookup (`PyDict_Contains`, block
 | python-float | 1196 ms | 1104 ms | 945 ms | −21% | 4387 ms | 183 ms |
 
 7-Zip goes from 2.7 to 2.4 times native (box64 1.1, FEX 1.4 on 2026-10-15); Python's loops from 6 to about 5 times. What is left in the same block: the permission check of every access (ADR-0046, proposed), r8 and r9 in the `Cpu` (a load and a store at each use), and the deferred operands of `cmp` saved even when the next instruction overwrites them.
+
+## xmm registers in vector registers, packed floating point, cheaper translation (M11, 2026-10-20)
+`jit.md`, sections "xmm registers in vector registers" and "Packed SSE floating point"; and three changes to the cost of translating: the encoder's `mov_imm64` allocated a `Vec` for every constant (now an array), the assembler's buffers start with room for a block, and every exit records its status through one shared entry of the epilogue instead of two instructions of its own (3.70 → 3.50 million AArch64 instructions on Python's startup). Python's startup translates in 83 ms instead of 123 (`ARMOR_JIT_STATS`).
+
+**Warm-up, measured and left off:** an option makes the engine interpret a block a few times before translating it (`Jit::set_warm_up`, `ARMOR_JIT_WARMUP=N` for measurements, default 0). On Python's startup (median of 7, `python3 -c pass`): 0 runs 241 ms, 1 234, 2 235, 4 245, 8 267, 16 306, 32 364, 64 451. The interpreter costs more than translating as soon as a block runs a few times, so the gain is 3% at best: the default stays 0, and the cost is attacked in the translator instead (M11, item 6).
+
+✅ `cargo xtask bench --runs 5`, Pi 5 with 4K pages, before (0ba3cd0) and after (all three changes), the machine otherwise idle. A first run of the intermediate builds was invalid: other work ran on the machine at the same time (7-Zip 36.8 s); measured again alone. Median of 5:
+
+| Benchmark | before | after | change | translating after |
+|---|---|---|---|---|
+| start-static | 9.3 ms | 7.8 ms | −16% | 3.2 ms |
+| start-dynamic | 18.0 ms | 15.0 ms | −17% | 7.1 ms |
+| integer | 195 ms | 194 ms | −1% | 3.6 ms |
+| float | 253 ms | 190 ms | −25% | 4.1 ms |
+| simd | 205 ms | 171 ms | −17% | 3.6 ms |
+| syscall | 212 ms | 216 ms | +2% | 3.5 ms |
+| memory | 265 ms | 243 ms | −8% | 4.4 ms |
+| threads | 144 ms | 146 ms | +1% | 7.6 ms |
+| 7zip | 14942 ms | 15092 ms | +1% | 34.2 ms |
+| python-start | 226 ms | 191 ms | −15% | 83.2 ms |
+| python-int | 1104 ms | 1055 ms | −4% | 87.8 ms |
+| python-float | 945 ms | 923 ms | −2% | 88.5 ms |
+
+The xmm registers alone (measured on the intermediate build, the first run): `float` 253 → 192 ms, `simd` 205 → 173 ms; Python's float loop does not change, as its floats live in objects in memory.

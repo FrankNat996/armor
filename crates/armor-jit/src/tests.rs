@@ -1797,6 +1797,95 @@ fn float_operations_on_special_values() {
     }
 }
 
+/// Packed floating point (`sse_packed`) on lanes of special values: each
+/// lane drawn from NaNs, infinities, denormals, zeros, values whose
+/// product underflows, and values out of int32's range; every operation,
+/// compare predicate and conversion, with registers and with memory.
+#[test]
+fn packed_float_operations_on_special_values() {
+    let guest = Guest::new();
+    let mut rng = Rng(53);
+    let singles: [u32; 16] = [
+        0,
+        0x8000_0000,
+        0x3f80_0000,
+        0xbf80_0000,
+        0x7f80_0000,
+        0xff80_0000,
+        0x7fc0_0000,
+        0xffc0_0001,
+        0x7f80_0001,
+        0x0000_0001,
+        0x0080_0001,
+        0x3f7f_fffe,
+        0x4f32_d05e,
+        0xcf32_d05e,
+        0x4f00_0000,
+        0x3eaa_aaab,
+    ];
+    let doubles: [u64; 12] = [
+        0,
+        0x8000_0000_0000_0000,
+        0x3ff0_0000_0000_0000,
+        0x7ff0_0000_0000_0000,
+        0x7ff8_0000_0000_0000,
+        0xfff8_0000_0000_0001,
+        0x7ff0_0000_0000_0001,
+        0x0000_0000_0000_0001,
+        0x0010_0000_0000_0001,
+        0x3fef_ffff_ffff_fffe,
+        0x3810_0000_0000_0001,
+        0x47ef_ffff_e000_0000,
+    ];
+    let mut codes: Vec<Vec<u8>> = Vec::new();
+    for prefix in [&[][..], &[0x66]] {
+        for op in [0x58u8, 0x59, 0x5c, 0x5d, 0x5e, 0x5f, 0x51] {
+            codes.push([prefix, &[0x0f, op, 0xc1]].concat());
+        }
+        for predicate in 0..8 {
+            codes.push([prefix, &[0x0f, 0xc2, 0xc1, predicate]].concat());
+        }
+    }
+    // cvtdq2ps, cvtps2dq, cvttps2dq, cvtps2pd, cvtpd2ps, cvtdq2pd.
+    for code in [
+        &[0x0f, 0x5b, 0xc1][..],
+        &[0x66, 0x0f, 0x5b, 0xc1],
+        &[0xf3, 0x0f, 0x5b, 0xc1],
+        &[0x0f, 0x5a, 0xc1],
+        &[0x66, 0x0f, 0x5a, 0xc1],
+        &[0xf3, 0x0f, 0xe6, 0xc1],
+    ] {
+        codes.push(code.to_vec());
+    }
+    // The memory forms: [rbx + 0x40] (aligned) and, for the m64 sources
+    // of cvtps2pd and cvtdq2pd, [rbx + 0x44].
+    let with_memory: Vec<Vec<u8>> = codes
+        .iter()
+        .map(|code| {
+            let mut code = code.clone();
+            let at = code.iter().position(|&b| b == 0xc1).expect("a modrm");
+            let m64 = code.ends_with(&[0x5a, 0xc1]) && code.len() == 3
+                || code[0] == 0xf3 && code[2] == 0xe6;
+            code[at] = 0x43;
+            code.insert(at + 1, if m64 { 0x44 } else { 0x40 });
+            code
+        })
+        .collect();
+    codes.extend(with_memory);
+    for round in 0..4000 {
+        let mut cpu = guest.cpu(&mut rng);
+        for reg in [0, 1] {
+            cpu.xmm[reg] = if round % 2 == 0 {
+                (0..4).fold(0u128, |v, i| v | u128::from(rng.pick(&singles)) << (32 * i))
+            } else {
+                u128::from(rng.pick(&doubles)) | u128::from(rng.pick(&doubles)) << 64
+            };
+        }
+        let code = &codes[rng.below(codes.len() as u64) as usize];
+        guest.compare(code, &cpu, round + 1);
+    }
+}
+
 /// Not a test: a tool for reading generated code (docs/tech/performance.md).
 /// Translates the block in the hex bytes of `ARMOR_DUMP_HEX`, at guest
 /// address `ARMOR_DUMP_RIP` (hex), and writes the AArch64 code to

@@ -40,10 +40,10 @@ Summary of the current code (`crates/armor-jit`). The per-increment sections, fu
 - `stats.rs`: translation counters for the whole process (blocks, guest instructions, AArch64 instructions, time), printed at exit when `ARMOR_JIT_STATS` is set. `cargo xtask bench` uses them (`tech/performance.md`). On python startup: 34,503 blocks, 146,657 guest instructions, 3.48 million AArch64 instructions (about 24 per guest instruction, prologues, exits and slow paths included), 100 ms (2026-10-13, after increment 19, which hardly changes this total: dead flags weigh in hot loops, not in the bulk of the code).
 
 **Block.** At most 64 guest instructions; it ends at an unconditional jump, a call or a return, at the first untranslated instruction or at the limit. A conditional jump inside a block is a side exit (since 2026-10-15, below). It is an `extern "C" fn(cpu, page_table, context) -> state` function:
-- **prologue**, executed only when the block is called by the engine: saves `x19`–`x30` on the stack, loads the mapped guest registers, `rflags` and the budget, and clears `KIND`. It is 16 instructions; `CHAINED_ENTRY` = 64 bytes (60 until 2026-10-15, when r10 and r11 got host registers);
+- **prologue**, executed only when the block is called by the engine: saves `x19`–`x30` on the stack, loads the mapped guest registers, the xmm registers (`ldp q`, since 2026-10-20), `rflags` and the budget, and clears `KIND`. It is 24 instructions; `CHAINED_ENTRY` = 96 bytes (60 until 2026-10-15, when r10 and r11 got host registers; 64 until 2026-10-20, when xmm0–15 got vector registers);
 - **body:** at the start it subtracts the block's instruction count from the budget, then the translated instructions;
 - **exits:** towards a known address, a rewritable `b` (chaining); towards a computed address, the lookup in the indirect jump table; otherwise the epilogue. A conditional jump that is not the block's last instruction branches, when taken, to an out-of-line exit with the flags state of that point, and the block goes on;
-- **epilogue**, on the way to the engine: computes the flags still pending, writes registers, `rflags` and `rip` back into the `Cpu`, and returns the status (`Context::status`): continue, interpret the instruction at `rip`, or continue and link the exit.
+- **epilogue**, on the way to the engine: computes the flags still pending, writes registers, xmm registers, `rflags` and `rip` back into the `Cpu`, and returns the status (`Context::status`, recorded by one entry of the epilogue per status that the exits share): continue, interpret the instruction at `rip`, or continue and link the exit.
 
 **Host registers:**
 
@@ -56,7 +56,9 @@ Summary of the current code (`crates/armor-jit`). The per-increment sections, fu
 | `x12`, `x13` | `rflags`, budget |
 | `x19`, `x20`, `x21` | lazy flags: operands (`FA`, `FB`) and code of the pending operation (`KIND`) |
 | `x4`–`x7`, `x8`, `x10`, `x11`, `x14`, `x15` | temporaries; `x7` is the guest address, `x8` also the exit `rip` |
-| `v0`–`v2` | temporaries for SSE operations with NEON |
+| `v16`–`v31` | xmm0–xmm15 (since 2026-10-20), loaded by the prologue and stored by the epilogue |
+| `v1`, `v2` | temporaries for SSE operations |
+| `v3`, `v4` | the two MMX scratch registers inside one MMX instruction (the interpreter's `Cpu::mm_scratch`, which translated code leaves zero) |
 
 `x18` is free for programs on Linux (the platform register only elsewhere). `x30` is the link register only for the one call blocks make, to the flag routine (generated code, which touches neither): the block keeps it on the stack around that `blr`.
 
@@ -569,6 +571,33 @@ The same block, after the flags: copies of operands through the temporaries `A`/
 Measured with the flags above (`tech/performance.md`): 7-Zip 16.4 → 14.9 s, `integer` 225 → 195 ms, `python-float` 1,104 → 945 ms; the block's main path from 439 to 352 instructions.
 
 Verification: the random tests now also generate addresses without a base and with a base kept in the `Cpu`; mutations caught: the sense of an immediate's sign, a negative displacement added, an index without a base left unscaled (caught only after the generator's new forms), the deferred operand taken after the register changed (logical and arithmetic), a 64-bit `mov` into a register in the `Cpu` widened to 32 bits. Surviving: a 32-bit stack pointer that wraps at 4 GiB in compatibility mode (`push`, `pop`; the same arithmetic as before, which the random tests do not reach), and the immediate of `test` at 64 bits instead of 32 (equivalent: the immediate has no higher bits).
+
+## xmm registers in vector registers (M11, 2026-10-20)
+Until 2026-10-20 every SSE instruction read its operands from `Cpu::xmm` and wrote its result back there: `addsd xmm0, xmm1` was 13 instructions, two loads and a store among them, plus the checks for denormals and NaN, and integer SSE loaded both registers with `ldr q` and stored the destination.
+
+Now xmm0–xmm15 live in `v16`–`v31` for the whole chain of blocks, like the mapped general registers: the prologue loads them with eight `ldp q`, the epilogue stores them with eight `stp q` (v16–v31 are caller-saved for the code that calls a block, and blocks call nothing that uses them).
+- **Lane operations, logic, unpacks, shifts:** straight into the destination's register (`vector_op`); a memory source is one `ldr q` into a temporary.
+- **Shuffles** (`pshufd`, `pshuflw`/`pshufhw`, `shufps`/`shufpd`) with `INS` (element), lane by lane into a temporary and then one move, so that a source that is also the destination is read whole first; `pextrw` with `UMOV`, `pinsrw` and `movhps`/`movlps` loads with `INS` from a general register.
+- **Moves:** register to register one `mov v.16b`; to and from memory one `ldr q`/`str q`; `movd`/`movq` to xmm with `FMOV` from a general register, which zeroes the rest as x86 does; `movss`/`movsd` loads with a scalar `ldr`, which zeroes it too.
+- **Scalar floating point:** the operands are the registers' low lanes; the result goes into the destination's low lane with `INS`, which keeps the other lanes, as x86 does. The denormal check reads an operand's bits with `FMOV` from the register.
+- **MMX:** the two scratch registers became `v3` and `v4`, so MMX lane operations no longer touch memory; `movq2dq`/`movdq2q` use `FMOV`.
+
+The encoder gained `ldp`/`stp q`, `INS` (element and general), `UMOV`, `FMOV` from a general register and the vector `MOV`, all checked by `encoder-check` (12,582 samples, 0 differences).
+
+Verification: the random JIT tests in every mode and lockstep (which compares xmm registers after every instruction); mutations caught: the scalar result written over the whole register, `pshufd`'s lanes reversed, the halves of `pshufw` exchanged, `movhlps` and `movlhps` exchanged, `movq xmm, xmm` keeping the upper half, a `cmpsd` mask over 64 bits for `cmpss`, the prologue's pairs exchanged, the epilogue storing one pair less.
+
+## Packed SSE floating point (M11, 2026-10-20)
+With the xmm registers in vector registers, packed floating point is translated too (`sse_packed`): `addps`/`addpd`, `subps`, `mulps`, `divps`, `minps`, `maxps`, `sqrtps` (and their `pd` forms), `cmpps`/`cmppd` with the eight predicates, and the conversions `cvtdq2ps`, `cvtps2dq`, `cvttps2dq`, `cvtdq2pd`, `cvtps2pd`, `cvtpd2ps` (`cvtpd2dq`/`cvttpd2dq`, `rcpps` and `rsqrtps` stay with the interpreter). The scalar path's rules apply to every lane (`tech/floating-point.md`):
+- a denormal operand in any lane goes to the interpreter before the operation (x86 raises DE): integer vector operations on the lanes' bits (`slow_if_denormal_lanes`: the bits without the sign, minus 1, below twice the smallest normal number minus 1) and one `UMAXV`;
+- a NaN result in any lane goes to the interpreter, which applies x86's NaN rules (`FCMEQ` of the result with itself, `UMINV`); an operand of a conversion is checked with integer compares instead, because a floating-point compare raises IOC for a signaling NaN before the interpreter runs (lockstep found it);
+- UFC after a multiplication, a division or `cvtpd2ps`: cleared out of line, then the interpreter, which decides UE (tininess after rounding). It is checked before the NaN, so that a NaN's slow path does not find another lane's UFC in FPSR (lockstep found that too);
+- `minps`/`maxps` are a signaling compare (`FCMGT`) and a select (`BSL`): src when unordered or equal, IE for any NaN, as x86; the predicates: `FCMEQ` (quiet) for eq, unord, neq, ord, `FCMGT`/`FCMGE` (signaling) for lt, le, nlt, nle, and `NOT` for the negated ones;
+- `cvtps2dq`: a lane the host saturates to 0x7fffffff goes to the interpreter (x86 gives 0x80000000; for large negative values both give 0x80000000).
+- They are translated only with MXCSR's control bits at their default, like scalar floating point (`uses_mxcsr_control`).
+
+The encoder gained the vector `FADD`, `FSUB`, `FMUL`, `FDIV`, `FSQRT`, `FCMEQ`, `FCMGE`, `FCMGT`, `SCVTF`, `FCVTZS`, `FCVTNS`, `FCVTL`, `FCVTN`, `SSHLL`, `XTN`, `NOT`, `UMINV`, `UMAXV`, `BSL`, `CMHI` and `DUP` (`encoder-check`: 12,630 samples, 0 differences).
+
+Verification: the new test `packed_float_operations_on_special_values` (4,000 rounds: every operation, predicate and conversion, with registers and memory, on lanes drawn from NaNs, infinities, denormals, zeros, products that underflow, values out of int32's range), with lockstep, which requires a slow path to leave the state as it was but for MXCSR flags the interpreter raises too. Mutations caught: `minps`'s operands exchanged, the negated predicates, lt as le, no check for 0x7fffffff, `cvtdq2pd` without the sign extension, no denormal check. Two survive and are equivalent in the results: a denormal limit one too high and a NaN check that also catches the largest finite values, which only send more cases to the interpreter.
 
 ## Postponed
 Traces, SMC through host protection, per-page invalidation. Done after this list: scalar SSE floating point (increment 17), parallelism with TSO (ADR-0023).

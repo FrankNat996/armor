@@ -550,6 +550,19 @@ struct Guest {
     always_serialize: bool,
 }
 
+/// Runs a block warms up in the interpreter before the JIT translates it
+/// (`Jit::set_warm_up`, `tech/performance.md`); `ARMOR_JIT_WARMUP=N`
+/// overrides it, for measurements.
+fn jit_warm_up() -> u32 {
+    std::env::var("ARMOR_JIT_WARMUP")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(JIT_WARM_UP)
+}
+
+/// The default of `jit_warm_up`.
+const JIT_WARM_UP: u32 = 0;
+
 /// Runs one guest thread until it exits. Errors that end the whole guest
 /// (an unsupported instruction or syscall, a fatal signal) end armor from
 /// here.
@@ -562,9 +575,11 @@ fn run_thread(guest: &'static Guest, cpu: &mut Cpu, thread: &mut syscall::Thread
         } else {
             Jit::new()
         };
-        jit.unwrap_or_else(|e| {
+        let mut jit = jit.unwrap_or_else(|e| {
             fatal_armor_error(format_args!("cannot allocate the JIT's code buffer: {e}"))
-        })
+        });
+        jit.set_warm_up(jit_warm_up());
+        jit
     });
     let mut turns = Turns::new(current_tid());
     loop {

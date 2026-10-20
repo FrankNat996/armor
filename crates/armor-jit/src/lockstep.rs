@@ -195,7 +195,9 @@ pub(crate) fn run(
         // drop `code`. Translate again from the restored bytes.
         let code = match jit.entry(rip, mem) {
             Entry::Code(code) => code,
-            Entry::Interpret => unreachable!("the bytes at {rip:#x} are restored"),
+            Entry::Interpret | Entry::Cold(_) => {
+                unreachable!("the bytes at {rip:#x} are restored")
+            }
         };
         // Budget enough for the one instruction: lockstep blocks are not
         // chained.

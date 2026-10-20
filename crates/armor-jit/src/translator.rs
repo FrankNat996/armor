@@ -41,13 +41,14 @@ use armor_mem::{
     PAGE_READABLE_BIT, PAGE_READABLE_SPAN_BIT, PAGE_WRITABLE_DATA_BIT, PAGE_WRITABLE_DATA_SPAN_BIT,
 };
 use armor_x86::{
-    AluOp, Base, BitTestOp, Cond as X86Cond, FloatOp, Instruction, IntOp, LaneOp, LogicOp, Mem, Op,
-    Operand, Reg, Segment, ShiftCount, ShiftKind, ShiftOp, Size, SseOp, UnaryOp,
+    AluOp, Base, BitTestOp, Cond as X86Cond, Conversion, FloatOp, Instruction, IntOp, LaneOp,
+    LogicOp, Mem, Op, Operand, Reg, Segment, ShiftCount, ShiftKind, ShiftOp, Size, SseOp, UnaryOp,
 };
 
 use crate::encoder::{
     Assembler, AtomicOp, Barrier, Cond, Data1, EncodeError, FpOp, Label, Lanes, Logic, MemSize,
-    PairMode, Reg as HostReg, SP, Select, Shift, VReg, VShift, Vec3, Width, ZR, encode_bitmask,
+    PairMode, Reg as HostReg, SP, Select, Shift, VReg, VShift, Vec3, VecFp, VecUnary, Width, ZR,
+    encode_bitmask,
 };
 
 /// Continue at `Cpu::rip` (the block ended with a jump or at its size cap).
@@ -65,7 +66,7 @@ pub const EXIT_CHAIN: u64 = 2;
 pub const MAX_BLOCK_INSTRUCTIONS: usize = 64;
 
 /// Offset of the entry that chained blocks jump to: after the prologue.
-pub const CHAINED_ENTRY: usize = 64;
+pub const CHAINED_ENTRY: usize = 96;
 
 /// What a block reads and writes besides the `Cpu`.
 #[derive(Debug, Default)]
@@ -231,9 +232,14 @@ const GUEST: [Option<HostReg>; 16] = {
         h(17),
     ]
 };
-// Vector registers (caller-saved).
-const V0: VReg = VReg::new(0);
+// Vector temporaries (caller-saved); xmm0–15 are in v16–v31 (`xreg`).
 const V1: VReg = VReg::new(1);
+// More temporaries of packed floating point (`sse_packed`); v3 and v4 are
+// MMX's scratch registers only inside MMX instructions.
+const V3: VReg = VReg::new(3);
+const V4: VReg = VReg::new(4);
+const V5: VReg = VReg::new(5);
+const V6: VReg = VReg::new(6);
 const V2: VReg = VReg::new(2);
 
 /// Status flags from the host's NZCV and the low byte of a result, as
@@ -291,7 +297,10 @@ pub fn uses_mxcsr_control(insn: &Instruction) -> bool {
                 | SseOp::FloatCmpMask { .. }
                 | SseOp::IntToFloat { .. }
                 | SseOp::FloatToInt { .. }
-                | SseOp::FloatToFloat { .. },
+                | SseOp::FloatToFloat { .. }
+                | SseOp::PackedArith { .. }
+                | SseOp::PackedCmpMask { .. }
+                | SseOp::PackedConvert(_),
             ..
         }
     )
@@ -423,10 +432,19 @@ pub fn supported(insn: &Instruction) -> bool {
                     gpr_dst && (from_xmm || src.is_mem() && xmm_or_mem(&src))
                 }
                 SseOp::FloatSignMask { .. } => gpr_dst && from_xmm,
-                // Packed floating point, the rarer SSE2 integer forms and
-                // SSE3: interpreter (docs/tech/jit.md).
+                // Packed floating point (`sse_packed`), but rcpps/rsqrtps
+                // and cvtpd2dq.
+                SseOp::PackedArith {
+                    op: FloatOp::Rcp | FloatOp::Rsqrt,
+                    ..
+                }
+                | SseOp::PackedConvert(Conversion::Pd2Dq { .. }) => false,
                 SseOp::PackedArith { .. }
-                | SseOp::AddSub { .. }
+                | SseOp::PackedCmpMask { .. }
+                | SseOp::PackedConvert(_) => to_xmm && xmm_or_mem(&src),
+                // The rarer SSE2 integer forms and SSE3: interpreter
+                // (docs/tech/jit.md).
+                SseOp::AddSub { .. }
                 | SseOp::Horizontal { .. }
                 | SseOp::Int(_)
                 | SseOp::Ptest
@@ -438,8 +456,6 @@ pub fn supported(insn: &Instruction) -> bool {
                 | SseOp::Round { .. }
                 | SseOp::Dp { .. }
                 | SseOp::MovDup(_)
-                | SseOp::PackedCmpMask { .. }
-                | SseOp::PackedConvert(_)
                 | SseOp::ShiftXmm { .. }
                 | SseOp::Pmaddwd
                 | SseOp::Psadbw
@@ -863,6 +879,7 @@ pub fn translate(
     let mut t = Translator {
         a: Assembler::new(),
         epilogue: None,
+        status_entries: Vec::new(),
         slow_paths: Vec::new(),
         side_exits: Vec::new(),
         last: false,
@@ -872,6 +889,7 @@ pub fn translate(
         underflows: Vec::new(),
         denormals: Vec::new(),
         zero_counts: Vec::new(),
+        packed_underflows: Vec::new(),
         live: STATUS_FLAGS,
         skip_flags: false,
         flags_emitted: 0,
@@ -902,6 +920,7 @@ pub fn translate(
         )?;
     }
     t.guest_registers(true)?;
+    t.vector_registers(true)?;
     t.a.ldr(MemSize::B64, FLAGS, CPU, field(offset_of!(Cpu, rflags)))?;
     t.a.ldr(
         MemSize::B64,
@@ -914,7 +933,7 @@ pub fn translate(
     assert_eq!(
         t.a.len() * 4,
         CHAINED_ENTRY,
-        "the prologue is thirteen pairs, two loads and a move"
+        "the prologue is twenty-one pairs, two loads and a move"
     );
     // The budget: when it runs out, back to the engine before this block.
     let start = block.first().expect("a block has an instruction").rip;
@@ -926,7 +945,7 @@ pub fn translate(
     for (i, (g, &live)) in block.iter().zip(&live).enumerate() {
         t.live = live;
         t.last = i + 1 == block.len();
-        assert!(
+        debug_assert!(
             supported(&g.insn),
             "translating an unsupported {:?}",
             g.insn
@@ -967,8 +986,8 @@ pub fn translate(
         t.a.mov_imm64(EXIT_RIP, rip);
         t.a.adr(T1, site);
         t.a.str(MemSize::B64, T1, CONTEXT, field(offset_of!(Context, site)))?;
-        t.set_status(EXIT_CHAIN)?;
-        t.a.b(epilogue);
+        let entry = t.status_entry(EXIT_CHAIN);
+        t.a.b(entry);
     }
     // Checks near the end of a page.
     for (edge, back, alone, bytes, slow) in std::mem::take(&mut t.page_edges) {
@@ -994,6 +1013,14 @@ pub fn translate(
         t.a.mov(Width::X, T3, ZR);
         t.a.b(back);
     }
+    // UFC after packed floating point: cleared, then the slow path.
+    for (entry, slow) in std::mem::take(&mut t.packed_underflows) {
+        t.a.bind(entry);
+        t.a.read_fpsr(T1);
+        t.a.logic_imm(Logic::And, Width::X, T1, T1, !(1u64 << 3))?;
+        t.a.write_fpsr(T1);
+        t.a.b(slow);
+    }
     // UFC raised by the host, made x86's UE.
     for (entry, back) in std::mem::take(&mut t.underflows) {
         t.underflow_fixup(entry, back)?;
@@ -1004,6 +1031,12 @@ pub fn translate(
         t.a.bind(label);
         t.lazy = lazy;
         t.exit(rip, EXIT_INTERPRET)?;
+    }
+    // The exit statuses, then the epilogue.
+    for (status, entry) in std::mem::take(&mut t.status_entries) {
+        t.a.bind(entry);
+        t.set_status(status)?;
+        t.a.b(epilogue);
     }
     // Back to the engine: the flags must be in `rflags`.
     t.a.bind(epilogue);
@@ -1018,6 +1051,7 @@ pub fn translate(
         field(offset_of!(Context, budget)),
     )?;
     t.guest_registers(false)?;
+    t.vector_registers(false)?;
     for (i, n) in [21u8, 23, 25, 27, 29].into_iter().enumerate().rev() {
         let offset = 16 * (i as i32 + 1);
         t.a.pair(
@@ -1057,6 +1091,7 @@ pub fn flags_routine() -> Result<Vec<u32>, EncodeError> {
     let mut t = Translator {
         a: Assembler::new(),
         epilogue: None,
+        status_entries: Vec::new(),
         slow_paths: Vec::new(),
         side_exits: Vec::new(),
         last: false,
@@ -1066,6 +1101,7 @@ pub fn flags_routine() -> Result<Vec<u32>, EncodeError> {
         underflows: Vec::new(),
         denormals: Vec::new(),
         zero_counts: Vec::new(),
+        packed_underflows: Vec::new(),
         live: STATUS_FLAGS,
         skip_flags: false,
         flags_emitted: 0,
@@ -1168,10 +1204,14 @@ fn location(reg: Reg) -> Option<Loc> {
     })
 }
 
-fn xmm_offset(n: u8) -> u32 {
-    match n {
-        0..16 => field(offset_of!(Cpu, xmm)) + 16 * u32::from(n),
-        _ => field(mmx_layout::SCRATCH) + 16 * u32::from(n - 16),
+/// The vector register of an xmm operand (`xmm`): v16–v31 for xmm0–15,
+/// loaded by the prologue and stored by the epilogue like the mapped
+/// general registers; v3 and v4 for the two MMX scratch registers, which
+/// live only inside one instruction.
+fn xreg(operand: &Operand) -> VReg {
+    match xmm(operand).expect("checked by supported") {
+        n @ 0..16 => VReg::new(16 + n),
+        n => VReg::new(3 + n - 16),
     }
 }
 
@@ -1283,6 +1323,9 @@ enum Lazy {
 struct Translator {
     a: Assembler,
     epilogue: Option<Label>,
+    /// Entries of the epilogue that first record an exit status (status,
+    /// label), shared by every exit with that status.
+    status_entries: Vec<(u64, Label)>,
     /// Slow paths: label, instruction, lazy flags at that instruction.
     slow_paths: Vec<(Label, u64, Lazy)>,
     /// Out of line: the taken side of a conditional jump inside the block
@@ -1310,6 +1353,9 @@ struct Translator {
     /// flags before it): the pending flags into `FLAGS`, where the shift's
     /// deferred flags then find them (`lazy_shift`).
     zero_counts: Vec<(Label, Label, Lazy)>,
+    /// Out of line: UFC after packed floating point (entry, slow path;
+    /// `slow_if_underflow`).
+    packed_underflows: Vec<(Label, Label)>,
     /// The status flags live after the current instruction (`live_flags`).
     live: u64,
     /// The current instruction's flags are dead: nothing computes them.
@@ -1781,6 +1827,9 @@ impl Translator {
                 | SseOp::FloatToInt { .. }
                 | SseOp::FloatToFloat { .. }
                 | SseOp::FloatSignMask { .. } => self.sse_float(op, dst, src, at, &mut slow)?,
+                SseOp::PackedArith { .. }
+                | SseOp::PackedCmpMask { .. }
+                | SseOp::PackedConvert(_) => self.sse_packed(op, dst, src, at, &mut slow)?,
                 _ => self.sse_integer(op, dst, src, at, &mut slow)?,
             },
             // Stack and branch instructions: `size` is the stack width,
@@ -2224,8 +2273,8 @@ impl Translator {
         self.store_reg(rdx, size, T1)
     }
 
-    /// movaps/movups/movdqa/movdqu, movd/movq to and from xmm: 128-bit
-    /// copies as two 64-bit loads and stores.
+    /// movaps/movups/movdqa/movdqu, movd/movq to and from xmm: the vector
+    /// registers themselves, a 128-bit load or store for memory.
     fn sse_move(
         &mut self,
         op: SseOp,
@@ -2235,47 +2284,47 @@ impl Translator {
         slow: &mut Option<Label>,
     ) -> Emit {
         match op {
-            SseOp::Mov128 { aligned } => {
-                match src {
-                    Operand::Mem(m) => {
-                        self.address(&m, at.next, true)?;
-                        self.check_xmm_access(Check::Read, aligned, at.rip, slow)?;
-                        self.a.pair(true, PairMode::Offset, A, B, ADDR, 0)?;
-                    }
-                    _ => {
-                        let n = xmm(&src).expect("checked by supported");
-                        self.cpu_pair(true, A, B, xmm_offset(n))?;
-                    }
+            SseOp::Mov128 { aligned } => match (dst, src) {
+                (Operand::Mem(m), _) => {
+                    let s = xreg(&src);
+                    self.address(&m, at.next, true)?;
+                    self.check_xmm_access(Check::Write, aligned, at.rip, slow)?;
+                    self.a.str_q(s, ADDR, 0)
                 }
-                match dst {
-                    Operand::Mem(m) => {
-                        self.address(&m, at.next, true)?;
-                        self.check_xmm_access(Check::Write, aligned, at.rip, slow)?;
-                        self.a.pair(false, PairMode::Offset, A, B, ADDR, 0)
-                    }
-                    _ => {
-                        let n = xmm(&dst).expect("checked by supported");
-                        self.cpu_pair(false, A, B, xmm_offset(n))
-                    }
+                (_, Operand::Mem(m)) => {
+                    let d = xreg(&dst);
+                    self.address(&m, at.next, true)?;
+                    self.check_xmm_access(Check::Read, aligned, at.rip, slow)?;
+                    self.a.ldr_q(d, ADDR, 0)
                 }
-            }
+                _ => {
+                    let (d, s) = (xreg(&dst), xreg(&src));
+                    if d != s {
+                        self.a.mov_vector(d, s);
+                    }
+                    Ok(())
+                }
+            },
             SseOp::MovToXmm { bytes } => {
+                // The rest of the register is zeroed (FMOV from a general
+                // register zeroes it).
                 let size = if bytes == 8 { Size::B64 } else { Size::B32 };
                 match xmm(&src) {
-                    Some(n) => self.load(false, size, B, CPU, xmm_offset(n))?,
+                    Some(_) => self.a.fmov_to_gpr(bytes == 8, B, xreg(&src)),
                     None => self.read_operand(B, src, size, at, slow)?,
                 }
-                // The rest of the register is zeroed.
-                let n = xmm(&dst).expect("checked by supported");
-                self.cpu_pair(false, B, ZR, xmm_offset(n))
+                self.a.fmov_from_gpr(bytes == 8, xreg(&dst), B);
+                Ok(())
             }
             SseOp::MovFromXmm { bytes } => {
                 let size = if bytes == 8 { Size::B64 } else { Size::B32 };
-                let n = xmm(&src).expect("checked by supported");
-                self.load(false, size, B, CPU, xmm_offset(n))?;
+                self.a.fmov_to_gpr(bytes == 8, B, xreg(&src));
                 match xmm(&dst) {
                     // movq xmm, xmm (66 0F D6) zeroes the upper half.
-                    Some(d) => self.cpu_pair(false, B, ZR, xmm_offset(d)),
+                    Some(_) => {
+                        self.a.fmov_from_gpr(true, xreg(&dst), B);
+                        Ok(())
+                    }
                     None => self.write_operand(dst, size, B, at, slow),
                 }
             }
@@ -2285,11 +2334,13 @@ impl Translator {
 
     /// An MMX instruction (`mmx_supported`), as the interpreter runs it
     /// (`armor_cpu`'s `sse.rs`): the moves directly; the lane operations
-    /// as their SSE translation on the two scratch registers, which hold
-    /// the zero-extended mm operands, the low 64 bits of the result going
-    /// back to the destination. Writing mm`n` sets the sign and exponent of
-    /// its x87 register to ones; any mm operand sets TOP to 0 and every
-    /// register valid; emms makes them all empty.
+    /// as their SSE translation on the two scratch registers (`v3`, `v4`
+    /// here; the interpreter's are in `Cpu::mm_scratch`, which translated
+    /// code leaves zero), which hold the zero-extended mm operands, the low
+    /// 64 bits of the result going back to the destination. Writing mm`n`
+    /// sets the sign and exponent of its x87 register to ones; any mm
+    /// operand sets TOP to 0 and every register valid; emms makes them all
+    /// empty.
     fn mmx(
         &mut self,
         op: SseOp,
@@ -2319,13 +2370,14 @@ impl Translator {
                     (Some(n), _) => {
                         self.load(false, size, T2, CPU, field(mmx_layout::mantissa(n)))?
                     }
-                    (None, Some(n)) => self.load(false, Size::B64, T2, CPU, xmm_offset(n))?,
+                    // movdq2q: the low half.
+                    (None, Some(_)) => self.a.fmov_to_gpr(true, T2, xreg(&src)),
                     _ => self.read_operand(T2, src, size, at, slow)?,
                 }
                 match (mm(&dst), xmm(&dst)) {
                     (Some(n), _) => self.write_mm(n, T2)?,
                     // movq2dq: the upper half is zeroed.
-                    (None, Some(n)) => self.cpu_pair(false, T2, ZR, xmm_offset(n))?,
+                    (None, Some(_)) => self.a.fmov_from_gpr(true, xreg(&dst), T2),
                     _ => self.write_operand(dst, size, T2, at, slow)?,
                 }
             }
@@ -2333,7 +2385,7 @@ impl Translator {
                 let d = mm(&dst).expect("checked by supported");
                 self.a
                     .ldr(MemSize::B64, T2, CPU, field(mmx_layout::mantissa(d)))?;
-                self.cpu_pair(false, T2, ZR, xmm_offset(xmm(&SCRATCH_A).expect("scratch")))?;
+                self.a.fmov_from_gpr(true, xreg(&SCRATCH_A), T2);
                 let source = match src {
                     Operand::Imm(_) => src,
                     _ => {
@@ -2344,23 +2396,13 @@ impl Translator {
                             }
                             None => self.read_operand(T2, src, Size::B64, at, slow)?,
                         }
-                        self.cpu_pair(
-                            false,
-                            T2,
-                            ZR,
-                            xmm_offset(xmm(&SCRATCH_B).expect("scratch")),
-                        )?;
+                        self.a.fmov_from_gpr(true, xreg(&SCRATCH_B), T2);
                         SCRATCH_B
                     }
                 };
                 self.sse_integer(op, SCRATCH_A, source, at, slow)?;
-                let a = xmm_offset(xmm(&SCRATCH_A).expect("scratch"));
-                self.a.ldr(MemSize::B64, T2, CPU, a)?;
+                self.a.fmov_to_gpr(true, T2, xreg(&SCRATCH_A));
                 self.write_mm(d, T2)?;
-                // The scratch registers are zero between instructions.
-                for n in [16, 17] {
-                    self.cpu_pair(false, ZR, ZR, xmm_offset(n))?;
-                }
             }
         }
         if mm(&dst).is_some() || mm(&src).is_some() {
@@ -2369,24 +2411,6 @@ impl Translator {
             self.a.str(MemSize::B8, ZR, CPU, field(mmx_layout::EMPTY))?;
         }
         Ok(())
-    }
-
-    /// Two 64-bit registers from or to the `Cpu` at `offset` (an xmm
-    /// register): LDP/STP when the offset fits their 7-bit scaled field,
-    /// else two LDR/STR (the MMX scratch registers are further away).
-    fn cpu_pair(&mut self, load: bool, first: HostReg, second: HostReg, offset: u32) -> Emit {
-        if offset <= 504 {
-            return self
-                .a
-                .pair(load, PairMode::Offset, first, second, CPU, offset as i32);
-        }
-        if load {
-            self.a.ldr(MemSize::B64, first, CPU, offset)?;
-            self.a.ldr(MemSize::B64, second, CPU, offset + 8)
-        } else {
-            self.a.str(MemSize::B64, first, CPU, offset)?;
-            self.a.str(MemSize::B64, second, CPU, offset + 8)
-        }
     }
 
     /// mm`n` = `value` (64 bits), its sign and exponent set to ones.
@@ -2407,8 +2431,9 @@ impl Translator {
     }
 
     /// The SSE2 integer operations, shuffles and half or scalar moves, as
-    /// `armor_cpu`'s `sse.rs`. Lane-wise operations use NEON (`V0` = dst,
-    /// `V1` = src); the shuffles and moves use general registers.
+    /// `armor_cpu`'s `sse.rs`, on the vector registers: lane-wise
+    /// operations straight into the destination; shuffles through `V2`,
+    /// so that a source that is also the destination is read whole first.
     fn sse_integer(
         &mut self,
         op: SseOp,
@@ -2417,8 +2442,6 @@ impl Translator {
         at: Site,
         slow: &mut Option<Label>,
     ) -> Emit {
-        let d_off = xmm(&dst).map(xmm_offset);
-        let s_off = xmm(&src).map(xmm_offset);
         match op {
             SseOp::Lane { op, lane } => {
                 let op = match op {
@@ -2452,83 +2475,82 @@ impl Translator {
             // is set; TBL gives 0 for an index of 16 or more, so the index
             // keeps bit 7 and the low four bits.
             SseOp::Int(IntOp::Pshufb) => {
-                let d_off = d_off.expect("checked by supported");
-                self.a.ldr_q(V0, CPU, d_off)?;
-                self.vector_source(V1, src, at, slow)?;
+                let d = xreg(&dst);
+                let s = self.vector_source(V1, src, at, slow)?;
                 self.a.movi_bytes(V2, 0x8f);
-                self.a.vec3(Vec3::And, Lanes::B, V1, V1, V2)?;
-                self.a.tbl(V0, V0, V1);
-                self.a.str_q(V0, CPU, d_off)
+                self.a.vec3(Vec3::And, Lanes::B, V1, s, V2)?;
+                self.a.tbl(d, d, V1);
+                Ok(())
             }
             // dst:src shifted right by `count` bytes, the low 16 kept: EXT
             // of src and dst; from 16 on, dst and zeros; from 32, zero.
             SseOp::Int(IntOp::Palignr(count)) => {
-                let d_off = d_off.expect("checked by supported");
+                let d = xreg(&dst);
                 let count = u32::from(count);
-                self.a.ldr_q(V0, CPU, d_off)?;
-                self.vector_source(V1, src, at, slow)?;
+                let s = self.vector_source(V1, src, at, slow)?;
                 match count {
-                    0..16 => self.a.ext(V0, V1, V0, count)?,
+                    0..16 => self.a.ext(d, s, d, count),
                     16..32 => {
                         self.a.movi_zero(V2);
-                        self.a.ext(V0, V0, V2, count - 16)?;
+                        self.a.ext(d, d, V2, count - 16)
                     }
-                    _ => self.a.movi_zero(V0),
+                    _ => {
+                        self.a.movi_zero(d);
+                        Ok(())
+                    }
                 }
-                self.a.str_q(V0, CPU, d_off)
             }
             SseOp::Pack { from, signed } => {
-                let d_off = d_off.expect("checked by supported");
-                self.a.ldr_q(V0, CPU, d_off)?;
-                self.vector_source(V1, src, at, slow)?;
+                let d = xreg(&dst);
+                let s = self.vector_source(V1, src, at, slow)?;
                 // dst's lanes narrowed into the low half, src's into the
                 // high half.
-                self.a.narrow(!signed, false, lanes(from), V2, V0)?;
-                self.a.narrow(!signed, true, lanes(from), V2, V1)?;
-                self.a.str_q(V2, CPU, d_off)
+                self.a.narrow(!signed, false, lanes(from), V2, d)?;
+                self.a.narrow(!signed, true, lanes(from), V2, s)?;
+                self.a.mov_vector(d, V2);
+                Ok(())
             }
             SseOp::ShiftImm { kind, lane, count } => {
-                let d_off = d_off.expect("checked by supported");
+                let d = xreg(&dst);
                 let bits = lane.bits();
                 let count = u32::from(count);
                 let l = lanes(lane);
-                self.a.ldr_q(V0, CPU, d_off)?;
                 match kind {
-                    ShiftKind::Left if count < bits => {
-                        self.a.vshift(VShift::Shl, l, V0, V0, count)?
-                    }
-                    ShiftKind::RightLogical if count == 0 => {}
+                    ShiftKind::Left if count < bits => self.a.vshift(VShift::Shl, l, d, d, count),
+                    ShiftKind::RightLogical if count == 0 => Ok(()),
                     ShiftKind::RightLogical if count < bits => {
-                        self.a.vshift(VShift::Ushr, l, V0, V0, count)?
+                        self.a.vshift(VShift::Ushr, l, d, d, count)
                     }
                     ShiftKind::RightArithmetic => {
                         // Counts above the lane size fill with the sign.
                         let count = count.min(bits - 1);
                         if count > 0 {
-                            self.a.vshift(VShift::Sshr, l, V0, V0, count)?;
+                            self.a.vshift(VShift::Sshr, l, d, d, count)?;
                         }
+                        Ok(())
                     }
-                    _ => self.a.movi_zero(V0),
+                    _ => {
+                        self.a.movi_zero(d);
+                        Ok(())
+                    }
                 }
-                self.a.str_q(V0, CPU, d_off)
             }
             SseOp::ByteShift { left, count } => {
-                let d_off = d_off.expect("checked by supported");
+                let d = xreg(&dst);
                 let count = u32::from(count);
                 if count == 0 {
                     return Ok(());
                 }
-                self.a.movi_zero(V2);
                 if count > 15 {
-                    return self.a.str_q(V2, CPU, d_off);
+                    self.a.movi_zero(d);
+                    return Ok(());
                 }
-                self.a.ldr_q(V0, CPU, d_off)?;
+                self.a.movi_zero(V2);
                 if left {
-                    self.a.ext(V0, V2, V0, 16 - count)?;
+                    self.a.ext(d, V2, d, 16 - count)
                 } else {
-                    self.a.ext(V0, V0, V2, count)?;
+                    self.a.ext(d, d, V2, count)
                 }
-                self.a.str_q(V0, CPU, d_off)
             }
             SseOp::Pmovmskb => {
                 // The sign bit of each byte, gathered with a multiply: bit
@@ -2537,8 +2559,7 @@ impl Translator {
                 let Operand::Reg(reg) = dst else {
                     unreachable!("checked by supported")
                 };
-                let s_off = s_off.expect("checked by supported");
-                self.cpu_pair(true, A, B, s_off)?;
+                self.xmm_halves(xreg(&src), A, B)?;
                 self.a.mov_imm64(T3, 0x0002_0408_1020_4081);
                 for half in [A, B] {
                     self.a
@@ -2551,127 +2572,120 @@ impl Translator {
                 self.store_reg(reg, Size::B32, R)
             }
             SseOp::Pshufd(order) => {
-                let d_off = d_off.expect("checked by supported");
-                let (base, off) = self.source_base(src, at, slow)?;
-                let regs = [A, B, T3, T4];
-                for (i, &r) in regs.iter().enumerate() {
+                let d = xreg(&dst);
+                let s = self.vector_source(V1, src, at, slow)?;
+                for i in 0..4 {
                     let pick = u32::from((order >> (2 * i)) & 3);
-                    self.a.ldr(MemSize::B32, r, base, off + 4 * pick)?;
+                    self.a.ins_element(Lanes::S, V2, i, s, pick)?;
                 }
-                for (i, &r) in regs.iter().enumerate() {
-                    self.a.str(MemSize::B32, r, CPU, d_off + 4 * i as u32)?;
-                }
+                self.a.mov_vector(d, V2);
                 Ok(())
             }
             SseOp::PshufWords { high, order } => {
                 // The shuffled half from src's words; the other half is
                 // src's too.
-                let d_off = d_off.expect("checked by supported");
-                let (base, off) = self.source_base(src, at, slow)?;
-                let (half, other) = if high { (8, 0) } else { (0, 8) };
-                let regs = [A, B, T3, T4];
-                for (i, &r) in regs.iter().enumerate() {
+                let d = xreg(&dst);
+                let s = self.vector_source(V1, src, at, slow)?;
+                let half = if high { 4 } else { 0 };
+                self.a.mov_vector(V2, s);
+                for i in 0..4 {
                     let pick = u32::from((order >> (2 * i)) & 3);
-                    self.a.ldr(MemSize::B16, r, base, off + half + 2 * pick)?;
+                    self.a.ins_element(Lanes::H, V2, half + i, s, half + pick)?;
                 }
-                self.a.ldr(MemSize::B64, T5, base, off + other)?;
-                for (i, &r) in regs.iter().enumerate() {
-                    self.a
-                        .str(MemSize::B16, r, CPU, d_off + half + 2 * i as u32)?;
-                }
-                self.a.str(MemSize::B64, T5, CPU, d_off + other)
+                self.a.mov_vector(d, V2);
+                Ok(())
             }
             SseOp::Pextrw(index) => {
                 let Operand::Reg(reg) = dst else {
                     unreachable!("checked by supported")
                 };
-                let s_off = s_off.expect("checked by supported");
-                self.a
-                    .ldr(MemSize::B16, B, CPU, s_off + 2 * u32::from(index))?;
+                self.a.umov(Lanes::H, B, xreg(&src), u32::from(index))?;
                 self.store_reg(reg, Size::B32, B)
             }
             SseOp::Pinsrw(index) => {
-                let d_off = d_off.expect("checked by supported");
                 self.read_operand(B, src, Size::B16, at, slow)?;
-                self.a
-                    .str(MemSize::B16, B, CPU, d_off + 2 * u32::from(index))
+                self.a.ins_gpr(Lanes::H, xreg(&dst), u32::from(index), B)
             }
             SseOp::Shuffle { double, order } => {
                 // The low half from dst's lanes, the high half from src's.
-                let d_off = d_off.expect("checked by supported");
-                let (base, off) = self.source_base(src, at, slow)?;
+                let d = xreg(&dst);
+                let s = self.vector_source(V1, src, at, slow)?;
                 if double {
-                    let pick = |i: u8| u32::from((order >> i) & 1) * 8;
-                    self.a.ldr(MemSize::B64, A, CPU, d_off + pick(0))?;
-                    self.a.ldr(MemSize::B64, B, base, off + pick(1))?;
-                    self.cpu_pair(false, A, B, d_off)
+                    let pick = |i: u8| u32::from((order >> i) & 1);
+                    self.a.ins_element(Lanes::D, V2, 0, d, pick(0))?;
+                    self.a.ins_element(Lanes::D, V2, 1, s, pick(1))?;
                 } else {
-                    let pick = |i: u8| u32::from((order >> (2 * i)) & 3) * 4;
-                    self.a.ldr(MemSize::B32, A, CPU, d_off + pick(0))?;
-                    self.a.ldr(MemSize::B32, B, CPU, d_off + pick(1))?;
-                    self.a.ldr(MemSize::B32, T3, base, off + pick(2))?;
-                    self.a.ldr(MemSize::B32, T4, base, off + pick(3))?;
-                    for (i, r) in [A, B, T3, T4].into_iter().enumerate() {
-                        self.a.str(MemSize::B32, r, CPU, d_off + 4 * i as u32)?;
-                    }
-                    Ok(())
+                    let pick = |i: u8| u32::from((order >> (2 * i)) & 3);
+                    self.a.ins_element(Lanes::S, V2, 0, d, pick(0))?;
+                    self.a.ins_element(Lanes::S, V2, 1, d, pick(1))?;
+                    self.a.ins_element(Lanes::S, V2, 2, s, pick(2))?;
+                    self.a.ins_element(Lanes::S, V2, 3, s, pick(3))?;
                 }
+                self.a.mov_vector(d, V2);
+                Ok(())
             }
             SseOp::Pmuludq => {
                 // The even dword lanes, multiplied into 64 bits.
-                let d_off = d_off.expect("checked by supported");
-                let (base, off) = self.source_base(src, at, slow)?;
-                self.a.ldr(MemSize::B32, A, CPU, d_off)?;
-                self.a.ldr(MemSize::B32, B, base, off)?;
-                self.a.ldr(MemSize::B32, T3, CPU, d_off + 8)?;
-                self.a.ldr(MemSize::B32, T4, base, off + 8)?;
+                let d = xreg(&dst);
+                let s = self.vector_source(V1, src, at, slow)?;
+                self.a.umov(Lanes::S, A, d, 0)?;
+                self.a.umov(Lanes::S, B, s, 0)?;
+                self.a.umov(Lanes::S, T3, d, 2)?;
+                self.a.umov(Lanes::S, T4, s, 2)?;
                 self.a.madd(Width::X, A, A, B, ZR);
                 self.a.madd(Width::X, T3, T3, T4, ZR);
-                self.cpu_pair(false, A, T3, d_off)
+                self.a.fmov_from_gpr(true, d, A);
+                self.a.ins_gpr(Lanes::D, d, 1, T3)
             }
             SseOp::MovHalf { high } => {
-                let half = if high { 8 } else { 0 };
-                match (d_off, s_off) {
-                    (Some(d_off), None) => {
+                let half = u32::from(high);
+                match (xmm(&dst), xmm(&src)) {
+                    (Some(_), None) => {
                         self.read_operand(B, src, Size::B64, at, slow)?;
-                        self.a.str(MemSize::B64, B, CPU, d_off + half)
+                        self.a.ins_gpr(Lanes::D, xreg(&dst), half, B)
                     }
-                    (None, Some(s_off)) => {
-                        self.a.ldr(MemSize::B64, B, CPU, s_off + half)?;
+                    (None, Some(_)) => {
+                        self.a.umov(Lanes::D, B, xreg(&src), half)?;
                         self.write_operand(dst, Size::B64, B, at, slow)
                     }
                     _ => unreachable!("checked by supported"),
                 }
             }
             SseOp::MovHlps | SseOp::MovLhps => {
-                let d_off = d_off.expect("checked by supported");
-                let s_off = s_off.expect("checked by supported");
-                let (from, to) = if op == SseOp::MovHlps { (8, 0) } else { (0, 8) };
-                self.a.ldr(MemSize::B64, B, CPU, s_off + from)?;
-                self.a.str(MemSize::B64, B, CPU, d_off + to)
+                let (from, to) = if op == SseOp::MovHlps { (1, 0) } else { (0, 1) };
+                self.a
+                    .ins_element(Lanes::D, xreg(&dst), to, xreg(&src), from)
             }
             SseOp::MovScalar { double } => {
-                let size = if double { Size::B64 } else { Size::B32 };
-                match (d_off, s_off) {
+                let lanes = if double { Lanes::D } else { Lanes::S };
+                let bytes = if double { 8 } else { 4 };
+                match (dst, src) {
                     // Register to register: only the low lane changes.
-                    (Some(d_off), Some(s_off)) => {
-                        self.a.ldr(mem_size(size), B, CPU, s_off)?;
-                        self.a.str(mem_size(size), B, CPU, d_off)
+                    (Operand::Reg(_), Operand::Reg(_)) => {
+                        self.a.ins_element(lanes, xreg(&dst), 0, xreg(&src), 0)
                     }
                     // Load: the rest of the register is zeroed.
-                    (Some(d_off), None) => {
-                        self.read_operand(B, src, size, at, slow)?;
-                        self.cpu_pair(false, B, ZR, d_off)
+                    (Operand::Reg(_), Operand::Mem(m)) => {
+                        self.address(&m, at.next, true)?;
+                        self.check(Check::Read, bytes, at.rip, slow)?;
+                        self.a.load_store_fp(true, double, xreg(&dst), ADDR, 0)
                     }
-                    (None, Some(s_off)) => {
-                        self.a.ldr(mem_size(size), B, CPU, s_off)?;
-                        self.write_operand(dst, size, B, at, slow)
+                    (Operand::Mem(m), Operand::Reg(_)) => {
+                        self.address(&m, at.next, true)?;
+                        self.check(Check::Write, bytes, at.rip, slow)?;
+                        self.a.load_store_fp(false, double, xreg(&src), ADDR, 0)
                     }
-                    (None, None) => unreachable!("checked by supported"),
+                    _ => unreachable!("checked by supported"),
                 }
             }
             _ => unreachable!("checked by supported"),
         }
+    }
+
+    /// The two 64-bit halves of vector `v` into general registers.
+    fn xmm_halves(&mut self, v: VReg, low: HostReg, high: HostReg) -> Emit {
+        self.a.fmov_to_gpr(true, low, v);
+        self.a.umov(Lanes::D, high, v, 1)
     }
 
     /// Scalar SSE floating point, as `armor_cpu`'s `float.rs`. The host's
@@ -2681,6 +2695,9 @@ impl Translator {
     /// conversions to integers. Those cases take the slow path (the
     /// interpreter applies the x86 rules). min/max and the comparisons
     /// need no slow path: their x86 results follow from host conditions.
+    /// The operands are the low lanes of the vector registers; a result
+    /// goes into the destination's low lane with INS, which keeps the
+    /// other lanes, as x86 does.
     ///
     /// MXCSR's exception flags come from the host's FPSR, which the engine
     /// folds into MXCSR after each run (ADR-0024). Where the host's flags
@@ -2708,35 +2725,33 @@ impl Translator {
         at: Site,
         slow: &mut Option<Label>,
     ) -> Emit {
-        let d_off = xmm(&dst).map(xmm_offset);
         match op {
             SseOp::FloatArith { op, double } => {
-                let d_off = d_off.expect("checked by supported");
-                self.a.load_store_fp(true, double, V0, CPU, d_off)?;
+                let d = xreg(&dst);
                 let b = self.scalar_source(V1, double, src, at, slow)?;
                 if op != FloatOp::Sqrt {
-                    self.slow_if_denormal(double, V0, (CPU, d_off), at.rip, slow)?;
+                    self.slow_if_denormal(double, d, at.rip, slow)?;
                 }
-                self.slow_if_denormal(double, V1, b, at.rip, slow)?;
+                self.slow_if_denormal(double, b, at.rip, slow)?;
                 match op {
                     FloatOp::Min | FloatOp::Max => {
                         // x86: a < b ? a : b (a > b for max): b when
                         // unordered or equal. IE for any NaN.
-                        self.a.fcmpe(double, V0, V1);
+                        self.a.fcmpe(double, d, b);
                         let cond = if op == FloatOp::Min {
                             Cond::Mi
                         } else {
                             Cond::Gt
                         };
-                        self.a.fcsel(double, V2, V0, V1, cond);
+                        self.a.fcsel(double, V2, d, b, cond);
                     }
                     _ => {
                         match op {
-                            FloatOp::Add => self.a.fp_arith(FpOp::Add, double, V2, V0, V1),
-                            FloatOp::Sub => self.a.fp_arith(FpOp::Sub, double, V2, V0, V1),
-                            FloatOp::Mul => self.a.fp_arith(FpOp::Mul, double, V2, V0, V1),
-                            FloatOp::Div => self.a.fp_arith(FpOp::Div, double, V2, V0, V1),
-                            FloatOp::Sqrt => self.a.fsqrt(double, V2, V1),
+                            FloatOp::Add => self.a.fp_arith(FpOp::Add, double, V2, d, b),
+                            FloatOp::Sub => self.a.fp_arith(FpOp::Sub, double, V2, d, b),
+                            FloatOp::Mul => self.a.fp_arith(FpOp::Mul, double, V2, d, b),
+                            FloatOp::Div => self.a.fp_arith(FpOp::Div, double, V2, d, b),
+                            FloatOp::Sqrt => self.a.fsqrt(double, V2, b),
                             _ => unreachable!("checked by supported"),
                         }
                         self.slow_if_nan(double, V2, at.rip, slow);
@@ -2745,17 +2760,16 @@ impl Translator {
                         }
                     }
                 }
-                self.a.load_store_fp(false, double, V2, CPU, d_off)
+                self.scalar_result(double, d)
             }
             SseOp::FloatCompare { double, signaling } => {
                 // ZF, PF, CF: unordered 1 1 1, less 0 0 1, greater 0 0 0,
                 // equal 1 0 0; OF, SF, AF cleared.
-                let d_off = d_off.expect("checked by supported");
-                self.a.load_store_fp(true, double, V0, CPU, d_off)?;
+                let d = xreg(&dst);
                 let b = self.scalar_source(V1, double, src, at, slow)?;
-                self.slow_if_denormal(double, V0, (CPU, d_off), at.rip, slow)?;
-                self.slow_if_denormal(double, V1, b, at.rip, slow)?;
-                self.compare(signaling, double, V0, V1);
+                self.slow_if_denormal(double, d, at.rip, slow)?;
+                self.slow_if_denormal(double, b, at.rip, slow)?;
+                self.compare(signaling, double, d, b);
                 if self.skip_flags {
                     // Dead flags: the comparison only, for MXCSR's IE.
                     return Ok(());
@@ -2772,12 +2786,11 @@ impl Translator {
             SseOp::FloatCmpMask { double, predicate } => {
                 // All ones in the low lane when the predicate holds; lt,
                 // le, nlt and nle signal on quiet NaNs.
-                let d_off = d_off.expect("checked by supported");
-                self.a.load_store_fp(true, double, V0, CPU, d_off)?;
+                let d = xreg(&dst);
                 let b = self.scalar_source(V1, double, src, at, slow)?;
-                self.slow_if_denormal(double, V0, (CPU, d_off), at.rip, slow)?;
-                self.slow_if_denormal(double, V1, b, at.rip, slow)?;
-                self.compare(matches!(predicate, 1 | 2 | 5 | 6), double, V0, V1);
+                self.slow_if_denormal(double, d, at.rip, slow)?;
+                self.slow_if_denormal(double, b, at.rip, slow)?;
+                self.compare(matches!(predicate, 1 | 2 | 5 | 6), double, d, b);
                 let cond = match predicate {
                     0 => Cond::Eq,
                     1 => Cond::Mi,
@@ -2788,13 +2801,15 @@ impl Translator {
                     6 => Cond::Hi,
                     _ => Cond::Vc,
                 };
-                let w = if double { Width::X } else { Width::W };
+                let (w, lanes) = if double {
+                    (Width::X, Lanes::D)
+                } else {
+                    (Width::W, Lanes::S)
+                };
                 self.a.csel(Select::Csinv, w, B, ZR, ZR, cond.invert());
-                let size = if double { MemSize::B64 } else { MemSize::B32 };
-                self.a.str(size, B, CPU, d_off)
+                self.a.ins_gpr(lanes, d, 0, B)
             }
             SseOp::IntToFloat { double, int_bytes } => {
-                let d_off = d_off.expect("checked by supported");
                 let size = if int_bytes == 8 { Size::B64 } else { Size::B32 };
                 match src {
                     Operand::Reg(reg) => self.read_reg(true, B, reg, size)?,
@@ -2807,7 +2822,7 @@ impl Translator {
                 }
                 // Sign-extended to 64 bits: the same value.
                 self.a.scvtf(Width::X, double, V2, B);
-                self.a.load_store_fp(false, double, V2, CPU, d_off)
+                self.scalar_result(double, xreg(&dst))
             }
             SseOp::FloatToInt {
                 double,
@@ -2817,8 +2832,8 @@ impl Translator {
                 let Operand::Reg(reg) = dst else {
                     unreachable!("checked by supported")
                 };
-                self.scalar_source(V1, double, src, at, slow)?;
-                self.slow_if_nan(double, V1, at.rip, slow);
+                let b = self.scalar_source(V1, double, src, at, slow)?;
+                self.slow_if_nan(double, b, at.rip, slow);
                 let (w, size, max) = if int_bytes == 8 {
                     (Width::X, Size::B64, i64::MAX as u64)
                 } else {
@@ -2826,7 +2841,7 @@ impl Translator {
                 };
                 // No DE check: x86 raises none for a conversion to an
                 // integer.
-                self.a.fcvt_to_int(truncate, w, double, B, V1);
+                self.a.fcvt_to_int(truncate, w, double, B, b);
                 // The host saturates where x86 gives the integer
                 // indefinite: the extremes go to the interpreter.
                 let slow_label = self.slow_path(at.rip, slow);
@@ -2840,26 +2855,22 @@ impl Translator {
                 self.store_reg(reg, size, B)
             }
             SseOp::FloatToFloat { to_double } => {
-                let d_off = d_off.expect("checked by supported");
                 let a = self.scalar_source(V1, !to_double, src, at, slow)?;
-                self.slow_if_nan(!to_double, V1, at.rip, slow);
-                self.slow_if_denormal(!to_double, V1, a, at.rip, slow)?;
-                if to_double {
-                    // Exact: no flag.
-                    self.a.fcvt(to_double, V2, V1);
-                } else {
-                    self.a.fcvt(to_double, V2, V1);
+                self.slow_if_nan(!to_double, a, at.rip, slow);
+                self.slow_if_denormal(!to_double, a, at.rip, slow)?;
+                self.a.fcvt(to_double, V2, a);
+                if !to_double {
                     self.underflow(false, V2)?;
                 }
-                self.a.load_store_fp(false, to_double, V2, CPU, d_off)
+                // Exact to a double: no flag.
+                self.scalar_result(to_double, xreg(&dst))
             }
             SseOp::FloatSignMask { double } => {
                 // The sign bit of each lane, into the low bits.
                 let Operand::Reg(reg) = dst else {
                     unreachable!("checked by supported")
                 };
-                let s_off = xmm(&src).map(xmm_offset).expect("checked by supported");
-                self.cpu_pair(true, A, B, s_off)?;
+                self.xmm_halves(xreg(&src), A, B)?;
                 if double {
                     self.a.shift_imm(Shift::Lsr, Width::X, R, A, 63)?;
                     self.a.shift_imm(Shift::Lsr, Width::X, T1, B, 63)?;
@@ -2890,9 +2901,243 @@ impl Translator {
         }
     }
 
-    /// Loads a scalar source operand (the low 4 or 8 bytes of an xmm
-    /// register, or memory without an alignment requirement) into `vt`;
-    /// returns where it is (`ADDR` stays valid until the next access).
+    /// Packed floating point (ps and pd), as `armor_cpu`'s `float.rs` does
+    /// lane by lane, with the scalar path's rules (`sse_float`) for every
+    /// lane: a denormal operand or a NaN result in any lane goes to the
+    /// interpreter, as does an underflow (UFC, whose tininess differs from
+    /// x86's: the host's flag is cleared and the interpreter decides UE).
+    /// min/max and the compares need no NaN path: their x86 results are
+    /// host compares and selects (FCMGT and FCMGE signal on any NaN, like
+    /// x86's lt, le, min and max; FCMEQ is quiet, like eq, unord, ord).
+    /// The result goes through `V2`, so that the destination changes only
+    /// when no slow path is taken.
+    fn sse_packed(
+        &mut self,
+        op: SseOp,
+        dst: Operand,
+        src: Operand,
+        at: Site,
+        slow: &mut Option<Label>,
+    ) -> Emit {
+        let d = xreg(&dst);
+        match op {
+            SseOp::PackedArith { op, double } => {
+                let b = self.vector_source(V1, src, at, slow)?;
+                let both = [d, b];
+                let operands: &[VReg] = if op == FloatOp::Sqrt {
+                    &both[1..]
+                } else {
+                    &both
+                };
+                self.slow_if_denormal_lanes(double, operands, at.rip, slow)?;
+                match op {
+                    // x86: dst < src ? dst : src (dst > src for max), src
+                    // when unordered or equal.
+                    FloatOp::Min | FloatOp::Max => {
+                        let (n, m) = if op == FloatOp::Min { (b, d) } else { (d, b) };
+                        self.a.vec_fp(VecFp::Cmgt, double, V2, n, m);
+                        self.a.bsl(V2, d, b);
+                    }
+                    _ => {
+                        match op {
+                            FloatOp::Add => self.a.vec_fp(VecFp::Add, double, V2, d, b),
+                            FloatOp::Sub => self.a.vec_fp(VecFp::Sub, double, V2, d, b),
+                            FloatOp::Mul => self.a.vec_fp(VecFp::Mul, double, V2, d, b),
+                            FloatOp::Div => self.a.vec_fp(VecFp::Div, double, V2, d, b),
+                            FloatOp::Sqrt => self.a.vec_unary(VecUnary::Fsqrt { double }, V2, b),
+                            _ => unreachable!("checked by supported"),
+                        }
+                        // UFC first: the NaN's slow path must not find it
+                        // in FPSR (the interpreter decides UE).
+                        if matches!(op, FloatOp::Mul | FloatOp::Div) {
+                            self.slow_if_underflow(at.rip, slow);
+                        }
+                        self.slow_if_nan_lanes(double, V2, at.rip, slow);
+                    }
+                }
+            }
+            SseOp::PackedCmpMask { double, predicate } => {
+                let b = self.vector_source(V1, src, at, slow)?;
+                self.slow_if_denormal_lanes(double, &[d, b], at.rip, slow)?;
+                match predicate & 3 {
+                    0 => self.a.vec_fp(VecFp::Cmeq, double, V2, d, b),
+                    1 => self.a.vec_fp(VecFp::Cmgt, double, V2, b, d),
+                    2 => self.a.vec_fp(VecFp::Cmge, double, V2, b, d),
+                    // Ordered: both equal to themselves.
+                    _ => {
+                        self.a.vec_fp(VecFp::Cmeq, double, V3, d, d);
+                        self.a.vec_fp(VecFp::Cmeq, double, V2, b, b);
+                        self.a.vec3(Vec3::And, Lanes::B, V2, V2, V3)?;
+                    }
+                }
+                // 4 to 7 are the negations of 0 to 3, and 3 (unordered)
+                // is the negation of ordered.
+                if (predicate >= 4) != (predicate & 3 == 3) {
+                    self.a.vec_unary(VecUnary::Not, V2, V2);
+                }
+            }
+            SseOp::PackedConvert(conversion) => match conversion {
+                Conversion::Dq2Ps => {
+                    let b = self.vector_source(V1, src, at, slow)?;
+                    self.a.vec_unary(VecUnary::Scvtf { double: false }, V2, b);
+                }
+                Conversion::Ps2Dq { truncate } => {
+                    let b = self.vector_source(V1, src, at, slow)?;
+                    self.slow_if_nan_operand(false, b, at.rip, slow)?;
+                    let convert = if truncate {
+                        VecUnary::Fcvtzs { double: false }
+                    } else {
+                        VecUnary::Fcvtns { double: false }
+                    };
+                    self.a.vec_unary(convert, V2, b);
+                    // The host saturates a large value to 0x7fffffff where
+                    // x86 gives 0x80000000 (as it does, like the host, for
+                    // large negative values): to the interpreter.
+                    let slow_label = self.slow_path(at.rip, slow);
+                    self.a.mov_imm64(T1, 0x7fff_ffff);
+                    self.a.dup(false, V3, T1);
+                    self.a.vec3(Vec3::Cmeq, Lanes::S, V3, V2, V3)?;
+                    self.a.vec_unary(VecUnary::Umaxv, V3, V3);
+                    self.a.fmov_to_gpr(false, T1, V3);
+                    self.a.cbz(true, Width::W, T1, slow_label);
+                }
+                Conversion::Dq2Pd => {
+                    let b = self.low_half_source(src, at, slow)?;
+                    self.a.vec_unary(VecUnary::Sxtl, V2, b);
+                    self.a.vec_unary(VecUnary::Scvtf { double: true }, V2, V2);
+                }
+                Conversion::Ps2Pd => {
+                    let b = self.low_half_source(src, at, slow)?;
+                    self.slow_if_denormal_lanes(false, &[b], at.rip, slow)?;
+                    self.slow_if_nan_operand(false, b, at.rip, slow)?;
+                    self.a.vec_unary(VecUnary::Fcvtl, V2, b);
+                }
+                Conversion::Pd2Ps => {
+                    let b = self.vector_source(V1, src, at, slow)?;
+                    self.slow_if_denormal_lanes(true, &[b], at.rip, slow)?;
+                    self.slow_if_nan_operand(true, b, at.rip, slow)?;
+                    self.a.vec_unary(VecUnary::Fcvtn, V2, b);
+                    self.slow_if_underflow(at.rip, slow);
+                }
+                Conversion::Pd2Dq { .. } => unreachable!("checked by supported"),
+            },
+            _ => unreachable!("checked by supported"),
+        }
+        self.a.mov_vector(d, V2);
+        Ok(())
+    }
+
+    /// The low 64 bits of an xmm register, or 8 bytes of memory (no
+    /// alignment) loaded into `V1` with the rest zeroed.
+    fn low_half_source(&mut self, src: Operand, at: Site, slow: &mut Option<Label>) -> Emit<VReg> {
+        match src {
+            Operand::Mem(m) => {
+                self.address(&m, at.next, true)?;
+                self.check(Check::Read, 8, at.rip, slow)?;
+                self.a.load_store_fp(true, true, V1, ADDR, 0)?;
+                Ok(V1)
+            }
+            _ => Ok(xreg(&src)),
+        }
+    }
+
+    /// To the slow path if any lane of the registers in `regs` (singles,
+    /// or `double`) is denormal: x86 raises DE. A lane is denormal when
+    /// its bits without the sign, minus 1, are below twice the smallest
+    /// normal number minus 1 (unsigned): exponent 0 and a fraction that is
+    /// not 0. Uses `T1`, `V3`–`V6`.
+    fn slow_if_denormal_lanes(
+        &mut self,
+        double: bool,
+        regs: &[VReg],
+        rip: u64,
+        slow: &mut Option<Label>,
+    ) -> Emit {
+        let slow = self.slow_path(rip, slow);
+        let (l, limit) = if double {
+            (Lanes::D, (2u64 << 52) - 1)
+        } else {
+            (Lanes::S, (2u64 << 23) - 1)
+        };
+        self.a.mov_imm64(T1, 1);
+        self.a.dup(double, V5, T1);
+        self.a.mov_imm64(T1, limit);
+        self.a.dup(double, V6, T1);
+        for (i, &r) in regs.iter().enumerate() {
+            let t = if i == 0 { V4 } else { V3 };
+            self.a.vshift(VShift::Shl, l, t, r, 1)?;
+            self.a.vec3(Vec3::Sub, l, t, t, V5)?;
+            self.a.cmhi(double, t, V6, t);
+            if i > 0 {
+                self.a.vec3(Vec3::Orr, Lanes::B, V4, V4, V3)?;
+            }
+        }
+        self.a.vec_unary(VecUnary::Umaxv, V4, V4);
+        self.a.fmov_to_gpr(false, T1, V4);
+        self.a.cbz(true, Width::W, T1, slow);
+        Ok(())
+    }
+
+    /// To the slow path if any lane of the operand `v` is a NaN, with
+    /// integer compares: a floating-point compare would raise IOC for a
+    /// signaling NaN before the interpreter runs the instruction. A lane
+    /// is a NaN when its bits without the sign are above those of
+    /// infinity. Uses `T1`, `V3`, `V5`.
+    fn slow_if_nan_operand(
+        &mut self,
+        double: bool,
+        v: VReg,
+        rip: u64,
+        slow: &mut Option<Label>,
+    ) -> Emit {
+        let slow = self.slow_path(rip, slow);
+        let (l, infinity) = if double {
+            (Lanes::D, 0x7ff0_0000_0000_0000u64 << 1)
+        } else {
+            (Lanes::S, 0x7f80_0000u64 << 1)
+        };
+        self.a.mov_imm64(T1, infinity);
+        self.a.dup(double, V5, T1);
+        self.a.vshift(VShift::Shl, l, V3, v, 1)?;
+        self.a.cmhi(double, V3, V3, V5);
+        self.a.vec_unary(VecUnary::Umaxv, V3, V3);
+        self.a.fmov_to_gpr(false, T1, V3);
+        self.a.cbz(true, Width::W, T1, slow);
+        Ok(())
+    }
+
+    /// To the slow path if any lane of `v` is a NaN. Uses `T1`, `V3`.
+    fn slow_if_nan_lanes(&mut self, double: bool, v: VReg, rip: u64, slow: &mut Option<Label>) {
+        let slow = self.slow_path(rip, slow);
+        // All ones where the lane equals itself (FCMEQ is quiet).
+        self.a.vec_fp(VecFp::Cmeq, double, V3, v, v);
+        self.a.vec_unary(VecUnary::Uminv, V3, V3);
+        self.a.fmov_to_gpr(false, T1, V3);
+        self.a.cbz(false, Width::W, T1, slow);
+    }
+
+    /// After a packed multiplication, division or `cvtpd2ps`: if the host
+    /// raised UFC, out of line it is cleared and the interpreter runs the
+    /// instruction (x86 detects tininess after rounding, the host before;
+    /// translated code never leaves UFC in FPSR, `underflow`). Uses `T1`.
+    fn slow_if_underflow(&mut self, rip: u64, slow: &mut Option<Label>) {
+        const UFC: u32 = 3;
+        let slow = self.slow_path(rip, slow);
+        let entry = self.a.new_label();
+        self.a.read_fpsr(T1);
+        self.a.tbz(true, T1, UFC, entry);
+        self.packed_underflows.push((entry, slow));
+    }
+
+    /// The scalar result in `V2` into the low lane of `d`, keeping the
+    /// other lanes.
+    fn scalar_result(&mut self, double: bool, d: VReg) -> Emit {
+        let lanes = if double { Lanes::D } else { Lanes::S };
+        self.a.ins_element(lanes, d, 0, V2, 0)
+    }
+
+    /// A scalar source operand: the low lane of an xmm register, or memory
+    /// without an alignment requirement, loaded into `vt`.
     fn scalar_source(
         &mut self,
         vt: VReg,
@@ -2900,17 +3145,16 @@ impl Translator {
         src: Operand,
         at: Site,
         slow: &mut Option<Label>,
-    ) -> Emit<(HostReg, u32)> {
-        let (base, off) = match src {
+    ) -> Emit<VReg> {
+        match src {
             Operand::Mem(m) => {
                 self.address(&m, at.next, true)?;
                 self.check(Check::Read, if double { 8 } else { 4 }, at.rip, slow)?;
-                (ADDR, 0)
+                self.a.load_store_fp(true, double, vt, ADDR, 0)?;
+                Ok(vt)
             }
-            _ => (CPU, xmm_offset(xmm(&src).expect("checked by supported"))),
-        };
-        self.a.load_store_fp(true, double, vt, base, off)?;
-        Ok((base, off))
+            _ => Ok(xreg(&src)),
+        }
     }
 
     /// FCMPE (`signaling`: IOC also for quiet NaNs) or FCMP.
@@ -2922,16 +3166,14 @@ impl Translator {
         }
     }
 
-    /// To the slow path if operand `v`, loaded from `base + off`, is a
-    /// denormal single or double: x86 raises DE, the host nothing. The
-    /// bits of an xmm register come from the `Cpu` again, with an integer
-    /// load, cheaper here than FMOV; guest memory is not read twice, as
-    /// another thread may write it in between. Uses `T1`.
+    /// To the slow path if the low lane of `v` is a denormal single or
+    /// double: x86 raises DE, the host nothing. The bits come from the
+    /// vector register (guest memory is not read twice, as another thread
+    /// may write it in between). Uses `T1`.
     fn slow_if_denormal(
         &mut self,
         double: bool,
         v: VReg,
-        (base, off): (HostReg, u32),
         rip: u64,
         slow: &mut Option<Label>,
     ) -> Emit {
@@ -2943,12 +3185,7 @@ impl Translator {
         } else {
             (Width::W, 0x7f80_0000)
         };
-        if base == CPU {
-            let size = if double { MemSize::B64 } else { MemSize::B32 };
-            self.a.ldr(size, T1, base, off)?;
-        } else {
-            self.a.fmov_to_gpr(double, T1, v);
-        }
+        self.a.fmov_to_gpr(double, T1, v);
         self.a.logic_imm(Logic::Ands, w, ZR, T1, exponent)?;
         // Exponent 0, out of line: denormal unless the fraction is 0 too
         // (shifting the sign out).
@@ -3014,7 +3251,8 @@ impl Translator {
         self.a.b_cond(Cond::Vs, slow);
     }
 
-    /// dst = dst op src (`swap`: src op dst) on 128-bit vectors.
+    /// dst = dst op src (`swap`: src op dst) on 128-bit vectors, straight
+    /// into the destination's register.
     #[allow(clippy::too_many_arguments)]
     fn vector_op(
         &mut self,
@@ -3026,42 +3264,29 @@ impl Translator {
         at: Site,
         slow: &mut Option<Label>,
     ) -> Emit {
-        let d_off = xmm(&dst).map(xmm_offset).expect("checked by supported");
-        self.a.ldr_q(V0, CPU, d_off)?;
-        self.vector_source(V1, src, at, slow)?;
-        let (n, m) = if swap { (V1, V0) } else { (V0, V1) };
-        self.a.vec3(op, lanes, V0, n, m)?;
-        self.a.str_q(V0, CPU, d_off)
+        let d = xreg(&dst);
+        let s = self.vector_source(V1, src, at, slow)?;
+        let (n, m) = if swap { (s, d) } else { (d, s) };
+        self.a.vec3(op, lanes, d, n, m)
     }
 
-    /// Loads a 128-bit source operand (an xmm register, or 16-byte aligned
-    /// memory) into `vt`.
+    /// A 128-bit source operand: an xmm register's vector register, or
+    /// 16-byte aligned memory (checked) loaded into `vt`.
     fn vector_source(
         &mut self,
         vt: VReg,
         src: Operand,
         at: Site,
         slow: &mut Option<Label>,
-    ) -> Emit {
-        let (base, off) = self.source_base(src, at, slow)?;
-        self.a.ldr_q(vt, base, off)
-    }
-
-    /// Where the bytes of a 128-bit source operand are: an xmm register in
-    /// the `Cpu`, or 16-byte aligned memory at `ADDR` (checked).
-    fn source_base(
-        &mut self,
-        src: Operand,
-        at: Site,
-        slow: &mut Option<Label>,
-    ) -> Emit<(HostReg, u32)> {
+    ) -> Emit<VReg> {
         match src {
             Operand::Mem(m) => {
                 self.address(&m, at.next, true)?;
                 self.check_xmm_access(Check::Read, true, at.rip, slow)?;
-                Ok((ADDR, 0))
+                self.a.ldr_q(vt, ADDR, 0)?;
+                Ok(vt)
             }
-            _ => Ok((CPU, xmm_offset(xmm(&src).expect("checked by supported")))),
+            _ => Ok(xreg(&src)),
         }
     }
 
@@ -3087,8 +3312,8 @@ impl Translator {
     fn exit(&mut self, rip: u64, status: u64) -> Emit {
         self.publish_lazy()?;
         self.a.mov_imm64(EXIT_RIP, rip);
-        self.set_status(status)?;
-        self.a.b(self.epilogue.expect("set by translate"));
+        let entry = self.status_entry(status);
+        self.a.b(entry);
         Ok(())
     }
 
@@ -3140,8 +3365,8 @@ impl Translator {
             self.a.bind(miss);
         }
         self.a.mov(Width::X, EXIT_RIP, target);
-        self.set_status(EXIT_CONTINUE)?;
-        self.a.b(self.epilogue.expect("set by translate"));
+        let entry = self.status_entry(EXIT_CONTINUE);
+        self.a.b(entry);
         Ok(())
     }
 
@@ -3305,6 +3530,32 @@ impl Translator {
             )?;
         }
         Ok(())
+    }
+
+    /// Loads (`load`) or stores the xmm registers, kept in v16–v31, from
+    /// or to `Cpu::xmm`, in pairs.
+    fn vector_registers(&mut self, load: bool) -> Emit {
+        let base = offset_of!(Cpu, xmm) as i32;
+        for pair in 0..8u8 {
+            self.a.pair_q(
+                load,
+                VReg::new(16 + 2 * pair),
+                VReg::new(17 + 2 * pair),
+                CPU,
+                base + 32 * i32::from(pair),
+            )?;
+        }
+        Ok(())
+    }
+
+    /// The entry of the epilogue that records `status` first.
+    fn status_entry(&mut self, status: u64) -> Label {
+        if let Some(&(_, entry)) = self.status_entries.iter().find(|(s, _)| *s == status) {
+            return entry;
+        }
+        let entry = self.a.new_label();
+        self.status_entries.push((status, entry));
+        entry
     }
 
     /// Records the exit status for the epilogue.

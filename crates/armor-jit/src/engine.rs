@@ -90,6 +90,9 @@ pub(crate) enum Entry {
     Code(*const u8),
     /// The first instruction is not translated: the interpreter runs it.
     Interpret,
+    /// Not translated yet: the interpreter ran the block this many times
+    /// (`Jit::warm_up`).
+    Cold(u32),
 }
 
 /// Hashes guest addresses: one multiplication instead of SipHash, which
@@ -158,6 +161,10 @@ pub struct Jit {
     mode: Mode,
     /// The host CPU's extensions the translations may use (ADR-0032).
     features: HostFeatures,
+    /// How many times the interpreter runs a block before it is
+    /// translated: code that runs only a few times (a program's startup)
+    /// costs less interpreted than translated. 0 translates at once.
+    warm_up: u32,
 }
 
 /// A translated block: `extern "C" fn(cpu, page_table, context)
@@ -190,6 +197,7 @@ impl Jit {
             targets: vec![[NO_RIP, 0]; TARGET_ENTRIES].into_boxed_slice(),
             mode: Mode::Long,
             features: HostFeatures::detect(),
+            warm_up: 0,
         })
         .map(|mut jit| {
             jit.context.targets = jit.targets.as_ptr() as u64;
@@ -204,6 +212,14 @@ impl Jit {
     pub fn set_features(&mut self, features: HostFeatures) {
         self.features = features;
         self.flush();
+    }
+
+    /// Blocks are translated after the interpreter has run them `runs`
+    /// times (0: at once, the default). Lockstep translates at once.
+    pub fn set_warm_up(&mut self, runs: u32) {
+        if !self.lockstep {
+            self.warm_up = runs;
+        }
     }
 
     /// Runs about `budget` guest instructions, like `Cpu::run`: stops
@@ -227,6 +243,24 @@ impl Jit {
         while budget > 0 {
             let interpret = match self.entry(cpu.rip, mem) {
                 Entry::Interpret => true,
+                Entry::Cold(_) => {
+                    // The block, interpreted until control leaves its
+                    // straight line.
+                    for _ in 0..MAX_BLOCK_INSTRUCTIONS {
+                        let rip = cpu.rip;
+                        budget -= 1;
+                        let step = cpu.step(mem)?;
+                        self.sync_mxcsr(cpu);
+                        if step == Step::Syscall {
+                            return Ok(Step::Syscall);
+                        }
+                        let ahead = cpu.rip.wrapping_sub(rip);
+                        if ahead == 0 || ahead > MAX_INSTRUCTION_LEN as u64 || budget <= 0 {
+                            break;
+                        }
+                    }
+                    continue;
+                }
                 Entry::Code(code) => {
                     let epoch = self.epoch;
                     let status;
@@ -274,6 +308,10 @@ impl Jit {
     /// Rewrites the exit at `site` (from a block that ran in `epoch`) to
     /// jump straight into the block at `target`, translating it if needed.
     fn chain(&mut self, site: u64, epoch: u64, target: u64, mem: &MemView) {
+        // A block still warming up is counted when the engine runs it.
+        if let Some(Entry::Cold(_)) = self.blocks.get(&target) {
+            return;
+        }
         let Entry::Code(code) = self.entry(target, mem) else {
             return;
         };
@@ -311,14 +349,18 @@ impl Jit {
             (cached, entry) if cached == rip => entry,
             _ => {
                 let entry = match self.blocks.get(&rip) {
+                    Some(&Entry::Cold(runs)) if runs + 1 < self.warm_up => Entry::Cold(runs + 1),
+                    Some(&Entry::Cold(_)) => self.translate(rip, mem),
                     Some(&entry) => entry,
-                    None => {
-                        let entry = self.translate(rip, mem);
-                        self.blocks.insert(rip, entry);
-                        entry
-                    }
+                    None if self.warm_up > 0 => Entry::Cold(0),
+                    None => self.translate(rip, mem),
                 };
-                self.recent[slot] = (rip, entry);
+                self.blocks.insert(rip, entry);
+                // Cold blocks stay out of the cache: their count is in
+                // `blocks`.
+                if !matches!(entry, Entry::Cold(_)) {
+                    self.recent[slot] = (rip, entry);
+                }
                 entry
             }
         };
@@ -408,7 +450,7 @@ impl Jit {
         // atomics; those without one go to the interpreter, which makes
         // them atomic on the host (`supported_concurrent`).
         let concurrent = mem.is_concurrent();
-        let mut block = Vec::new();
+        let mut block = Vec::with_capacity(MAX_BLOCK_INSTRUCTIONS);
         let mut at = rip;
         let limit = if self.lockstep {
             1
