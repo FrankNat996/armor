@@ -307,12 +307,15 @@ pub(crate) fn compare(
 /// The mask of a cmpss / cmpsd / cmpps / cmppd lane: predicate 0..7 is eq,
 /// lt, le, unord, neq, nlt, nle, ord; lt, le, nlt and nle signal on QNaNs.
 pub(crate) fn compare_mask(double: bool, predicate: u8, a: u64, b: u64, env: Env) -> (u64, u16) {
-    let signaling = matches!(predicate, 1 | 2 | 5 | 6);
+    // VEX predicates 8–15 give the opposite result for unordered operands
+    // (EQ_UQ, NGE_US, …, TRUE_UQ), 16–31 those of 0–15 with the opposite
+    // signaling (Intel SDM, CMPPS, table 3-1).
+    let signaling = matches!(predicate & 7, 1 | 2 | 5 | 6) != (predicate & 0x10 != 0);
     let ((zf, pf, cf), flags) = compare(double, a, b, signaling, env);
     let unordered = pf;
     let equal = zf && !unordered;
     let less = cf && !unordered;
-    let result = match predicate {
+    let result = match predicate & 7 {
         0 => equal,
         1 => less,
         2 => less || equal,
@@ -321,7 +324,7 @@ pub(crate) fn compare_mask(double: bool, predicate: u8, a: u64, b: u64, env: Env
         5 => !less,
         6 => !(less || equal),
         _ => !unordered,
-    };
+    } != (unordered && predicate & 8 != 0);
     let all_ones = if double { u64::MAX } else { 0xffff_ffff };
     (if result { all_ones } else { 0 }, flags)
 }

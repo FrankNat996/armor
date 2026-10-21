@@ -29,6 +29,8 @@ pub enum Extension {
     /// XSAVE: xgetbv, xsetbv, xsave, xrstor, xsaveopt, xsavec, xsaves,
     /// xrstors.
     Xsave,
+    /// movbe.
+    Movbe,
     Aes,
     Pclmul,
     Sha,
@@ -59,6 +61,7 @@ impl Extension {
                 | Extension::Sse42
                 | Extension::Popcnt
                 | Extension::Xsave
+                | Extension::Movbe
         )
     }
 }
@@ -76,6 +79,7 @@ impl fmt::Display for Extension {
             Extension::Sse42 => "SSE4.2",
             Extension::Popcnt => "POPCNT",
             Extension::Xsave => "XSAVE",
+            Extension::Movbe => "MOVBE",
             Extension::Aes => "AES-NI",
             Extension::Pclmul => "PCLMULQDQ",
             Extension::Sha => "SHA",
@@ -495,6 +499,7 @@ impl Reader<'_> {
             (0x66, 0x10 | 0x14 | 0x15 | 0x17 | 0x20..=0x25 | 0x28..=0x2b | 0x30..=0x35)
             | (0x66, 0x38..=0x41) => Extension::Sse41,
             (0x66, 0x37) | (0xf2, 0xf0 | 0xf1) => Extension::Sse42,
+            (0 | 0x66, 0xf0 | 0xf1) => Extension::Movbe,
             (0x66, 0xdb..=0xdf) => Extension::Aes,
             (0, 0xc8..=0xcd) => Extension::Sha,
             _ => Extension::Base,

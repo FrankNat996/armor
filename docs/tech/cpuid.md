@@ -42,8 +42,13 @@ Features on the way to x86-64-v3 that armor implements but does not declare by d
 | Feature | What changes | Measured against |
 |---|---|---|
 | `xsave` | leaf 1 ecx \|= XSAVE (bit 26), OSXSAVE (27): 0x8c982201; leaf 0xd subleaf 0 (3, 0x240, 0x240, 0), subleaf 1 (0, 0x240, 0, 0); XCR0 = 3 | ✅ `qemu64,...,+xsave` (`basic/cpuid`, `xsave/xsave`) |
+| `avx` (with `xsave`) | leaf 1 ecx bit 28: 0x9c982201; leaf 0xd subleaf 0 (7, 0x340, 0x340, 0), subleaf 1 (0, 0x340, 0, 0), subleaf 2 (0x100, 0x240, 0, 0); XCR0 = 7 | ✅ `qemu64,...,+xsave,+avx` (CPUID program, `basic/cpuid`) |
+| `bmi1` | leaf 7 ebx bit 3; `tzcnt` counts zeros | ✅ `qemu64,...,+bmi1` (CPUID program, `bmi/bmi`) |
+| `bmi2` | leaf 7 ebx bit 8 | ✅ `qemu64,...,+bmi2` |
+| `abm` | leaf 0x8000_0001 ecx bit 5 (LZCNT); `lzcnt` counts zeros | ✅ `qemu64,...,+abm` |
+| `movbe` | leaf 1 ecx bit 22 | ✅ `qemu64,...,+movbe` |
 
-Without the feature its instructions raise #UD (`cpuid::reports`, `Extension::Xsave`).
+Without the feature its instructions raise #UD (`cpuid::reports`, `Extension::Xsave`, `Extension::Movbe`; `declared` in `armor-cpu/src/lib.rs` for those the decoder decodes), except F3 0F BC/BD, which then run as `bsf`/`bsr`.
 
 An instruction from an undeclared extension raises #UD (SIGILL), as on a CPU without it (ADR-0026, `cpuid::reports`, checked against these bits by a unit test).
 
@@ -59,7 +64,7 @@ The test `basic/cpuid` does not compare these leaves.
 
 ## Observed consequences
 - With this model static glibc uses only baseline + SSE2 instructions. The qemu log (`-d in_asm`) on the three initial C programs shows 129 distinct forms, none of them AVX.
-- `tzcnt`/`lzcnt` (F3 0F BC/BD) are executed as `bsf`/`bsr`, as a CPU without BMI1/LZCNT does. The compiler emits them on purpose because they are compatible.
+- `tzcnt`/`lzcnt` (F3 0F BC/BD) are executed as `bsf`/`bsr`, as a CPU without BMI1/LZCNT does. The compiler emits them on purpose because they are compatible. With `bmi1` or `abm` declared they count zeros (`tech/avx.md`).
 
 ## When to change it
 When armor implements a new extension of x86-64-v3, it is first declared on request (`Features`, above); the default model changes only when the whole of v3 works (`tech/avx.md`). For the others (for example SSE3, SSSE3, SSE4.1/4.2 in M4):

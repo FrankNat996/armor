@@ -429,7 +429,19 @@ pub fn supported(insn: &Instruction) -> bool {
         Op::Cmpxchg { dst, src } | Op::Xadd { dst, src } => {
             wide && reg_or_mem(&dst) && gpr(src).is_some()
         }
-        Op::BitScan { dst, src, .. } => wide && gpr(dst).is_some() && reg_or_mem(&src),
+        // tzcnt and lzcnt only as bsf and bsr, when CPUID declares
+        // neither BMI1 nor LZCNT: counting zeros is left to the
+        // interpreter.
+        Op::BitScan {
+            reverse,
+            dst,
+            src,
+            counts_zeros,
+        } => {
+            wide && gpr(dst).is_some()
+                && reg_or_mem(&src)
+                && !(counts_zeros && armor_cpu::counts_zeros(reverse))
+        }
         // A register offset into memory moves the address: interpreter.
         Op::BitTest { dst, offset, .. } => {
             wide && match (dst, offset) {
@@ -2373,7 +2385,9 @@ impl Translator {
                     self.write_destination(dst, size, R)?;
                 }
             }
-            Op::BitScan { reverse, dst, src } => {
+            Op::BitScan {
+                reverse, dst, src, ..
+            } => {
                 // Only ZF changes; a zero source leaves the destination.
                 self.read_operand(B, src, size, at, &mut slow)?;
                 let (zero, done) = (self.a.new_label(), self.a.new_label());

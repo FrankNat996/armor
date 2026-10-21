@@ -337,7 +337,7 @@ impl Cpu {
         Ok(())
     }
 
-    fn sse_ops(
+    pub(crate) fn sse_ops(
         &mut self,
         op: SseOp,
         dst: Operand,
@@ -1056,7 +1056,7 @@ impl Cpu {
             Operand::Reg(Reg::Mm(n)) => Ok(self.mm(n)),
             Operand::Mem(m) => {
                 let addr = self.address(&m, next);
-                check_alignment(addr, aligned)?;
+                check_alignment(addr, aligned && !self.vex_unaligned)?;
                 let mut bytes = [0u8; 16];
                 mem.read(addr, &mut bytes)?;
                 Ok(u128::from_le_bytes(bytes))
@@ -1077,7 +1077,7 @@ impl Cpu {
             Operand::Reg(Reg::Xmm(n)) => self.xmm[usize::from(n)] = value,
             Operand::Mem(m) => {
                 let addr = self.address(&m, next);
-                check_alignment(addr, aligned)?;
+                check_alignment(addr, aligned && !self.vex_unaligned)?;
                 mem.write(addr, &value.to_le_bytes())?;
             }
             _ => unreachable!("128-bit operands are xmm registers or memory"),

@@ -204,7 +204,13 @@ fn matches_case(pattern: &str, name: &str) -> bool {
 /// Cases that test instructions of CPUID features armor declares only on
 /// request (docs/tech/avx.md): qemu and armor run them with these features
 /// declared, so that they execute instead of raising #UD under both.
-const CASE_FEATURES: [(&str, &str); 2] = [("xsave/", "+xsave"), ("*/signal_xstate", "+xsave")];
+const CASE_FEATURES: [(&str, &str); 5] = [
+    ("xsave/", "+xsave"),
+    ("avx/", "+xsave,+avx"),
+    ("*/signal_xstate", "+xsave"),
+    ("bmi/", "+bmi1,+bmi2,+abm,+movbe"),
+    ("*/bmi_compiled", "+bmi1,+bmi2,+abm,+movbe"),
+];
 
 /// The CPUID features case `name` needs (`CASE_FEATURES`), or "".
 pub fn case_features(name: &str) -> &'static str {

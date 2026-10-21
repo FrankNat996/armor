@@ -27,6 +27,7 @@ pub(crate) fn decode(bytes: &[u8], mode: Mode) -> Result<Instruction, DecodeErro
         lock: false,
         rep: None,
         segment: Segment::Default,
+        vex: None,
     };
     d.prefixes()?;
     let (op, size) = d.instruction()?;
@@ -70,6 +71,21 @@ pub(crate) struct Decoder<'a> {
     /// The last F2 or F3 prefix.
     rep: Option<u8>,
     segment: Segment,
+    /// The VEX prefix, if the instruction has one.
+    vex: Option<Vex>,
+}
+
+/// The fields of a VEX prefix (Intel SDM vol. 2, 2.3.5).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Vex {
+    /// The opcode map: 1 (0F), 2 (0F 38), 3 (0F 3A).
+    pub map: u8,
+    /// The mandatory prefix VEX.pp stands for: 0, 0x66, 0xf3 or 0xf2.
+    pub prefix: u8,
+    /// The register VEX.vvvv names (stored inverted in the prefix).
+    pub vvvv: u8,
+    /// VEX.L: 256-bit vectors.
+    pub l: bool,
 }
 
 /// The r/m half of a ModRM byte.
@@ -476,7 +492,7 @@ impl Decoder<'_> {
             0xc4 | 0xc5 if self.compat && self.peek_modrm()? >> 6 != 3 => {
                 Err(DecodeError::Unsupported("les/lds"))
             }
-            0xc4 | 0xc5 => Err(DecodeError::Unsupported("AVX (VEX)")),
+            0xc4 | 0xc5 => self.vex_prefix(opcode),
             0xc6 | 0xc7 => {
                 let size = if opcode == 0xc6 { Size::B8 } else { size };
                 let (digit, rm) = self.modrm()?;
@@ -867,7 +883,7 @@ impl Decoder<'_> {
                 ))
             }
             // bsf/bsr. With F3 these encode tzcnt/lzcnt, which run as
-            // bsf/bsr on CPUs without BMI1/LZCNT, and armor reports neither.
+            // bsf/bsr on CPUs without BMI1/LZCNT (armor's default model).
             0xbc | 0xbd => {
                 let (reg, rm) = self.modrm()?;
                 Ok((
@@ -875,6 +891,7 @@ impl Decoder<'_> {
                         reverse: opcode == 0xbd,
                         dst: Reg::Gpr(reg),
                         src: self.rm_operand(rm, size),
+                        counts_zeros: self.rep == Some(0xf3),
                     },
                     size,
                 ))
@@ -961,6 +978,54 @@ impl Decoder<'_> {
         }
     }
 
+    /// A VEX prefix, C4 (three bytes) or C5 (two), then the instruction
+    /// (`vex.rs`). A 66, F2, F3, LOCK or REX prefix before it is #UD. In
+    /// compatibility mode VEX.B and the top bit of VEX.vvvv are ignored
+    /// (VEX.R and VEX.X are 1 there, or the bytes would be les or lds).
+    fn vex_prefix(&mut self, escape: u8) -> Result<(Op, Size), DecodeError> {
+        if self.opsize16 || self.rep.is_some() || self.lock || self.has_rex {
+            return Err(DecodeError::Invalid);
+        }
+        let first = self.u8()?;
+        let (rxb, map, last) = if escape == 0xc5 {
+            // R̄ vvvv̄ L pp; map 0F, W 0.
+            ((!first >> 5) & 4, 1, first & 0x7f)
+        } else {
+            // R̄ X̄ B̄ m-mmmm, then W vvvv̄ L pp.
+            ((!first >> 5) & 7, first & 0x1f, self.u8()?)
+        };
+        if !(1..=3).contains(&map) {
+            return Err(DecodeError::Invalid);
+        }
+        let mut vvvv = (!last >> 3) & 0xf;
+        let mut rxb = rxb;
+        if self.compat {
+            vvvv &= 7;
+            rxb = 0;
+        }
+        let w = last & 0x80 != 0;
+        // VEX.W widens general registers in 64-bit mode only.
+        self.rex = u8::from(w && !self.compat) << 3 | rxb;
+        self.has_rex = true;
+        self.vex = Some(Vex {
+            map,
+            prefix: [0, 0x66, 0xf3, 0xf2][usize::from(last & 3)],
+            vvvv,
+            l: last & 4 != 0,
+        });
+        crate::vex::decode(self)
+    }
+
+    /// The VEX prefix of the instruction being decoded (`vex_prefix`).
+    pub(crate) fn vex(&self) -> Vex {
+        self.vex.expect("decoding a VEX instruction")
+    }
+
+    /// Whether the instruction has a VEX prefix.
+    pub(crate) fn is_vex(&self) -> bool {
+        self.vex.is_some()
+    }
+
     /// The width of stack and branch operations: 64 bits, 32 in
     /// compatibility mode.
     fn stack(&self) -> Size {
@@ -994,6 +1059,9 @@ impl Decoder<'_> {
     /// Mandatory prefix of an SSE instruction: F3 or F2 if present (the last
     /// one wins), otherwise 66, otherwise none (0).
     pub(crate) fn sse_prefix(&self) -> u8 {
+        if let Some(vex) = self.vex {
+            return vex.prefix;
+        }
         match self.rep {
             Some(p) => p,
             None if self.opsize16 => 0x66,

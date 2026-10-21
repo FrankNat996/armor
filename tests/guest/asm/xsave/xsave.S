@@ -99,8 +99,19 @@ _start:
     SAVE 1, 0
     /* SSE only: MXCSR, MXCSR_MASK and the xmm registers, bit 1. */
     SAVE 2, 0
-    /* AVX only, which XCR0 does not enable: as with nothing. */
-    SAVE 4, 0
+    /*
+     * AVX only, which XCR0 does not enable: as with nothing. With AVX
+     * declared (ARMOR_CPU_FEATURES) the SDM writes MXCSR here too and qemu
+     * does not (docs/tech/avx.md): those 8 bytes are not compared.
+     */
+    FILL
+    mov eax, 4
+    xor edx, edx
+    xsave [rip + area]
+    CLEAR_X87_UNDEFINED area
+    mov rax, 0xa5a5a5a5a5a5a5a5
+    mov [rip + area + 24], rax
+    DUMP_WRITE area, 576
     /* Everything: what XCR0 enables. */
     SAVE -1, -1
     /* The dynamic loader's mask (SSE, AVX, AVX-512 and more, no x87). */

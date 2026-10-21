@@ -17,6 +17,8 @@ use alloc::vec::Vec;
 extern crate alloc;
 
 mod alu;
+mod avx;
+mod bmi;
 pub mod cpuid;
 mod f80;
 mod float;
@@ -31,8 +33,9 @@ use core::fmt;
 
 use armor_guest::{Access, GuestMemory, MemFault};
 use armor_x86::{
-    AluOp, Base, BitTestOp, Cond, DecodeError, FlagOp, Instruction, LoopKind, MAX_INSTRUCTION_LEN,
-    Mem, Mode, Op, Operand, Reg, Segment, ShiftCount, Size, StateOp, UnaryOp, decode_in,
+    AluOp, Base, BitTestOp, BmiOp, Cond, DecodeError, FlagOp, Instruction, LoopKind,
+    MAX_INSTRUCTION_LEN, Mem, Mode, Op, Operand, Reg, Segment, ShiftCount, Size, StateOp, UnaryOp,
+    decode_in,
 };
 
 pub use alu::{
@@ -104,6 +107,9 @@ pub struct Cpu {
     /// or load them; xsave and xrstor do when XCR0 has the AVX component
     /// (docs/tech/avx.md).
     pub ymm_hi: [u128; 16],
+    /// Set while a VEX instruction runs (`avx.rs`): its memory operands
+    /// need no alignment. False between instructions.
+    pub(crate) vex_unaligned: bool,
     /// Decoded instructions; not architectural state.
     icache: icache::DecodeCache,
 }
@@ -297,9 +303,29 @@ fn declared(op: &Op) -> bool {
             op: StateOp::Xsave | StateOp::Xrstor,
             ..
         } => Features::XSAVE,
+        Op::Movbe { .. } => Features::MOVBE,
+        Op::Vex { avx2: true, .. } => Features::AVX2,
+        Op::Vex { .. } | Op::Vzero { .. } | Op::VexMxcsr { .. } => Features::AVX,
+        Op::Bmi { op, .. } => match op {
+            BmiOp::Andn | BmiOp::Bextr | BmiOp::Blsi | BmiOp::Blsmsk | BmiOp::Blsr => {
+                Features::BMI1
+            }
+            _ => Features::BMI2,
+        },
         _ => return true,
     };
     cpuid::declared().contains(needs)
+}
+
+/// Whether tzcnt (`reverse` false) or lzcnt counts zeros: CPUID declares
+/// BMI1 or LZCNT. Otherwise F3 0F BC and BD run as bsf and bsr.
+pub fn counts_zeros(reverse: bool) -> bool {
+    let feature = if reverse {
+        cpuid::Features::LZCNT
+    } else {
+        cpuid::Features::BMI1
+    };
+    cpuid::declared().contains(feature)
 }
 
 impl Cpu {
@@ -320,6 +346,7 @@ impl Cpu {
             segments: Segments::default(),
             mm_scratch: [0; 2],
             ymm_hi: [0; 16],
+            vex_unaligned: false,
             icache: icache::DecodeCache::new(),
         }
     }
@@ -753,7 +780,20 @@ impl Cpu {
                 let crc = simd::crc32c(crc, data, src_size.bytes());
                 self.write_reg(dst, size, u64::from(crc));
             }
-            Op::BitScan { reverse, dst, src } => {
+            Op::BitScan {
+                reverse,
+                dst,
+                src,
+                counts_zeros: true,
+            } if counts_zeros(reverse) => {
+                let value = self.read(src, size, next, mem)?;
+                let (count, flags) = bmi::count_zeros(reverse, size, value);
+                self.write_reg(dst, size, count);
+                self.rflags = (self.rflags & !(FLAG_CF | FLAG_ZF)) | flags;
+            }
+            Op::BitScan {
+                reverse, dst, src, ..
+            } => {
                 let value = self.read(src, size, next, mem)? & size.mask();
                 if value == 0 {
                     // The destination is left unchanged (undefined per Intel).
@@ -766,6 +806,37 @@ impl Cpu {
                     };
                     self.write_reg(dst, size, u64::from(index));
                     self.rflags &= !FLAG_ZF;
+                }
+            }
+            Op::Movbe { dst, src } => {
+                let value = self.read(src, size, next, mem)?;
+                let swapped = match size {
+                    Size::B16 => u64::from((value as u16).swap_bytes()),
+                    Size::B32 => u64::from((value as u32).swap_bytes()),
+                    _ => value.swap_bytes(),
+                };
+                self.write(dst, size, swapped, next, mem)?;
+            }
+            Op::Bmi {
+                op: BmiOp::Mulx,
+                dst,
+                src,
+                vvvv,
+            } => {
+                let factor = self.read(src, size, next, mem)?;
+                let rdx = self.read_reg(Reg::Gpr(RDX as u8), size);
+                let product = u128::from(rdx) * u128::from(factor);
+                // The low half first: with the same register for both,
+                // the high half is what stays (SDM).
+                self.write_reg(vvvv, size, product as u64 & size.mask());
+                self.write_reg(dst, size, (product >> size.bits()) as u64);
+            }
+            Op::Bmi { op, dst, src, vvvv } => {
+                let value = self.read(src, size, next, mem)?;
+                let (result, flags) = bmi::bmi(op, size, value, self.read_reg(vvvv, size));
+                self.write_reg(dst, size, result);
+                if let Some(flags) = flags {
+                    self.set_status(flags);
                 }
             }
             Op::Bswap(reg) => {
@@ -950,6 +1021,16 @@ impl Cpu {
             Op::Int3 => return Err(Trap::Exception(Exception::Breakpoint(insn.len as u8))),
             Op::Int1 => return Err(Trap::Exception(Exception::Debug)),
             Op::Sse { op, dst, src } => self.sse(op, dst, src, next, mem)?,
+            Op::Vex { .. } => self.vex(&insn.op, next, mem)?,
+            Op::Vzero { all } => self.vzero(all),
+            Op::VexMxcsr { store, mem: m } => {
+                let op = if store {
+                    StateOp::Stmxcsr
+                } else {
+                    StateOp::Ldmxcsr
+                };
+                self.state(op, m, next, mem)?;
+            }
             Op::State { op, mem: m } => self.state(op, m, next, mem)?,
             Op::X87 { op, opcode } => self.x87(op, opcode, next, mem)?,
         }

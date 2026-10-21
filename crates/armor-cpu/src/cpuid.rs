@@ -28,10 +28,33 @@ impl Features {
     /// XSAVE and OSXSAVE (leaf 1 ecx bits 26 and 27), leaf 0xD, XCR0 = x87
     /// | SSE: xgetbv, xsave, xrstor, and XSAVE-format signal frames.
     pub const XSAVE: Features = Features(1 << 0);
+    /// BMI1 (leaf 7 ebx bit 3): andn, bextr, blsi, blsmsk, blsr, and tzcnt
+    /// instead of bsf for F3 0F BC.
+    pub const BMI1: Features = Features(1 << 1);
+    /// BMI2 (leaf 7 ebx bit 8): bzhi, mulx, pdep, pext, rorx, sarx, shlx,
+    /// shrx.
+    pub const BMI2: Features = Features(1 << 2);
+    /// ABM, that is LZCNT (leaf 0x8000_0001 ecx bit 5): lzcnt instead of
+    /// bsr for F3 0F BD.
+    pub const LZCNT: Features = Features(1 << 3);
+    /// MOVBE (leaf 1 ecx bit 22).
+    pub const MOVBE: Features = Features(1 << 4);
+    /// AVX (leaf 1 ecx bit 28), with XSAVE only: XCR0 gains the AVX
+    /// component (the upper ymm halves, leaf 0xD subleaf 2).
+    pub const AVX: Features = Features(1 << 5);
+    /// AVX2 (leaf 7 ebx bit 5), with AVX only: the 256-bit integer forms.
+    pub const AVX2: Features = Features(1 << 6);
 
     /// The names `parse` accepts, qemu's (`qemu-x86_64 -cpu help`): only
     /// features armor implements.
-    const NAMES: [(&'static str, Features); 1] = [("xsave", Features::XSAVE)];
+    const NAMES: [(&'static str, Features); 6] = [
+        ("xsave", Features::XSAVE),
+        ("avx", Features::AVX),
+        ("bmi1", Features::BMI1),
+        ("bmi2", Features::BMI2),
+        ("abm", Features::LZCNT),
+        ("movbe", Features::MOVBE),
+    ];
 
     pub fn contains(self, other: Features) -> bool {
         self.0 & other.0 == other.0
@@ -60,6 +83,11 @@ impl Features {
                 ));
             };
             features = features.union(*feature);
+        }
+        // AVX state is enabled through XCR0: without XSAVE no program
+        // could use it (qemu then raises #UD on xgetbv).
+        if features.contains(Features::AVX) && !features.contains(Features::XSAVE) {
+            return Err("CPU feature `avx` needs `xsave`".into());
         }
         Ok(features)
     }
@@ -93,22 +121,31 @@ pub fn declared() -> Features {
 /// model has (✅ `xgetbv` under `-cpu qemu64,+xsave` gives 3); none
 /// without.
 pub fn xcr0(features: Features) -> u64 {
-    if features.contains(Features::XSAVE) {
-        0b11
-    } else {
+    if !features.contains(Features::XSAVE) {
         0
+    } else if features.contains(Features::AVX) {
+        0b111
+    } else {
+        0b11
     }
 }
 
 /// The size of the XSAVE area for the components of XCR0: the 512-byte
 /// legacy region and the 64-byte header (leaf 0xD, ebx).
 pub fn xsave_size(features: Features) -> u32 {
-    if features.contains(Features::XSAVE) {
-        512 + 64
-    } else {
+    if !features.contains(Features::XSAVE) {
         0
+    } else if features.contains(Features::AVX) {
+        AVX_OFFSET + AVX_SIZE
+    } else {
+        512 + 64
     }
 }
+
+/// The AVX component in the XSAVE area: 16 upper halves of 16 bytes,
+/// after the legacy region and the header (leaf 0xD subleaf 2).
+const AVX_OFFSET: u32 = 576;
+const AVX_SIZE: u32 = 256;
 
 /// Whether the CPU armor presents reports `extension` in CPUID. An
 /// instruction of an extension it does not report raises #UD, as on a CPU
@@ -124,7 +161,12 @@ pub fn reports_with(features: Features, extension: armor_x86::Extension) -> bool
     match extension {
         Base | X87 | Mmx | Sse | Sse3 | Ssse3 | Sse41 | Sse42 | Popcnt => true,
         Xsave => features.contains(Features::XSAVE),
-        Aes | Pclmul | Sha | Amd3dNow | Vex | Evex | Xop | Padlock => false,
+        Movbe => features.contains(Features::MOVBE),
+        // VEX instructions armor decodes are checked one by one
+        // (`declared` in lib.rs); the others are AVX, AVX2, FMA, F16C: with
+        // AVX declared they stop armor until it implements them.
+        Vex => features.contains(Features::AVX),
+        Aes | Pclmul | Sha | Amd3dNow | Evex | Xop | Padlock => false,
     }
 }
 
@@ -139,26 +181,35 @@ pub fn query(leaf: u32, subleaf: u32) -> [u32; 4] {
 /// `query` with `features` declared.
 pub fn query_with(features: Features, leaf: u32, subleaf: u32) -> [u32; 4] {
     let xsave = features.contains(Features::XSAVE);
+    let bit = |feature: Features, bit: u32| {
+        if features.contains(feature) {
+            1 << bit
+        } else {
+            0
+        }
+    };
     match leaf {
         // Max basic leaf 0xd, vendor "AuthenticAMD".
         0 => [0xd, 0x6874_7541, 0x444d_4163, 0x6974_6e65],
         // Family/model/stepping, CLFLUSH size 64, features: SSE2 baseline
         // (FPU ... SSE SSE2) in edx, SSE3 (bit 0), SSSE3 (bit 9), CX16
         // (bit 13), SSE4.1 (bit 19), SSE4.2 (bit 20), POPCNT (bit 23) and
-        // "hypervisor present" in ecx; with XSAVE, XSAVE (bit 26) and
-        // OSXSAVE (bit 27: the operating system has enabled it, as Linux
-        // does).
+        // "hypervisor present" in ecx; on request MOVBE (bit 22), XSAVE
+        // (bit 26) and OSXSAVE (bit 27: the operating system has enabled
+        // it, as Linux does).
         1 => {
-            let xsave_bits = if xsave { 3 << 26 } else { 0 };
-            [
-                0x0006_0fb1,
-                0x0000_0800,
-                0x8098_2201 | xsave_bits,
-                0x078b_fbfd,
-            ]
+            let ecx = 0x8098_2201
+                | bit(Features::MOVBE, 22)
+                | bit(Features::XSAVE, 26)
+                | bit(Features::XSAVE, 27)
+                | bit(Features::AVX, 28);
+            [0x0006_0fb1, 0x0000_0800, ecx, 0x078b_fbfd]
         }
         // MONITOR/MWAIT leaf: only the extension bits.
         5 => [0, 0, 3, 0],
+        // Structured extended features, subleaf 0 (the only one): on
+        // request BMI1 (ebx bit 3) and BMI2 (bit 8).
+        7 if subleaf == 0 => [0, bit(Features::BMI1, 3) | bit(Features::BMI2, 8), 0, 0],
         // Extended topology: one thread per core, one core.
         0xb => match subleaf {
             0 => [0, 1, 0x100, 0],
@@ -174,6 +225,7 @@ pub fn query_with(features: Features, leaf: u32, subleaf: u32) -> [u32; 4] {
             match subleaf {
                 0 => [xcr0(features) as u32, size, size, 0],
                 1 => [0, size, 0, 0],
+                2 if features.contains(Features::AVX) => [AVX_SIZE, AVX_OFFSET, 0, 0],
                 _ => [0; 4],
             }
         }
@@ -181,7 +233,8 @@ pub fn query_with(features: Features, leaf: u32, subleaf: u32) -> [u32; 4] {
         0x8000_0000 => [0x8000_000a, 0x6874_7541, 0x444d_4163, 0x6974_6e65],
         // LAHF-LM (ecx bit 0); SYSCALL, NX, long mode, and the mirrored
         // baseline bits.
-        0x8000_0001 => [0x0006_0fb1, 0, 1, 0x2193_fbfd],
+        // On request ABM (LZCNT, ecx bit 5).
+        0x8000_0001 => [0x0006_0fb1, 0, 1 | bit(Features::LZCNT, 5), 0x2193_fbfd],
         0x8000_0002..=0x8000_0004 => {
             let chunk = &BRAND[(leaf - 0x8000_0002) as usize * 16..][..16];
             let word = |i: usize| u32::from_le_bytes(chunk[i * 4..i * 4 + 4].try_into().unwrap());
@@ -221,7 +274,7 @@ mod tests {
     #[test]
     fn reported_extensions_match_the_feature_bits() {
         use armor_x86::Extension;
-        for features in [Features::NONE, Features::XSAVE] {
+        for features in [Features::NONE, Features::XSAVE, Features::MOVBE] {
             let query = |leaf| query_with(features, leaf, 0);
             let reports = |extension| reports_with(features, extension);
             let [_, _, ecx, edx] = query(1);
@@ -236,6 +289,7 @@ mod tests {
             assert_eq!(reports(Extension::Popcnt), bit(ecx, 23));
             assert_eq!(reports(Extension::Aes), bit(ecx, 25));
             assert_eq!(reports(Extension::Xsave), bit(ecx, 26) && bit(ecx, 27));
+            assert_eq!(reports(Extension::Movbe), bit(ecx, 22));
             assert_eq!(reports(Extension::Vex), bit(ecx, 28));
             assert_eq!(reports(Extension::Evex), query(7)[1] >> 16 & 1 == 1);
             assert_eq!(reports(Extension::Sha), query(7)[1] >> 29 & 1 == 1);
@@ -282,6 +336,34 @@ mod tests {
         assert_eq!(query_with(f, 0x4000_0000, 0), [0; 4]);
         assert_eq!(query_with(f, 0x8000_0007, 0), [0; 4]);
         assert_eq!(query_with(Features::NONE, 0x8000_000b, 0), [0; 4]);
+    }
+
+    #[test]
+    fn bmi_lzcnt_and_movbe_bits_as_qemu() {
+        // ✅ qemu 10.0.13: `qemu64,...,+bmi1` leaf 7 ebx 8, `+bmi2` 0x100,
+        // `+abm` leaf 0x8000_0001 ecx 0x21, `+movbe` leaf 1 ecx 0x80d82201.
+        assert_eq!(query_with(Features::BMI1, 7, 0)[1], 0x8);
+        assert_eq!(query_with(Features::BMI2, 7, 0)[1], 0x100);
+        assert_eq!(query_with(Features::BMI2, 7, 1), [0; 4]);
+        assert_eq!(query_with(Features::LZCNT, 0x8000_0001, 0)[2], 0x21);
+        assert_eq!(query_with(Features::MOVBE, 1, 0)[2], 0x80d8_2201);
+        let all = Features::parse("+bmi1,+bmi2,+abm,+movbe,+xsave").unwrap();
+        assert_eq!(query_with(all, 1, 0)[2], 0x8cd8_2201);
+    }
+
+    #[test]
+    fn avx_extends_xcr0_and_leaf_0xd() {
+        // ✅ qemu 10.0.13, `qemu64,...,+xsave,+avx`: leaf 1 ecx 0x9c982201,
+        // leaf 0xd (7, 0x340, 0x340, 0), (0, 0x340, 0, 0), (0x100, 0x240,
+        // 0, 0), xgetbv 7.
+        let f = Features::parse("+xsave,+avx").unwrap();
+        assert_eq!(query_with(f, 1, 0)[2], 0x9c98_2201);
+        assert_eq!(query_with(f, 0xd, 0), [7, 0x340, 0x340, 0]);
+        assert_eq!(query_with(f, 0xd, 1), [0, 0x340, 0, 0]);
+        assert_eq!(query_with(f, 0xd, 2), [0x100, 0x240, 0, 0]);
+        assert_eq!(query_with(f, 0xd, 3), [0; 4]);
+        assert_eq!(xcr0(f), 7);
+        assert!(Features::parse("+avx").is_err());
     }
 
     #[test]

@@ -1,4 +1,5 @@
-//! The three-byte opcode maps 0F 38 and 0F 3A: SSSE3, SSE4.1, SSE4.2.
+//! The three-byte opcode maps 0F 38 and 0F 3A: SSSE3, SSE4.1, SSE4.2,
+//! MOVBE.
 //! Without a prefix the SSSE3 opcodes are MMX forms, decoded as their 66
 //! form on mm registers (`sse::to_mmx`).
 
@@ -26,6 +27,21 @@ pub(crate) fn decode_38(d: &mut Decoder) -> Result<(Op, Size), DecodeError> {
             src_size,
         };
         return Ok((op, dst_size));
+    }
+    // movbe (MOVBE): without F2 or F3, 66 for 16 bits; memory only.
+    if matches!(prefix, 0 | 0x66) && matches!(opcode, 0xf0 | 0xf1) {
+        let size = d.operand_size();
+        let (reg, rm) = d.modrm()?;
+        let Rm::Mem(mem) = rm else {
+            return Err(DecodeError::Invalid);
+        };
+        let (reg, mem) = (Operand::Reg(Reg::Gpr(reg)), Operand::Mem(mem));
+        let (dst, src) = if opcode == 0xf0 {
+            (reg, mem)
+        } else {
+            (mem, reg)
+        };
+        return Ok((Op::Movbe { dst, src }, size));
     }
     let int = |op| SseOp::Int(op);
     let mmx = prefix == 0 && matches!(opcode, 0x00..=0x0b | 0x1c..=0x1e);
