@@ -3598,9 +3598,9 @@ fn clone_or_fork(
         };
     }
     // A second guest thread: from now on guest code may run in parallel
-    // (ADR-0023). Before the thread exists, so that no code translated for
-    // one thread runs in two.
-    mem.enter_concurrent_mode();
+    // (ADR-0023), and the page tables need their lock. Before the thread
+    // exists, so that no code translated for one thread runs in two.
+    mem.share_between_threads();
     clone(cpu, thread, flags, stack, parent_tid, child_tid, tls)
 }
 

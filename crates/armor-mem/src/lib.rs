@@ -10,16 +10,20 @@
 //! addresses as `u64`.
 //!
 //! An `AddressSpace` is shared by the guest's threads (ADR-0018): every
-//! method takes `&self`, and the page tables are behind a `RwLock`. Guest
+//! method takes `&self`, and the page tables are behind a `RwLock` once a
+//! second thread may use them (`TableLock`; with one thread, borrows
+//! checked as `RefCell` checks them, without atomic operations). Guest
 //! accesses copy bytes under the read lock, so that no thread can unmap
 //! the host pages being copied; races between guest threads on the bytes
 //! themselves are the guest's own.
 
+use std::cell::UnsafeCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::io;
+use std::ops::{Deref, DerefMut};
 use std::ptr::NonNull;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering, fence};
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, AtomicU64, Ordering, fence};
 use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 pub use armor_guest::{Access, GUEST_PAGE_SIZE, GuestMemory, MemFault, Prot};
@@ -241,7 +245,7 @@ pub enum SharedSource {
 
 pub struct AddressSpace {
     host_page_size: u64,
-    tables: RwLock<Tables>,
+    tables: TableLock,
     /// Incremented by every mapping change and every write to an
     /// executable page (`GuestMemory::code_generation`).
     code_generation: AtomicU64,
@@ -291,6 +295,147 @@ struct Tables {
     shared: BTreeMap<u64, bool>,
 }
 
+/// The page tables, behind a lock once several threads may use them
+/// (`AddressSpace::share_between_threads`, before a second guest thread
+/// exists). Until then the one thread there is borrows them without a lock
+/// (a pair of read-lock operations cost 20 ns on a Cortex-A76, a syscall
+/// took two), checked as `RefCell` checks its borrows: a borrow for writing
+/// while another borrow lives panics, where the lock would deadlock.
+struct TableLock {
+    lock: RwLock<()>,
+    /// Set once, by `share`, never cleared.
+    shared: AtomicBool,
+    /// Before `shared`: the borrows alive, n > 0 for reading, -1 for
+    /// writing. Only the one thread touches it, with plain loads and
+    /// stores (no read-modify-write).
+    borrows: AtomicIsize,
+    tables: UnsafeCell<Tables>,
+}
+
+// SAFETY: `tables` is reached only through `read` and `write`. Once
+// `shared` is set, they hold `lock` (shared for `read`, exclusive for
+// `write`) for as long as the reference lives, as `RwLock<Tables>` would.
+// Before it, a single thread can reach the address space (`share` runs
+// before a second one exists, and asserts that no borrow lives across it),
+// and `borrows` keeps a borrow for writing apart from every other borrow.
+unsafe impl Sync for TableLock {}
+
+impl TableLock {
+    fn new(tables: Tables) -> TableLock {
+        TableLock {
+            lock: RwLock::new(()),
+            shared: AtomicBool::new(false),
+            borrows: AtomicIsize::new(0),
+            tables: UnsafeCell::new(tables),
+        }
+    }
+
+    fn read(&self) -> TablesRef<'_> {
+        if self.shared.load(Ordering::Acquire) {
+            let guard = self.lock.read().expect("page tables lock poisoned");
+            return TablesRef {
+                lock: self,
+                guard: Some(guard),
+            };
+        }
+        let n = self.borrows.load(Ordering::Relaxed);
+        assert!(n >= 0, "page tables read while borrowed for writing");
+        self.borrows.store(n + 1, Ordering::Relaxed);
+        TablesRef {
+            lock: self,
+            guard: None,
+        }
+    }
+
+    fn write(&self) -> TablesMut<'_> {
+        if self.shared.load(Ordering::Acquire) {
+            let guard = self.lock.write().expect("page tables lock poisoned");
+            return TablesMut {
+                lock: self,
+                guard: Some(guard),
+            };
+        }
+        let n = self.borrows.load(Ordering::Relaxed);
+        assert!(n == 0, "page tables written while borrowed");
+        self.borrows.store(-1, Ordering::Relaxed);
+        TablesMut {
+            lock: self,
+            guard: None,
+        }
+    }
+
+    /// From now on, `read` and `write` take the lock. Called by the only
+    /// thread, with no borrow alive.
+    fn share(&self) {
+        if !self.shared.load(Ordering::Relaxed) {
+            assert_eq!(
+                self.borrows.load(Ordering::Relaxed),
+                0,
+                "page tables shared while borrowed"
+            );
+            self.shared.store(true, Ordering::Release);
+        }
+    }
+
+    fn get_mut(&mut self) -> &mut Tables {
+        self.tables.get_mut()
+    }
+}
+
+/// The page tables borrowed for reading (`TableLock::read`).
+struct TablesRef<'a> {
+    lock: &'a TableLock,
+    guard: Option<RwLockReadGuard<'a, ()>>,
+}
+
+impl Deref for TablesRef<'_> {
+    type Target = Tables;
+    fn deref(&self) -> &Tables {
+        // SAFETY: a borrow for reading, under the lock or counted
+        // (`TableLock`): nothing writes the tables while it lives.
+        unsafe { &*self.lock.tables.get() }
+    }
+}
+
+impl Drop for TablesRef<'_> {
+    fn drop(&mut self) {
+        if self.guard.is_none() {
+            let n = self.lock.borrows.load(Ordering::Relaxed);
+            self.lock.borrows.store(n - 1, Ordering::Relaxed);
+        }
+    }
+}
+
+/// The page tables borrowed for writing (`TableLock::write`).
+struct TablesMut<'a> {
+    lock: &'a TableLock,
+    guard: Option<RwLockWriteGuard<'a, ()>>,
+}
+
+impl Deref for TablesMut<'_> {
+    type Target = Tables;
+    fn deref(&self) -> &Tables {
+        // SAFETY: the only borrow (`TableLock::write`).
+        unsafe { &*self.lock.tables.get() }
+    }
+}
+
+impl DerefMut for TablesMut<'_> {
+    fn deref_mut(&mut self) -> &mut Tables {
+        // SAFETY: the only borrow (`TableLock::write`), and `&mut self`
+        // keeps this reference the only one.
+        unsafe { &mut *self.lock.tables.get() }
+    }
+}
+
+impl Drop for TablesMut<'_> {
+    fn drop(&mut self) {
+        if self.guard.is_none() {
+            self.lock.borrows.store(0, Ordering::Relaxed);
+        }
+    }
+}
+
 /// Guest page numbers: 47-bit addresses, 4K pages.
 const PAGE_TABLE_ENTRIES: u64 = 1 << (47 - 12);
 /// Marks a mapped page in `PageTable`; the low bits are its `Prot`.
@@ -310,7 +455,8 @@ struct PageTable {
 }
 
 // SAFETY: the table is plain bytes; `Tables` is only reached through the
-// address space's RwLock, which orders every write before later reads.
+// address space's `TableLock`, whose lock orders every write before later
+// reads once several threads may read it (before that, one thread does).
 unsafe impl Send for PageTable {}
 // SAFETY: as above.
 unsafe impl Sync for PageTable {}
@@ -468,7 +614,7 @@ impl AddressSpace {
         );
         AddressSpace {
             host_page_size,
-            tables: RwLock::new(Tables::default()),
+            tables: TableLock::new(Tables::default()),
             code_generation: AtomicU64::new(0),
             concurrent: AtomicBool::new(false),
             writers_waiting: AtomicU32::new(0),
@@ -501,7 +647,7 @@ impl AddressSpace {
         } else {
             1 << (bits - 1)
         };
-        let tables = self.tables.get_mut().expect("page tables lock poisoned");
+        let tables = self.tables.get_mut();
         if self.host_page_size != GUEST_PAGE_SIZE || !tables.host_pages.is_empty() {
             return false;
         }
@@ -703,11 +849,13 @@ impl AddressSpace {
         // a thread waits to change the page tables (mprotect, mmap, a fork),
         // it waits for that first, briefly, so that a thread running guest
         // code in a loop cannot keep the tables from it.
-        for _ in 0..10_000 {
-            if self.writers_waiting.load(Ordering::Acquire) == 0 {
-                break;
+        if self.tables.shared.load(Ordering::Relaxed) {
+            for _ in 0..10_000 {
+                if self.writers_waiting.load(Ordering::Acquire) == 0 {
+                    break;
+                }
+                std::thread::yield_now();
             }
-            std::thread::yield_now();
         }
         MemView {
             space: self,
@@ -734,14 +882,26 @@ impl AddressSpace {
         self.code_generation.fetch_add(1, Ordering::Release);
     }
 
-    fn tables(&self) -> RwLockReadGuard<'_, Tables> {
-        // A poisoned lock means another thread panicked: armor is ending.
-        self.tables.read().expect("page tables lock poisoned")
+    /// Several threads may use the address space from now on: its page
+    /// tables are locked (`TableLock`). Call it before a second thread
+    /// exists, with no `MemView` alive; concurrent mode, which also comes
+    /// with shared mappings, comes with it.
+    pub fn share_between_threads(&self) {
+        self.tables.share();
+        self.enter_concurrent_mode();
     }
 
-    fn tables_mut(&self) -> RwLockWriteGuard<'_, Tables> {
+    fn tables(&self) -> TablesRef<'_> {
+        // A poisoned lock means another thread panicked: armor is ending.
+        self.tables.read()
+    }
+
+    fn tables_mut(&self) -> TablesMut<'_> {
+        if !self.tables.shared.load(Ordering::Relaxed) {
+            return self.tables.write();
+        }
         self.writers_waiting.fetch_add(1, Ordering::AcqRel);
-        let tables = self.tables.write().expect("page tables lock poisoned");
+        let tables = self.tables.write();
         self.writers_waiting.fetch_sub(1, Ordering::AcqRel);
         tables
     }
@@ -1985,11 +2145,11 @@ fn fetch_locked(tables: &Tables, addr: u64, buf: &mut [u8]) -> usize {
 /// `AddressSpace::view`: guest memory with the page tables locked, so
 /// that a block of accesses takes the lock once.
 /// The page tables held for writing (`AddressSpace::exclusive`).
-pub struct Exclusive<'a>(#[allow(dead_code)] RwLockWriteGuard<'a, Tables>);
+pub struct Exclusive<'a>(#[allow(dead_code)] TablesMut<'a>);
 
 pub struct MemView<'a> {
     space: &'a AddressSpace,
-    tables: RwLockReadGuard<'a, Tables>,
+    tables: TablesRef<'a>,
 }
 
 impl MemView<'_> {
@@ -2207,7 +2367,7 @@ impl GuestMemory for AddressSpace {
 
 impl Drop for AddressSpace {
     fn drop(&mut self) {
-        let tables = self.tables.get_mut().expect("page tables lock poisoned");
+        let tables = self.tables.get_mut();
         for &page in &tables.host_pages {
             // SAFETY: every page in `host_pages` was mapped by this address
             // space, and no guest memory is accessed after drop.
@@ -2729,6 +2889,66 @@ mod tests {
         );
         mem.unmap(addr, 2 * GUEST_PAGE_SIZE).unwrap();
         assert!(!mem.any_shared(addr, 2 * GUEST_PAGE_SIZE));
+    }
+
+    /// `TableLock`: with one thread the tables are borrowed without the
+    /// lock (reads inside a view, writes, a fork's exclusive borrow), then
+    /// locked once shared: a thread maps and unmaps while others read.
+    #[test]
+    fn page_tables_alone_then_locked() {
+        let mem = std::sync::Arc::new(AddressSpace::new());
+        let addr = 0x7000_0000;
+        mem.map_fixed(addr, 2 * GUEST_PAGE_SIZE, Prot::READ | Prot::WRITE)
+            .unwrap();
+        mem.write(addr, &[1, 2, 3]).unwrap();
+        {
+            let view = mem.view();
+            let mut buf = [0; 3];
+            view.read(addr, &mut buf).unwrap();
+            mem.read(addr, &mut buf).unwrap();
+            assert_eq!(buf, [1, 2, 3]);
+        }
+        drop(mem.exclusive());
+        mem.share_between_threads();
+        assert!(mem.is_concurrent());
+        let other = 0x7100_0000;
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                for _ in 0..200 {
+                    mem.map_fixed(other, GUEST_PAGE_SIZE, Prot::READ).unwrap();
+                    mem.unmap(other, GUEST_PAGE_SIZE).unwrap();
+                }
+            });
+            for _ in 0..2 {
+                s.spawn(|| {
+                    for _ in 0..2000 {
+                        let mut buf = [0; 3];
+                        mem.view().read(addr, &mut buf).unwrap();
+                        assert_eq!(buf, [1, 2, 3]);
+                    }
+                });
+            }
+        });
+    }
+
+    /// Sharing the tables while this thread still borrows them would leave
+    /// that borrow without the lock: it panics.
+    #[test]
+    #[should_panic(expected = "page tables shared while borrowed")]
+    fn page_tables_shared_while_viewed_panic() {
+        let mem = AddressSpace::new();
+        let _view = mem.view();
+        mem.share_between_threads();
+    }
+
+    /// With one thread, changing the tables while a view lives panics (with
+    /// the lock it would deadlock).
+    #[test]
+    #[should_panic(expected = "page tables written while borrowed")]
+    fn page_tables_written_while_viewed_panic() {
+        let mem = AddressSpace::new();
+        let _view = mem.view();
+        let _ = mem.map_fixed(0x7000_0000, GUEST_PAGE_SIZE, Prot::READ);
     }
 
     /// ADR-0023: concurrent mode starts a new code generation once, so
