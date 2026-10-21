@@ -73,8 +73,13 @@ pub const EXIT_SYSCALL: u64 = 3;
 pub const MAX_BLOCK_INSTRUCTIONS: usize = 64;
 
 /// Offset of the entry that chained blocks jump to: the block's start (the
-/// prologue is `enter_routine`, shared).
+/// prologue is `enter_routine`, shared), at its budget check.
 pub const CHAINED_ENTRY: usize = 0;
+
+/// Offset of the entry past the budget check (`subs` and `b.mi`), for a
+/// direct jump forward: a run of those cannot come back to where it was
+/// without a jump backward or an indirect one, which check the budget.
+pub const UNCHECKED_ENTRY: usize = 8;
 
 /// What a block reads and writes besides the `Cpu`.
 #[derive(Debug, Default)]
@@ -1121,6 +1126,7 @@ pub fn translate_block(
     let out_of_budget = t.a.new_label();
     t.a.subs_imm(Width::X, BUDGET, BUDGET, block.len() as u32)?;
     t.a.b_cond(Cond::Mi, out_of_budget);
+    debug_assert_eq!(t.a.len() * 4, UNCHECKED_ENTRY);
     t.body(block, &live, end)?;
     t.side_exits_out_of_line()?;
     // The loop's copy, if an exit asked for one: from the state of that
@@ -1148,10 +1154,15 @@ pub fn translate_block(
     t.exit(start, EXIT_CONTINUE)?;
     t.lazy = Lazy::Current;
     // Chainable exits: the `b` at `site` comes here until it is patched.
-    for (site, stub, rip) in core::mem::take(&mut t.chain_stubs) {
+    for (site, stub, rip, forward) in core::mem::take(&mut t.chain_stubs) {
         t.a.bind(stub);
         t.a.mov_imm64(EXIT_RIP, rip);
         t.a.adr(T1, site);
+        if forward {
+            // Bit 0 of the site: the engine chains it past the budget
+            // check (`UNCHECKED_ENTRY`).
+            t.a.logic_imm(Logic::Orr, Width::X, T1, T1, 1)?;
+        }
         t.a.str(MemSize::B64, T1, CONTEXT, field(offset_of!(Context, site)))?;
         t.a.ldr(MemSize::B64, T1, CONTEXT, field(offset_of!(Context, kind)))?;
         t.a.str(
@@ -1689,7 +1700,7 @@ struct Translator {
     slow_paths: Vec<(Label, u64, Lazy)>,
     /// Out of line: the taken side of a conditional jump inside the block
     /// (label, target, lazy flags at the jump).
-    side_exits: Vec<(Label, u64, Lazy, [u32; 2])>,
+    side_exits: Vec<(Label, u64, Lazy, [u32; 2], u64)>,
     /// The block's first instruction, when exits may become loops (not in
     /// lockstep): an exit back to it with the flags known goes to a copy
     /// of the block translated from that state (`loops`).
@@ -1703,7 +1714,10 @@ struct Translator {
     /// Lazy flags at the current point of the emitted code.
     lazy: Lazy,
     /// Chainable exits: the patchable `b`, its stub, the target.
-    chain_stubs: Vec<(Label, Label, u64)>,
+    chain_stubs: Vec<(Label, Label, u64, bool)>,
+    /// The guest instruction being translated (an exit to a higher
+    /// address is a jump forward: `UNCHECKED_ENTRY`).
+    at_rip: u64,
     options: Options,
     /// Out of line: `check` for accesses near the end of a page whose next
     /// page does not allow them (entry, back, bit, size, slow path).
@@ -1851,10 +1865,11 @@ impl Translator {
     /// The taken sides of the conditional jumps inside the block: each
     /// starts with the state of the point it is reached from.
     fn side_exits_out_of_line(&mut self) -> Emit {
-        for (label, rip, lazy, normal) in core::mem::take(&mut self.side_exits) {
+        for (label, rip, lazy, normal, from) in core::mem::take(&mut self.side_exits) {
             self.a.bind(label);
             self.lazy = lazy;
             self.normal = normal;
+            self.at_rip = from;
             self.exit_direct(rip)?;
         }
         Ok(())
@@ -1872,6 +1887,7 @@ impl Translator {
             loops: Vec::new(),
             last: false,
             chain_stubs: Vec::new(),
+            at_rip: 0,
             page_edges: Vec::new(),
             unaligned: Vec::new(),
             underflows: Vec::new(),
@@ -1905,6 +1921,7 @@ impl Translator {
     /// Emits one instruction; returns whether execution falls through to
     /// the next one.
     fn instruction(&mut self, g: &GuestInstruction) -> Emit<bool> {
+        self.at_rip = g.rip;
         let insn = &g.insn;
         let next = g.rip.wrapping_add(insn.len as u64);
         let size = insn.size;
@@ -2626,7 +2643,9 @@ impl Translator {
                 let to = target(next, rel, size);
                 match self.loop_head(to) {
                     Some(head) => self.a.retarget(taken, head),
-                    None => self.side_exits.push((taken, to, self.lazy, self.normal)),
+                    None => self
+                        .side_exits
+                        .push((taken, to, self.lazy, self.normal, self.at_rip)),
                 }
                 return Ok(true);
             }
@@ -4303,7 +4322,8 @@ impl Translator {
         let (site, stub) = (self.a.new_label(), self.a.new_label());
         self.a.bind(site);
         self.a.b(stub);
-        self.chain_stubs.push((site, stub, rip));
+        self.chain_stubs
+            .push((site, stub, rip, rip > self.at_rip && self.options.chain));
         Ok(())
     }
 

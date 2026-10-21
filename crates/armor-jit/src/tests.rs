@@ -1800,7 +1800,12 @@ fn indirect_jumps_keep_flags_and_budget() {
     let cpu = guest.cpu(&mut rng);
     guest.compare(&FLAGS_ACROSS_RET, &cpu, 1);
 
-    // A small budget must still bring control back to the engine.
+    // A small budget must still bring control back to the engine. Only
+    // blocks entered through their budget check count (a jump forward
+    // enters past it, `UNCHECKED_ENTRY`): each iteration counts at least
+    // the block at 0x05 (1 instruction, after the backward `jnz`) and the
+    // one at 0x0a (3, after the `ret`), so 1000 iterations with a budget
+    // of 50 return at least 80 times.
     let mut code = FLAGS_ACROSS_RET.to_vec();
     code.extend([0x0f, 0x05]);
     guest.mem.write_privileged(guest.code, &code).unwrap();
@@ -1811,7 +1816,7 @@ fn indirect_jumps_keep_flags_and_budget() {
         returns += 1;
         assert!(returns < 10_000, "the budget is not enforced");
     }
-    assert!(returns >= 100, "only {returns} returns to the engine");
+    assert!(returns >= 80, "only {returns} returns to the engine");
 }
 
 #[test]

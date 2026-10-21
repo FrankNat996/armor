@@ -30,8 +30,9 @@ use crate::cache;
 use crate::encoder::branch_word;
 use crate::translator::{
     BlockEnd, CHAINED_ENTRY, Context, EXIT_CHAIN, EXIT_INTERPRET, EXIT_SYSCALL, FLAG_TABLE,
-    GuestInstruction, HostFeatures, MAX_BLOCK_INSTRUCTIONS, Options, TARGET_ENTRIES, ends_block,
-    supported, supported_concurrent, target_slot, translate_block, uses_mxcsr_control,
+    GuestInstruction, HostFeatures, MAX_BLOCK_INSTRUCTIONS, Options, TARGET_ENTRIES,
+    UNCHECKED_ENTRY, ends_block, supported, supported_concurrent, target_slot, translate_block,
+    uses_mxcsr_control,
 };
 use crate::translator::{enter_routine, flags_routine, leave_routine};
 
@@ -391,8 +392,14 @@ impl Jit {
             // is gone with it.
             return;
         }
-        let site = site as *const u8;
-        let entry = code.wrapping_add(CHAINED_ENTRY);
+        // Bit 0: a jump forward, past the target's budget check.
+        let offset = if site & 1 != 0 {
+            UNCHECKED_ENTRY
+        } else {
+            CHAINED_ENTRY
+        };
+        let site = (site & !1) as *const u8;
+        let entry = code.wrapping_add(offset);
         let word = branch_word(site as usize, entry as usize)
             .expect("the code buffer is smaller than the reach of B");
         assert!(
