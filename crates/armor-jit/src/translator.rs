@@ -1875,10 +1875,10 @@ impl Translator {
                         ..
                     }
                 );
-            // An instruction that writes every flag, all of them dead
-            // (`skip_flags`): what is pending before it is never observed
-            // after it, so nothing need survive the write.
-            let dead = self.skip_flags && flags_written(insn) == STATUS_FLAGS;
+            // Flags pending that nothing observes after this instruction
+            // (`live`, after it): nothing need survive the write. (The
+            // instruction itself reads them before it writes a register.)
+            let dead = self.live & p.mask == 0;
             if !replaces
                 && !dead
                 && p.held_registers()
@@ -2079,6 +2079,17 @@ impl Translator {
                 }
                 if matches!(op, AluOp::Adc | AluOp::Sbb) {
                     self.flags(kind, a, b, STATUS_FLAGS)?;
+                } else if op == AluOp::Cmp
+                    && a == FA
+                    && whole_register(src, size).is_some()
+                    && !self.skip_flags
+                {
+                    // `cmp [mem], reg`: the register stays where it is,
+                    // held (`Held::Reg`) until it changes.
+                    self.flags_emitted |= STATUS_FLAGS;
+                    let mut pending = Pending::new(kind, size, STATUS_FLAGS);
+                    pending.b = Held::Reg(b);
+                    self.lazy = Lazy::Static(pending);
                 } else {
                     self.defer(kind, size, a, b, STATUS_FLAGS);
                 }
