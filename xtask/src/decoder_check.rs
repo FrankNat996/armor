@@ -366,15 +366,15 @@ mod tests {
             },
             Listed {
                 addr: 0x1003,
-                bytes: vec![0xc4, 0xe2, 0x79, 0x18, 0x07],
-                text: "vbroadcastss xmm0,DWORD PTR [rdi]".into(),
+                bytes: vec![0xc4, 0xe2, 0x71, 0xdc, 0xc2],
+                text: "vaesenc xmm0,xmm1,xmm2".into(),
             },
         ];
         let report = check(&listing, Mode::Long);
         assert_eq!(report.total, 3);
         assert_eq!(report.decoded, 2);
         assert!(report.mismatches.is_empty());
-        assert_eq!(report.unsupported["vbroadcastss"].0, 1);
+        assert_eq!(report.unsupported["vaesenc"].0, 1);
     }
 
     fn listed(addr: u64, bytes: &[u8], text: &str) -> Listed {
