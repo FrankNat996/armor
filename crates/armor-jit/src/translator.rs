@@ -280,11 +280,13 @@ const T3: HostReg = HostReg::new(14);
 const T4: HostReg = HostReg::new(15);
 
 /// Guest registers kept in host registers (ADR-0021 §4), by guest number:
-/// rax..rdi in x22..x29, r12..r15 in x3, x9, x16, x17. r8..r11 stay in
-/// `Cpu::regs`: in the python profile they were under 4% of the register
-/// uses (`tech/performance.md`). The prologue loads them, the epilogue
-/// stores them back; between chained blocks they stay where they are.
-/// x16 and x17 are free here: generated code goes through no veneer.
+/// rax..rdi in x22..x29, r8..r11 in x8, x21, x18, x30, r12..r15 in x3, x9,
+/// x16, x17. The prologue loads them, the epilogue stores them back;
+/// between chained blocks they stay where they are. x16 and x17 are free
+/// here: generated code goes through no veneer. In an ARM64EC image
+/// (Windows' x86-64 emulator, ADR-0047) x18 is the TEB, which Wine's
+/// signal handling reads while translated code runs: r10 is in x1 there,
+/// free with neither the page table nor `KIND` in it (`Options`).
 const GUEST: [Option<HostReg>; 16] = {
     const fn h(n: u8) -> Option<HostReg> {
         Some(HostReg::new(n))
@@ -300,7 +302,7 @@ const GUEST: [Option<HostReg>; 16] = {
         h(29),
         h(8),
         h(21),
-        h(18),
+        h(if cfg!(target_arch = "arm64ec") { 1 } else { 18 }),
         h(30),
         h(3),
         h(9),
@@ -2003,6 +2005,8 @@ impl Translator {
 
     /// A translator with nothing emitted, the flags current.
     fn bare(options: Options) -> Translator {
+        // r10 is in `KIND_REG` in an ARM64EC image (`GUEST`).
+        debug_assert!(!cfg!(target_arch = "arm64ec") || !options.kind_register);
         Translator {
             a: Assembler::new(),
             epilogue: None,

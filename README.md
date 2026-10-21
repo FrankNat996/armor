@@ -157,6 +157,7 @@ cargo xtask difftest                    # every test program under qemu and unde
 cargo xtask difftest --lockstep         # the JIT checked instruction by instruction against the interpreter
 cargo xtask app-check                   # real applications installed and checked under a virtual display
 cargo xtask wow64                       # armor's engine as Wine's WoW64 backend for 32-bit Windows code (ADR-0047)
+cargo xtask arm64ec                     # armor's engine as Wine's ARM64EC emulator for x86-64 Windows code (ADR-0047, first stage)
 cargo xtask bench --box64 --fex         # the speed table above
 ```
 

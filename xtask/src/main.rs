@@ -7,6 +7,7 @@
 //! See docs/testing.md.
 
 mod app_check;
+mod arm64ec;
 mod bench;
 mod busybox;
 mod coverage;
@@ -90,7 +91,11 @@ commands:
                                  Windows programs into target/wow64/ (needs
                                  the aarch64-pc-windows-msvc target, lld and
                                  llvm; ADR-0047)
-  gl-check                       draw with OpenGL under armor, with the guest's
+  arm64ec                        build armor's ARM64EC emulator for x86-64
+                                 Windows programs into target/arm64ec/ (needs
+                                 the arm64ec-pc-windows-msvc target, lld and
+                                 llvm; ADR-0047)
+  gl-check                      draw with OpenGL under armor, with the guest's
                                  Mesa and with the host's GPU (--host-gl), and
                                  compare the pixels (needs an X display and
                                  fetch-rootfs --games)
@@ -241,6 +246,7 @@ fn main() -> ExitCode {
         },
         Some("gl-check") => gl::check(&Paths::new()),
         Some("wow64") => wow64::run(&Paths::new().root),
+        Some("arm64ec") => arm64ec::run(&Paths::new().root),
         Some("distro-check") => {
             let mut rest = args[1..].to_vec();
             let report = results::take_flag(&mut rest);

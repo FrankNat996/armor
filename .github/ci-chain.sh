@@ -33,8 +33,9 @@ runuser -u builder -- bash -c '
   cd ~/armor
   curl --proto =https --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal >/dev/null 2>&1
   export PATH=$HOME/.cargo/bin:$PATH
-  # armor-wow64.dll (ADR-0047): the Windows target, linked with lld-link.
-  rustup target add aarch64-pc-windows-msvc >/dev/null 2>&1
+  # armor-wow64.dll (ADR-0047): the Windows target, linked with lld-link;
+  # armor-arm64ec.dll: the ARM64EC target, linked with the toolchain's rust-lld.
+  rustup target add aarch64-pc-windows-msvc arm64ec-pc-windows-msvc >/dev/null 2>&1
   failed=0
   for step in "cargo fmt --all --check" \
       "cargo clippy --workspace --all-targets -- -D warnings" \
@@ -49,7 +50,8 @@ runuser -u builder -- bash -c '
       "cargo xtask difftest --native --report" \
       "cargo xtask encoder-check" \
       "cargo xtask sandbox-check" \
-      "cargo xtask wow64"; do
+      "cargo xtask wow64" \
+      "cargo xtask arm64ec"; do
     echo "::group::$step"
     bash -c "$step"
     rc=$?

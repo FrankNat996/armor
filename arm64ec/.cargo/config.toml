@@ -1,0 +1,13 @@
+[build]
+target = "arm64ec-pc-windows-msvc"
+
+[target.arm64ec-pc-windows-msvc]
+# Rust's own LLD (`rust-lld`, in the toolchain): an ARM64EC image needs a
+# linker that makes the x64 entry points, the redirections and the
+# auxiliary import table (LLD 20 and later; Debian 13's lld-link 19 does
+# not, and loops on the inputs).
+linker = "rust-lld"
+# No C runtime: only ntdll (import library from build.rs). The runtime
+# pieces an ARM64EC image needs, which MSVC's C runtime would bring, are in
+# `src/chpe.rs`.
+rustflags = ["-C", "linker-flavor=lld-link", "-C", "link-arg=/NODEFAULTLIB", "-C", "link-arg=/NOENTRY", "-C", "target-feature=+crt-static"]
