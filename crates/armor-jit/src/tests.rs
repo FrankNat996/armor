@@ -1284,6 +1284,27 @@ fn host_memory_stays_out_of_reach(guest: &Guest, rng: &mut Rng) {
             guest.compare(&code, &cpu, 8);
         }
     }
+    // Reads at base + index * scale + a constant (`direct`: base + index
+    // tested, the constant in the load): inside the data, at every scale,
+    // and with base + index at armor's memory.
+    for scale in 0..4u8 {
+        let sib = scale << 6 | 0x0b; // [rbx + rcx * 2^scale]
+        for (code, index) in [
+            (vec![0x8b, 0x44, sib, 0x08], 5u64), // mov eax, [... + 8]
+            (vec![0x48, 0x0f, 0xbe, 0x44, sib, 0x21], 9), // movsx rax, byte [... + 0x21]
+            (vec![0x48, 0x8b, 0x44, sib, 0x10], 33), // mov rax, [... + 16]
+        ] {
+            let mut cpu = guest.cpu(rng);
+            cpu.regs[3] = guest.data;
+            cpu.regs[1] = index;
+            guest.compare(&code, &cpu, 9);
+            if host_address >= end {
+                cpu.regs[1] = (host_address - guest.data) >> scale;
+                cpu.regs[3] = host_address - (cpu.regs[1] << scale);
+                guest.compare(&code, &cpu, 9);
+            }
+        }
+    }
     assert_eq!(host[1], 0x1234_5678, "the guest wrote armor's memory");
 }
 
@@ -2136,6 +2157,107 @@ fn float_operations_on_special_values() {
                     guest.compare(code, &cpu, 1);
                 }
             }
+        }
+    }
+}
+
+/// Floating-point comparisons whose flags wait (`FlagKind::FloatCompare`):
+/// comiss, ucomiss, comisd and ucomisd on special values, read by each
+/// jcc, setcc and cmov right after (from the comparison's host NZCV),
+/// after a store whose check changes the host NZCV (redone from `FA` and
+/// `FB`), or only at the block's exit; and loops whose back edge leaves
+/// them pending. rflags and MXCSR compared with the interpreter.
+#[test]
+fn float_comparison_flags_wait() {
+    let guest = Guest::new();
+    let mut rng = Rng(59);
+    let singles: [u64; 8] = [
+        0,
+        0x8000_0000,
+        0x3f80_0000,
+        0xbf80_0000,
+        0x7f80_0000,
+        0x7fc0_0000,
+        0x7f80_0001,
+        0x0000_0001,
+    ];
+    let doubles: [u64; 8] = [
+        0,
+        0x8000_0000_0000_0000,
+        0x3ff0_0000_0000_0000,
+        0xbff0_0000_0000_0000,
+        0x7ff0_0000_0000_0000,
+        0x7ff8_0000_0000_0000,
+        0x7ff0_0000_0000_0001,
+        1,
+    ];
+    let with = |cpu: &mut Cpu, n: usize, bits: u64| {
+        cpu.xmm[n] = (cpu.xmm[n] & !u128::from(u64::MAX)) | u128::from(bits);
+    };
+    let mut round = 0;
+    for (double, values) in [(false, singles), (true, doubles)] {
+        let prefix: &[u8] = if double { &[0x66] } else { &[] };
+        for op in [0x2eu8, 0x2f] {
+            // ucomis / comis xmm0, xmm1
+            let compare = [prefix, &[0x0f, op, 0xc1]].concat();
+            for cc in 0..16u8 {
+                #[rustfmt::skip]
+                let readers: [&[u8]; 4] = [
+                    // jcc over lea rdx, [rdx+1] (which keeps the flags)
+                    &[0x70 | cc, 0x04, 0x48, 0x8d, 0x52, 0x01],
+                    // setcc dl
+                    &[0x0f, 0x90 | cc, 0xc2],
+                    // cmovcc rax, rcx
+                    &[0x48, 0x0f, 0x40 | cc, 0xc1],
+                    // mov [rbx+8], rcx; jcc over lea rdx, [rdx+1]
+                    &[0x48, 0x89, 0x4b, 0x08, 0x70 | cc, 0x04, 0x48, 0x8d, 0x52, 0x01],
+                ];
+                for reader in readers {
+                    let code = [compare.as_slice(), reader].concat();
+                    for _ in 0..4 {
+                        let mut cpu = guest.cpu(&mut rng);
+                        with(&mut cpu, 0, rng.pick(&values));
+                        with(&mut cpu, 1, rng.pick(&values));
+                        round += 1;
+                        guest.compare(&code, &cpu, round);
+                    }
+                }
+            }
+            // The flags read only at the exit.
+            for &a in &values {
+                for &b in &values {
+                    let mut cpu = guest.cpu(&mut rng);
+                    with(&mut cpu, 0, a);
+                    with(&mut cpu, 1, b);
+                    round += 1;
+                    guest.compare(&compare, &cpu, round);
+                }
+            }
+        }
+    }
+    #[rustfmt::skip]
+    let loops: [&[u8]; 2] = [
+        // loop: setb al; movzx eax, al; add ebx, eax; addsd xmm0, xmm2;
+        // dec ecx; jz out; comisd xmm0, xmm1; jmp loop; out:
+        &[0x0f, 0x92, 0xc0, 0x0f, 0xb6, 0xc0, 0x01, 0xc3, 0xf2, 0x0f, 0x58, 0xc2,
+          0xff, 0xc9, 0x74, 0x06, 0x66, 0x0f, 0x2f, 0xc1, 0xeb, 0xea],
+        // loop: cmovb ebx, edi; lea edi, [rdi+rdi*4+1]; addsd xmm0, xmm2;
+        // dec ecx; jz out; comisd xmm0, xmm1; jbe loop; out:
+        &[0x0f, 0x42, 0xdf, 0x8d, 0x7c, 0xbf, 0x01, 0xf2, 0x0f, 0x58, 0xc2, 0xff,
+          0xc9, 0x74, 0x06, 0x66, 0x0f, 0x2f, 0xc1, 0x76, 0xeb],
+    ];
+    for count in 0..32u64 {
+        for code in loops {
+            let mut cpu = guest.cpu(&mut rng);
+            cpu.regs[1] = 20 + count; // rcx
+            with(&mut cpu, 0, 0xc000_0000_0000_0000); // -2.0
+            with(
+                &mut cpu,
+                1,
+                rng.pick(&[0, 0x3ff0_0000_0000_0000, 0x7ff8_0000_0000_0000]),
+            );
+            with(&mut cpu, 2, 0x3fd0_0000_0000_0000); // 0.25
+            guest.compare(code, &cpu, count);
         }
     }
 }

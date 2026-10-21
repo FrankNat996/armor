@@ -615,6 +615,10 @@ fn lazy_flags(insn: &Instruction) -> bool {
         | Op::Imul { .. }
         | Op::MulWide { .. } => true,
         Op::Shift { op, dst, .. } => lazy_shift(op, dst, insn.size),
+        Op::Sse {
+            op: SseOp::FloatCompare { .. },
+            ..
+        } => true,
         _ => false,
     }
 }
@@ -732,12 +736,14 @@ fn shift_constant(count: ShiftCount, size: Size) -> Option<u32> {
 }
 
 /// Whether `mov r1, r2` (registers mapped whole) can leave its copy to
-/// `next`, an in-place shift by a constant or ALU operation on r1 whose
-/// flags nothing observes (`live`, after it) and which reads r1 only as
-/// its first operand: `next` then reads r2 there (`Translator::first`),
-/// `lsr x1, x2, #n` instead of `mov x1, x2; lsr x1, x1, #n`. A 32-bit copy
-/// only into a 32-bit operation (the zero-extension is the operation's).
-fn copy_fuses(mov: &Instruction, next: &Instruction, live: u64) -> bool {
+/// `next`, an in-place shift by a constant or ALU operation on r1 which
+/// reads r1 only as its first operand: `next` then reads r2 there
+/// (`Translator::first`), `lsr x1, x2, #n` instead of `mov x1, x2; lsr
+/// x1, x1, #n`. Its deferred flags take that operand from r2 too (a
+/// shift's `FA`), or need only the result and the second (`Held`). A
+/// 32-bit copy only into a 32-bit operation (the zero-extension is the
+/// operation's).
+fn copy_fuses(mov: &Instruction, next: &Instruction) -> bool {
     let Op::Mov {
         dst: dst @ Operand::Reg(r1),
         src: src @ Operand::Reg(_),
@@ -749,10 +755,8 @@ fn copy_fuses(mov: &Instruction, next: &Instruction, live: u64) -> bool {
     else {
         return false;
     };
-    let may_write = flags_may_write(next);
-    let dead = may_write != 0 && may_write & live == 0 && flags_read(next) == 0;
     if h1 == h2
-        || !dead
+        || flags_read(next) != 0
         || whole_register(dst, next.size).is_none()
         || (mov.size == Size::B32 && next.size != Size::B32)
     {
@@ -913,6 +917,19 @@ fn live_flags(block: &[GuestInstruction]) -> Vec<u64> {
 /// addition).
 fn host_condition(p: Pending, cond: X86Cond) -> Option<Cond> {
     use X86Cond as C;
+    if let FlagKind::FloatCompare { .. } = p.kind {
+        // FCMP's NZCV: unordered 0011, less 1000, equal 0110, greater
+        // 0010; x86's ZF PF CF: 111, 001, 100, 000.
+        return match cond {
+            C::A => Some(Cond::Gt),
+            C::Ae => Some(Cond::Ge),
+            C::B => Some(Cond::Lt),
+            C::Be => Some(Cond::Le),
+            C::P => Some(Cond::Vs),
+            C::Np => Some(Cond::Vc),
+            _ => None,
+        };
+    }
     // Only operations whose flags are the host NZCV of redoing them.
     if !matches!(p.kind, FlagKind::Add | FlagKind::Sub | FlagKind::Logic) {
         return None;
@@ -1218,8 +1235,8 @@ pub fn translate_block(
         t.a.b(slow);
     }
     // UFC raised by the host, made x86's UE.
-    for (entry, back, slow) in core::mem::take(&mut t.underflows) {
-        t.underflow_fixup(entry, back, slow)?;
+    for (entry, back, slow, double) in core::mem::take(&mut t.underflows) {
+        t.underflow_fixup(entry, back, slow, double)?;
     }
     // Slow paths: the instruction at `rip` goes to the interpreter, which
     // finds the state exactly as before it.
@@ -1531,6 +1548,10 @@ enum FlagKind {
     /// A multiplication of `FA` by `FB` (both extended to 64 bits): CF and
     /// OF say that the product does not fit `size`. Inside the block only.
     Mul { signed: bool },
+    /// comisd, comiss, ucomisd, ucomiss of the bits in `FA` and `FB`: ZF,
+    /// PF and CF from the comparison, OF, SF and AF cleared. Inside the
+    /// block only.
+    FloatCompare { double: bool },
 }
 
 type Emit<T = ()> = Result<T, EncodeError>;
@@ -1612,7 +1633,9 @@ impl Pending {
             FlagKind::Add => 1,
             FlagKind::Sub => 2,
             FlagKind::Logic => 3,
-            FlagKind::Shift(..) | FlagKind::Mul { .. } => return None,
+            FlagKind::Shift(..) | FlagKind::Mul { .. } | FlagKind::FloatCompare { .. } => {
+                return None;
+            }
         };
         let size = match self.size {
             Size::B8 => 0,
@@ -1687,9 +1710,9 @@ struct Translator {
     page_edges: Vec<(Label, Label, u32, u32, Label)>,
     /// Out of line: ordered accesses to unaligned addresses (entry, back).
     unaligned: Vec<(Label, Label, Unaligned)>,
-    /// Out of line: UFC raised by the host, made x86's UE (entry, back;
-    /// `underflow`).
-    underflows: Vec<(Label, Label, Label)>,
+    /// Out of line: UFC raised by the host, made x86's UE (entry, back,
+    /// slow path, double; `underflow`).
+    underflows: Vec<(Label, Label, Label, bool)>,
     /// xmm registers whose low lane is known not to be denormal, as a
     /// double (`[0]`) and as a single (`[1]`), by host vector register
     /// (bits 16–31): `slow_if_denormal` needs no test for them
@@ -1791,7 +1814,7 @@ impl Translator {
             }
             self.fuse_copy = block
                 .get(i + 1)
-                .is_some_and(|n| copy_fuses(&g.insn, &n.insn, live[i + 1]));
+                .is_some_and(|n| copy_fuses(&g.insn, &n.insn));
             fell_through = self.instruction(g)?;
             if !core::mem::take(&mut self.fuse_copy) {
                 debug_assert!(self.first.is_none(), "a copy left to {:?}", g.insn);
@@ -2763,11 +2786,11 @@ impl Translator {
         if let (Some(n @ 1..), false, Some(h)) =
             (constant, rotate, whole_register(Operand::Reg(reg), size))
         {
+            let from = self.first.take().unwrap_or(h);
             if !self.skip_flags {
                 // The value zero-extended from `size`, before it changes.
-                self.a.mov(w, FA, h);
+                self.a.mov(w, FA, from);
             }
-            let from = self.first.take().unwrap_or(h);
             self.a.shift_imm(shift, w, h, from, n)?;
             let kind = FlagKind::Shift(op, Some(n as u8));
             if !self.skip_flags {
@@ -3605,14 +3628,19 @@ impl Translator {
                     // Dead flags: the comparison only, for MXCSR's IE.
                     return Ok(());
                 }
-                self.a.cset(Width::X, T1, Cond::Lt);
-                self.a.cset(Width::X, T2, Cond::Vs);
-                self.a.cset(Width::X, T3, Cond::Eq);
-                self.a
-                    .logic(Logic::Orr, false, Width::X, T3, T3, T2, Shift::Lsl, 0)?;
-                self.or_into_t1(T2, FLAG_PF.trailing_zeros())?;
-                self.or_into_t1(T3, FLAG_ZF.trailing_zeros())?;
-                self.merge_flags(STATUS_FLAGS)
+                // Deferred as the operands' bits (`FlagKind::FloatCompare`);
+                // the host NZCV is the comparison's for a condition reader
+                // right after.
+                self.a.fmov_to_gpr(double, FA, d);
+                self.a.fmov_to_gpr(double, FB, b);
+                self.flags_emitted |= STATUS_FLAGS;
+                self.lazy = Lazy::Static(Pending::new(
+                    FlagKind::FloatCompare { double },
+                    Size::B64,
+                    STATUS_FLAGS,
+                ));
+                self.nzcv_valid = true;
+                Ok(())
             }
             SseOp::FloatCmpMask { double, predicate } => {
                 // All ones in the low lane when the predicate holds; lt,
@@ -4036,9 +4064,11 @@ impl Translator {
     }
 
     /// After a host operation that may underflow (a multiplication, a
-    /// division, `cvtsd2ss`) with result `v`: out of line if `|v|` is at
-    /// most the smallest normal number, the only results for which the
-    /// host can raise UFC. There (`underflow_fixup`) a denormal result
+    /// division, `cvtsd2ss`) with result `v`: out of line if its exponent
+    /// is 0 or 1 (one test of the exponent's top bits), which includes
+    /// every `|v|` at most the smallest normal number, the only results
+    /// for which the host can raise UFC. There (`underflow_fixup`) one
+    /// above it comes back at once; a denormal result
     /// goes to the interpreter (so that a result that comes back is never
     /// denormal, `update_normal`); for 0 or ±the smallest normal number
     /// UFC, if raised, is cleared, and becomes UE in MXCSR unless `v` is
@@ -4048,32 +4078,38 @@ impl Translator {
     /// just done. Uses `T1`, `T2` and the host's flags.
     fn underflow(&mut self, double: bool, v: VReg, rip: u64, slow: &mut Option<Label>) -> Emit {
         let slow = self.slow_path(rip, slow);
+        let (w, top_of_exponent) = if double {
+            (Width::X, 0x7fe0_0000_0000_0000)
+        } else {
+            (Width::W, 0x7f00_0000)
+        };
+        let entry = self.a.new_label();
+        let back = self.a.new_label();
+        self.a.fmov_to_gpr(double, T1, v);
+        self.a.logic_imm(Logic::Ands, w, ZR, T1, top_of_exponent)?;
+        self.a.b_cond(Cond::Eq, entry);
+        self.a.bind(back);
+        self.underflows.push((entry, back, slow, double));
+        Ok(())
+    }
+
+    /// The out-of-line part of `underflow`; `T1` holds `v`'s bits.
+    fn underflow_fixup(&mut self, entry: Label, back: Label, slow: Label, double: bool) -> Emit {
+        const UFC: u32 = 3;
+        const UE: u64 = 1 << 4;
         let (w, smallest) = if double {
             (Width::X, 1u64 << 52)
         } else {
             (Width::W, 1 << 23)
         };
-        let entry = self.a.new_label();
-        let back = self.a.new_label();
-        self.a.fmov_to_gpr(double, T1, v);
-        // The sign shifted out.
+        let not_denormal = self.a.new_label();
+        self.a.bind(entry);
+        // `|v|` (the sign shifted out) compared with the smallest normal
+        // number: above it, nothing to do.
         self.a.shift_imm(Shift::Lsl, w, T1, T1, 1)?;
         self.a.mov_imm64(T2, smallest << 1);
         self.a.subs(w, ZR, T1, T2, Shift::Lsl, 0)?;
-        self.a.b_cond(Cond::Ls, entry);
-        self.a.bind(back);
-        self.underflows.push((entry, back, slow));
-        Ok(())
-    }
-
-    /// The out-of-line part of `underflow`; the host's flags still hold
-    /// the comparison of `|v|` with the smallest normal number, and `T1`
-    /// is `|v|` shifted left by one.
-    fn underflow_fixup(&mut self, entry: Label, back: Label, slow: Label) -> Emit {
-        const UFC: u32 = 3;
-        const UE: u64 = 1 << 4;
-        let not_denormal = self.a.new_label();
-        self.a.bind(entry);
+        self.a.b_cond(Cond::Hi, back);
         // ±the smallest normal number, or 0: comes back. (CBZ keeps NZCV.)
         self.a.b_cond(Cond::Eq, not_denormal);
         self.a.cbz(false, Width::X, T1, not_denormal);
@@ -4454,7 +4490,7 @@ impl Translator {
         if self.options.host_reads.is_none() || self.options.concurrent || mem.addr32 {
             return None;
         }
-        let (Base::Gpr(n), None, Segment::Default) = (mem.base, mem.index, mem.segment) else {
+        let (Base::Gpr(n), Segment::Default) = (mem.base, mem.segment) else {
             return None;
         };
         let base = register_host(n)?;
@@ -4462,6 +4498,27 @@ impl Translator {
         let n = u64::from(bytes);
         if mem.disp < 0 || !disp.is_multiple_of(n) || disp / n >= 4096 {
             return None;
+        }
+        if let Some(index) = mem.index {
+            // A read at base + index + a constant within the guard's
+            // distance: base + index tested, the constant in the load.
+            let (bits, index) = (self.options.host_reads?, register_host(index)?);
+            if check != Check::Read || disp == 0 || disp + n > REGION_GUARD {
+                return None;
+            }
+            self.flush_misaligned();
+            let slow = self.slow_path(rip, slow);
+            let shift = u32::from(mem.scale).trailing_zeros();
+            self.a
+                .add(Width::X, ADDR, base, index, Shift::Lsl, shift)
+                .ok()?;
+            self.a
+                .logic_imm(Logic::Ands, Width::X, ZR, ADDR, !((1u64 << bits) - 1))
+                .ok()?;
+            self.a.b_cond(Cond::Ne, slow);
+            self.access_slow = Some(slow);
+            self.mark_access();
+            return Some((ADDR, disp as u32));
         }
         let align = if bytes > 1 && check == Check::Write {
             bytes.next_power_of_two()
@@ -5226,9 +5283,8 @@ impl Translator {
         };
         let defer = !self.skip_flags;
         // The first operand, when a copy before was left to this
-        // operation (`copy_fuses`: then the flags are not wanted).
+        // operation (`copy_fuses`); the deferred flags hold the result.
         let from = self.first.take().unwrap_or(h);
-        debug_assert!(from == h || !defer);
         // A memory operand of an addition, subtraction or comparison goes
         // straight to `FB`, where the deferred flags keep it: the load is
         // the instruction's only access, and a load that faults leaves its
@@ -5922,6 +5978,17 @@ impl Translator {
             }
             FlagKind::Shift(op, count) => return self.shift_flags(op, p.size, count),
             FlagKind::Mul { signed } => return self.mul_flags(signed, p.size),
+            FlagKind::FloatCompare { double } => {
+                self.float_compare_nzcv(double);
+                self.a.cset(Width::X, T1, Cond::Lt);
+                self.a.cset(Width::X, T2, Cond::Vs);
+                self.a.cset(Width::X, T3, Cond::Eq);
+                self.a
+                    .logic(Logic::Orr, false, Width::X, T3, T3, T2, Shift::Lsl, 0)?;
+                self.or_into_t1(T2, FLAG_PF.trailing_zeros())?;
+                self.or_into_t1(T3, FLAG_ZF.trailing_zeros())?;
+                return self.merge_flags(STATUS_FLAGS);
+            }
             kind => self.arith(kind == FlagKind::Sub, p.size, FA, FB)?,
         }
         self.flags(p.kind, FA, FB, p.mask)
@@ -6062,6 +6129,10 @@ impl Translator {
     /// The host NZCV of the pending operation `p`, redone from its operands
     /// wherever they are. Uses `R`, `T3`, `T4`.
     fn redo(&mut self, p: Pending) -> Emit {
+        if let FlagKind::FloatCompare { double } = p.kind {
+            self.float_compare_nzcv(double);
+            return Ok(());
+        }
         if !p.plain() {
             let w = width(p.size);
             return match p.kind {
@@ -6098,6 +6169,19 @@ impl Translator {
             }
             kind => self.arith(kind == FlagKind::Sub, p.size, FA, FB),
         }
+    }
+
+    /// The host NZCV of a deferred floating-point comparison
+    /// (`FlagKind::FloatCompare`), redone from the bits in `FA` and `FB`.
+    /// FCMP raises IOC only where the comparison did (for a signaling
+    /// NaN; FCMPE's quiet NaNs are not redone with it), and IE is sticky:
+    /// MXCSR can be written only by an instruction that leaves the block,
+    /// and an exit computes these flags first, so no comparison is redone
+    /// after it. Uses `V1`, `V2`.
+    fn float_compare_nzcv(&mut self, double: bool) {
+        self.a.fmov_from_gpr(double, V1, FA);
+        self.a.fmov_from_gpr(double, V2, FB);
+        self.a.fcmp(double, V1, V2);
     }
 
     fn branch_if(&mut self, cond: X86Cond, target: Label) -> Emit {
