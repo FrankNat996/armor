@@ -631,3 +631,5 @@ Startups of real programs of the test root (`target/guest/rootfs`), best of 5, w
 
 **SSE with required alignment** (`simd`, 2026-10-21; `jit.md`, "Required alignment in the region's test"): one test instead of two for each aligned 16-byte access, and the alignment proven for the accesses near it: 128 → 84 ms (box64 92).
 
+**mmap without an address** (`memory`, 2026-10-21): `map_anywhere`'s top-down search moved one host page at a time through every mapping above (`perf record --call-graph=dwarf`: 11% of the workload in a `BTreeSet` range query from `AddressSpace::place`); jumping below the lowest page in the way instead finds the same range: 262 → 211 ms (box64 247).
+

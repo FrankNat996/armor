@@ -786,13 +786,11 @@ impl AddressSpace {
         let mut end = ceiling - ceiling % host;
         while end >= PLACEMENT_FLOOR.saturating_add(len) {
             let start = end - len;
-            // The highest host page of this address space in the way: the
-            // next try ends below it.
-            if let Some(&owned) = tables
-                .host_pages
-                .range(start / host..end / host)
-                .next_back()
-            {
+            // The lowest host page of this address space in the way: every
+            // window ending above it holds it (it is at most `len` below
+            // `end`), so the next try ends below it. (The highest would
+            // move down one page at a time through a mapping.)
+            if let Some(&owned) = tables.host_pages.range(start / host..end / host).next() {
                 end = owned * host;
                 continue;
             }
