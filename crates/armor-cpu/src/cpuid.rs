@@ -44,13 +44,19 @@ impl Features {
     pub const AVX: Features = Features(1 << 5);
     /// AVX2 (leaf 7 ebx bit 5), with AVX only: the 256-bit integer forms.
     pub const AVX2: Features = Features(1 << 6);
+    /// FMA (leaf 1 ecx bit 12), with AVX only: the fused multiply-adds.
+    pub const FMA: Features = Features(1 << 7);
+    /// F16C (leaf 1 ecx bit 29), with AVX only: vcvtph2ps, vcvtps2ph.
+    pub const F16C: Features = Features(1 << 8);
 
     /// The names `parse` accepts, qemu's (`qemu-x86_64 -cpu help`): only
     /// features armor implements.
-    const NAMES: [(&'static str, Features); 7] = [
+    const NAMES: [(&'static str, Features); 9] = [
         ("xsave", Features::XSAVE),
         ("avx", Features::AVX),
         ("avx2", Features::AVX2),
+        ("fma", Features::FMA),
+        ("f16c", Features::F16C),
         ("bmi1", Features::BMI1),
         ("bmi2", Features::BMI2),
         ("abm", Features::LZCNT),
@@ -90,8 +96,14 @@ impl Features {
         if features.contains(Features::AVX) && !features.contains(Features::XSAVE) {
             return Err("CPU feature `avx` needs `xsave`".into());
         }
-        if features.contains(Features::AVX2) && !features.contains(Features::AVX) {
-            return Err("CPU feature `avx2` needs `avx`".into());
+        for (feature, name) in [
+            (Features::AVX2, "avx2"),
+            (Features::FMA, "fma"),
+            (Features::F16C, "f16c"),
+        ] {
+            if features.contains(feature) && !features.contains(Features::AVX) {
+                return Err(format!("CPU feature `{name}` needs `avx`"));
+            }
         }
         Ok(features)
     }
@@ -203,10 +215,12 @@ pub fn query_with(features: Features, leaf: u32, subleaf: u32) -> [u32; 4] {
         // it, as Linux does).
         1 => {
             let ecx = 0x8098_2201
+                | bit(Features::FMA, 12)
                 | bit(Features::MOVBE, 22)
                 | bit(Features::XSAVE, 26)
                 | bit(Features::XSAVE, 27)
-                | bit(Features::AVX, 28);
+                | bit(Features::AVX, 28)
+                | bit(Features::F16C, 29);
             [0x0006_0fb1, 0x0000_0800, ecx, 0x078b_fbfd]
         }
         // MONITOR/MWAIT leaf: only the extension bits.
@@ -377,6 +391,13 @@ mod tests {
         let f = Features::parse("+xsave,+avx,+avx2").unwrap();
         assert_eq!(query_with(f, 7, 0)[1], 0x20);
         assert!(Features::parse("+xsave,+avx2").is_err());
+        // ✅ `+fma`: leaf 1 ecx bit 12.
+        let f = Features::parse("+xsave,+avx,+fma").unwrap();
+        assert_eq!(query_with(f, 1, 0)[2], 0x9c98_3201);
+        assert!(Features::parse("+xsave,+fma").is_err());
+        // ✅ `+f16c`: leaf 1 ecx bit 29.
+        let f = Features::parse("+xsave,+avx,+f16c").unwrap();
+        assert_eq!(query_with(f, 1, 0)[2], 0xbc98_2201);
     }
 
     #[test]

@@ -44,6 +44,8 @@ Features on the way to x86-64-v3 that armor implements but does not declare by d
 | `xsave` | leaf 1 ecx \|= XSAVE (bit 26), OSXSAVE (27): 0x8c982201; leaf 0xd subleaf 0 (3, 0x240, 0x240, 0), subleaf 1 (0, 0x240, 0, 0); XCR0 = 3 | ✅ `qemu64,...,+xsave` (`basic/cpuid`, `xsave/xsave`) |
 | `avx` (with `xsave`) | leaf 1 ecx bit 28: 0x9c982201; leaf 0xd subleaf 0 (7, 0x340, 0x340, 0), subleaf 1 (0, 0x340, 0, 0), subleaf 2 (0x100, 0x240, 0, 0); XCR0 = 7 | ✅ `qemu64,...,+xsave,+avx` (CPUID program, `basic/cpuid`) |
 | `avx2` (with `avx`) | leaf 7 ebx bit 5 (0x20) | ✅ `qemu64,...,+avx2` (CPUID program) |
+| `fma` (with `avx`) | leaf 1 ecx bit 12 | ✅ `qemu64,...,+fma` (CPUID program) |
+| `f16c` (with `avx`) | leaf 1 ecx bit 29 | ✅ `qemu64,...,+f16c` (CPUID program) |
 | `bmi1` | leaf 7 ebx bit 3; `tzcnt` counts zeros | ✅ `qemu64,...,+bmi1` (CPUID program, `bmi/bmi`) |
 | `bmi2` | leaf 7 ebx bit 8 | ✅ `qemu64,...,+bmi2` |
 | `abm` | leaf 0x8000_0001 ecx bit 5 (LZCNT); `lzcnt` counts zeros | ✅ `qemu64,...,+abm` |

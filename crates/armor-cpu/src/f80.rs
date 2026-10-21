@@ -267,6 +267,11 @@ const SINGLE: Format = Format {
     emin: -126,
     emax: 127,
 };
+const HALF: Format = Format {
+    precision: 11,
+    emin: -14,
+    emax: 15,
+};
 
 /// A rounded finite result: `mant` has `precision` bits, its top bit being
 /// the integer bit (clear for denormals and zero), and `exp` is the
@@ -618,6 +623,70 @@ pub fn mul(a: F80, b: F80, mode: impl Into<Mode>) -> Out<F80> {
     with_flags(pack(sign, ea + eb + 1, product, mode), denormal)
 }
 
+/// `a * b + c` rounded once (fused multiply-add, FMA3). The operands are
+/// not NaN: the SSE layer chooses the NaN result first (`float::fma`).
+pub fn fma(a: F80, b: F80, c: F80, mode: impl Into<Mode>) -> Out<F80> {
+    let mode = mode.into();
+    let (ca, cb, cc) = (a.class(), b.class(), c.class());
+    let sign = a.sign != b.sign;
+    let infinite = ca == Class::Infinity || cb == Class::Infinity;
+    let zero = ca == Class::Zero || cb == Class::Zero;
+    if infinite && zero {
+        return invalid();
+    }
+    if infinite {
+        if cc == Class::Infinity && c.sign != sign {
+            return invalid();
+        }
+        return out(F80::infinity(sign), 0);
+    }
+    if cc == Class::Infinity {
+        return out(c, 0);
+    }
+    // An exact zero sum: the common sign, or with opposite signs +0 (-0
+    // when rounding down).
+    let zero_sum = |signs_differ: bool, negative: bool| {
+        let negative = if signs_differ {
+            mode.rc == Rounding::Down
+        } else {
+            negative
+        };
+        out(F80::zero(negative), 0)
+    };
+    if zero {
+        if cc == Class::Zero {
+            return zero_sum(sign != c.sign, sign);
+        }
+        return normalize_register(c, mode);
+    }
+    let (ea, ma) = a.unpack();
+    let (eb, mb) = b.unpack();
+    // The exact product, two bits of headroom: bit 127 has the exponent
+    // ea + eb + 3.
+    let product = shift_right_jam(u128::from(ma) * u128::from(mb), 2);
+    let ep = ea + eb + 3;
+    if cc == Class::Zero {
+        return pack(sign, ep, product, mode);
+    }
+    // The addend at bits 125..62: bit 127 has the exponent ec + 2.
+    let (ec, mc) = c.unpack();
+    let (addend, eq) = (u128::from(mc) << 62, ec + 2);
+    let e = ep.max(eq);
+    let x = shift_right_jam(product, (e - ep) as u32);
+    let y = shift_right_jam(addend, (e - eq) as u32);
+    let (sum, sum_sign) = if sign == c.sign {
+        (x + y, sign)
+    } else if x >= y {
+        (x - y, sign)
+    } else {
+        (y - x, c.sign)
+    };
+    if sum == 0 {
+        return zero_sum(true, false);
+    }
+    pack(sum_sign, e, sum, mode)
+}
+
 pub fn div(a: F80, b: F80, mode: impl Into<Mode>) -> Out<F80> {
     let mode = mode.into();
     let denormal = match prepare(a, b) {
@@ -854,11 +923,29 @@ pub fn from_float(bits: u64, double: bool) -> Out<F80> {
 
 /// fst m64 (`double`) or m32: rounded to the destination format.
 pub fn to_float(a: F80, double: bool, rc: Rounding) -> Out<u64> {
-    let (format, frac_bits, exp_bits) = if double {
-        (DOUBLE, 52, 11)
+    if double {
+        to_format(a, DOUBLE, 52, 11, rc, false)
     } else {
-        (SINGLE, 23, 8)
-    };
+        to_format(a, SINGLE, 23, 8, rc, false)
+    }
+}
+
+/// `a` as a half-precision value (vcvtps2ph, F16C), tininess detected
+/// after rounding as for the SSE results.
+pub fn to_half(a: F80, rc: Rounding) -> Out<u64> {
+    to_format(a, HALF, 10, 5, rc, true)
+}
+
+/// `a` in an IEEE binary format of `frac_bits` and `exp_bits`; tininess
+/// detected after rounding with `after`.
+fn to_format(
+    a: F80,
+    format: Format,
+    frac_bits: u32,
+    exp_bits: u32,
+    rc: Rounding,
+    after: bool,
+) -> Out<u64> {
     let sign_bit = u64::from(a.sign) << (frac_bits + exp_bits);
     let exp_all_ones = ((1u64 << exp_bits) - 1) << frac_bits;
     let quiet = 1u64 << (frac_bits - 1);
@@ -884,7 +971,7 @@ pub fn to_float(a: F80, double: bool, rc: Rounding) -> Out<u64> {
     }
     let (e, m) = a.unpack();
     // x87 stores detect tininess before rounding, like the registers.
-    let rounded = round(a.sign, e, u128::from(m) << 64, format, rc, false);
+    let rounded = round(a.sign, e, u128::from(m) << 64, format, rc, after);
     let bias = (1i32 << (exp_bits - 1)) - 1;
     let value = match rounded.value {
         Rounded::Infinity => sign_bit | exp_all_ones,

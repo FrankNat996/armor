@@ -148,7 +148,7 @@ impl Cpu {
     }
 
     /// The MXCSR control bits the floating-point operations follow.
-    fn float_env(&self) -> float::Env {
+    pub(crate) fn float_env(&self) -> float::Env {
         float::Env::from_mxcsr(self.mxcsr)
     }
 
@@ -170,7 +170,7 @@ impl Cpu {
     /// are the only ones set; otherwise all of them are, OE, UE and PE
     /// included. Old flags that are set and unmasked do not raise #XM:
     /// only the instruction's own do.
-    fn raise(&mut self, flags: u16) -> Exec<()> {
+    pub(crate) fn raise(&mut self, flags: u16) -> Exec<()> {
         const BEFORE: u32 = 0x07;
         let flags = u32::from(flags);
         let unmasked = !(self.mxcsr >> 7) & 0x3f;

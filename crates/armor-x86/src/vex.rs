@@ -6,7 +6,9 @@
 
 use crate::decoder::{Decoder, Rm, Vex};
 use crate::sse::{xmm, xmm_rm};
-use crate::{AvxOp, BmiOp, DecodeError, IntOp, Op, Operand, Reg, ShiftKind, Size, SseOp};
+use crate::{
+    AvxOp, BmiOp, DecodeError, FmaKind, FmaOrder, IntOp, Op, Operand, Reg, ShiftKind, Size, SseOp,
+};
 
 pub(crate) fn decode(d: &mut Decoder) -> Result<(Op, Size), DecodeError> {
     let vex = d.vex();
@@ -46,10 +48,16 @@ pub(crate) fn decode(d: &mut Decoder) -> Result<(Op, Size), DecodeError> {
             d.u8()?;
             avx(d, vex, opcode)
         }
+        // FMA3: map 2 (VEX.66) 96–9F, A6–AF, B6–BF.
+        (2, 0x96..=0x9f | 0xa6..=0xaf | 0xb6..=0xbf) if vex.prefix == 0x66 => {
+            d.u8()?;
+            fma(d, vex, opcode)
+        }
         // One of them with a VEX.W it does not have.
         (
             2,
             0x0c..=0x0f
+            | 0x13
             | 0x16
             | 0x18..=0x1a
             | 0x2c..=0x2f
@@ -59,7 +67,7 @@ pub(crate) fn decode(d: &mut Decoder) -> Result<(Op, Size), DecodeError> {
             | 0x78
             | 0x79,
         )
-        | (3, 0x00..=0x02 | 0x04..=0x06 | 0x18 | 0x19 | 0x38 | 0x39 | 0x46 | 0x4a..=0x4c)
+        | (3, 0x00..=0x02 | 0x04..=0x06 | 0x18 | 0x19 | 0x1d | 0x38 | 0x39 | 0x46 | 0x4a..=0x4c)
             if vex.prefix == 0x66 =>
         {
             Err(DecodeError::Invalid)
@@ -125,6 +133,8 @@ fn new_instruction(vex: Vex, opcode: u8) -> Option<New> {
             false,
         ),
         (2, 0x16 | 0x36) if !w => new(Permd, Source, Only256, true),
+        (2, 0x13) if !w => new(Ph2Ps, Unused, Both, false),
+        (3, 0x1d) if !w => new(Ps2Ph(0), Unused, Both, false),
         (2, 0x18) if !w => new(Broadcast(Size::B32), Unused, Both, false),
         (2, 0x19) if !w => new(Broadcast(Size::B64), Unused, Only256, false),
         (2, 0x1a) if !w => new(Broadcast128, Unused, Only256, false),
@@ -236,6 +246,11 @@ fn avx(d: &mut Decoder, vex: Vex, opcode: u8) -> Result<(Op, Size), DecodeError>
             imm: Some(imm),
         },
         AvxOp::Perm2x128(_) => AvxOp::Perm2x128(imm),
+        AvxOp::Ps2Ph(_) => {
+            // vcvtps2ph xmm/m, xmm/ymm, imm8.
+            (dst, src) = (src, dst);
+            AvxOp::Ps2Ph(imm)
+        }
         AvxOp::Insert128(_) => AvxOp::Insert128(imm & 1),
         AvxOp::Extract128(_) => {
             // vextractf128 xmm/m128, ymm, imm8.
@@ -281,6 +296,43 @@ fn avx(d: &mut Decoder, vex: Vex, opcode: u8) -> Result<(Op, Size), DecodeError>
             src,
             wide: vex.l,
             avx2,
+        },
+        Size::B64,
+    ))
+}
+
+/// The fused multiply-adds: the row (9, A, B) is the operand order, the
+/// low nibble the signs and whether the form is scalar (odd from 9 on),
+/// VEX.W double precision. The scalar forms ignore VEX.L.
+fn fma(d: &mut Decoder, vex: Vex, opcode: u8) -> Result<(Op, Size), DecodeError> {
+    let order = match opcode >> 4 {
+        0x9 => FmaOrder::O132,
+        0xa => FmaOrder::O213,
+        _ => FmaOrder::O231,
+    };
+    let low = opcode & 0xf;
+    let (kind, scalar) = match low {
+        6 => (FmaKind::AddSub, false),
+        7 => (FmaKind::SubAdd, false),
+        8 | 9 => (FmaKind::Add, low == 9),
+        0xa | 0xb => (FmaKind::Sub, low == 0xb),
+        0xc | 0xd => (FmaKind::NegAdd, low == 0xd),
+        _ => (FmaKind::NegSub, low == 0xf),
+    };
+    let (reg, rm) = d.modrm()?;
+    Ok((
+        Op::Avx {
+            op: AvxOp::Fma {
+                order,
+                kind,
+                double: vex.w,
+                scalar,
+            },
+            dst: xmm(reg),
+            src1: Some(vex.vvvv),
+            src: xmm_rm(rm),
+            wide: vex.l && !scalar,
+            avx2: false,
         },
         Size::B64,
     ))

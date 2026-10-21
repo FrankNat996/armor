@@ -6,7 +6,7 @@
 //! `ymm_hi`; a 128-bit form zeroes the high half of its destination.
 
 use armor_guest::GuestMemory;
-use armor_x86::{AvxOp, Op, Operand, Reg, ShiftKind};
+use armor_x86::{AvxOp, FmaKind, FmaOrder, Op, Operand, Reg, ShiftKind};
 
 use crate::{Cpu, Exec, FLAG_CF, FLAG_ZF, STATUS_FLAGS};
 
@@ -174,6 +174,90 @@ impl Cpu {
                     let addr = base.wrapping_add((i * bytes) as u64);
                     mem.read(addr, &mut result[i * bytes..(i + 1) * bytes])?;
                 }
+                result
+            }
+            AvxOp::Ph2Ps => {
+                let lanes = size / 4;
+                let halves = self.read_bytes(src, lanes * 2, next, mem)?;
+                let mut result = [0u8; 32];
+                let mut flags = 0;
+                for i in 0..lanes {
+                    let (value, f) = crate::float::half_to_single(get(&halves, 2, i) as u16);
+                    flags |= f;
+                    set(&mut result, 4, i, value);
+                }
+                self.raise(flags)?;
+                result
+            }
+            AvxOp::Ps2Ph(imm) => {
+                let Operand::Reg(Reg::Xmm(s)) = src else {
+                    unreachable!("vcvtps2ph converts a register")
+                };
+                let singles = self.vector(s);
+                let env = self.float_env();
+                let rc = if imm & 4 != 0 {
+                    env.rc
+                } else {
+                    crate::f80::Rounding::from_control_word(u16::from(imm & 3) << 10)
+                };
+                let lanes = size / 4;
+                let mut result = [0u8; 32];
+                let mut flags = 0;
+                for i in 0..lanes {
+                    let (value, f) = crate::float::single_to_half(get(&singles, 4, i), rc, env);
+                    flags |= f;
+                    set(&mut result, 2, i, value);
+                }
+                self.raise(flags)?;
+                if let Operand::Mem(m) = dst {
+                    mem.write(self.address(&m, next), &result[..lanes * 2])?;
+                    return Ok(());
+                }
+                let Operand::Reg(Reg::Xmm(d)) = dst else {
+                    unreachable!("a register or memory")
+                };
+                self.set_vector(d, &result, false);
+                return Ok(());
+            }
+            AvxOp::Fma {
+                order,
+                kind,
+                double,
+                scalar,
+            } => {
+                let Operand::Reg(Reg::Xmm(d)) = dst else {
+                    unreachable!("FMA writes a register")
+                };
+                let lane = if double { 8 } else { 4 };
+                let (x, y) = (self.vector(d), first());
+                let z = self.read_bytes(src, if scalar { lane } else { size }, next, mem)?;
+                let env = self.float_env();
+                let mut result = if scalar { x } else { [0; 32] };
+                let mut flags = 0;
+                let lanes = if scalar { 1 } else { size / lane };
+                for i in 0..lanes {
+                    let (dst, src1, src) = (get(&x, lane, i), get(&y, lane, i), get(&z, lane, i));
+                    let operands = match order {
+                        FmaOrder::O132 => [dst, src, src1],
+                        FmaOrder::O213 => [src1, dst, src],
+                        FmaOrder::O231 => [src1, src, dst],
+                    };
+                    let even = i % 2 == 0;
+                    let (negate_product, negate_addend) = match kind {
+                        FmaKind::Add => (false, false),
+                        FmaKind::Sub => (false, true),
+                        FmaKind::NegAdd => (true, false),
+                        FmaKind::NegSub => (true, true),
+                        FmaKind::AddSub => (false, even),
+                        FmaKind::SubAdd => (false, !even),
+                    };
+                    let (value, f) =
+                        crate::float::fma(double, operands, negate_product, negate_addend, env);
+                    flags |= f;
+                    set(&mut result, lane, i, value);
+                }
+                // Nothing is written when an unmasked exception is raised.
+                self.raise(flags)?;
                 result
             }
             AvxOp::Test { double } => {

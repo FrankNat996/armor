@@ -843,6 +843,50 @@ pub enum AvxOp {
     /// vtestps, vtestpd: ZF if the sign bits of `dst & src` are all 0, CF
     /// if those of `!dst & src` are; the other status flags cleared.
     Test { double: bool },
+    /// vcvtph2ps (F16C): half-precision lanes of `src` (64 or 128 bits) to
+    /// singles.
+    Ph2Ps,
+    /// vcvtps2ph (F16C): the singles of `src` to half precision in `dst`
+    /// (a register or 64 or 128 bits of memory), rounded by imm8[1:0], or
+    /// by MXCSR with bit 2.
+    Ps2Ph(u8),
+    /// The fused multiply-adds (FMA3): `±(a * b) ± c` rounded once, on
+    /// every lane, or on the low one (`scalar`, the rest of `dst` kept).
+    Fma {
+        order: FmaOrder,
+        kind: FmaKind,
+        double: bool,
+        scalar: bool,
+    },
+}
+
+/// Which operands of an FMA instruction are multiplied (`a * b + c`):
+/// `dst`, `src1` (VEX.vvvv) and `src`, by the digits of the mnemonic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FmaOrder {
+    /// vfmadd132: `dst * src + src1`.
+    O132,
+    /// vfmadd213: `src1 * dst + src`.
+    O213,
+    /// vfmadd231: `src1 * src + dst`.
+    O231,
+}
+
+/// The signs of an FMA instruction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FmaKind {
+    /// vfmadd: `a * b + c`.
+    Add,
+    /// vfmsub: `a * b - c`.
+    Sub,
+    /// vfnmadd: `-(a * b) + c`.
+    NegAdd,
+    /// vfnmsub: `-(a * b) - c`.
+    NegSub,
+    /// vfmaddsub: `a * b - c` on the even lanes, `+ c` on the odd ones.
+    AddSub,
+    /// vfmsubadd: `a * b + c` on the even lanes, `- c` on the odd ones.
+    SubAdd,
 }
 
 /// SSE/x87 state instructions of the 0F AE group.

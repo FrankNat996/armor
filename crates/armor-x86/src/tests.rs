@@ -772,6 +772,42 @@ fn avx_new_instructions() {
         xmm(3),
         true,
     );
+    // vcvtph2ps ymm0, [rdi]; vcvtps2ph xmm1, ymm2, 4 (F16C).
+    let at_rdi = mem(Base::Gpr(RDI), None, 1, 0);
+    avx(
+        &[0xc4, 0xe2, 0x7d, 0x13, 0x07],
+        AvxOp::Ph2Ps,
+        xmm(0),
+        None,
+        at_rdi,
+        false,
+    );
+    avx(
+        &[0xc4, 0xe3, 0x7d, 0x1d, 0xd1, 0x04],
+        AvxOp::Ps2Ph(4),
+        xmm(1),
+        None,
+        xmm(2),
+        false,
+    );
+    // vfnmsub231sd xmm3, xmm4, [rax] (FMA, scalar: VEX.L ignored).
+    let fma = ok(&[0xc4, 0xe2, 0xd9, 0xbf, 0x18]).op;
+    assert_eq!(
+        fma,
+        Op::Avx {
+            op: AvxOp::Fma {
+                order: FmaOrder::O231,
+                kind: FmaKind::NegSub,
+                double: true,
+                scalar: true,
+            },
+            dst: xmm(3),
+            src1: Some(4),
+            src: mem(Base::Gpr(RAX), None, 1, 0),
+            wide: false,
+            avx2: false,
+        }
+    );
     // vpermq with VEX.W0, and with VEX.L0: #UD.
     for bytes in [
         &[0xc4, 0xe3, 0x7d, 0x00, 0xca, 0x1b][..],
@@ -933,9 +969,9 @@ fn bmi_and_movbe() {
     ] {
         assert_eq!(decode(bytes), Err(DecodeError::Invalid), "{bytes:02x?}");
     }
-    // FMA is not decoded yet: vfmadd132ps xmm0, xmm1, xmm2.
+    // The gathers are not decoded yet: vpgatherdd xmm0, [rax+xmm1*4], xmm2.
     assert!(matches!(
-        decode(&[0xc4, 0xe2, 0x71, 0x98, 0xc2]),
+        decode(&[0xc4, 0xe2, 0x69, 0x90, 0x04, 0x88]),
         Err(DecodeError::Unsupported(_))
     ));
     // In compatibility mode: andn eax, ebx, ecx (VEX.W ignored).

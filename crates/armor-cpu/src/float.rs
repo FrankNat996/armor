@@ -235,6 +235,78 @@ pub(crate) fn arith(op: FloatOp, double: bool, a: u64, b: u64, env: Env) -> (u64
     (value, flags)
 }
 
+/// `±(a * b) ± c` rounded once (FMA3), with its flags: the product
+/// negated (`negate_product`: vfnmadd, vfnmsub) and the addend
+/// (`negate_addend`: vfmsub, vfnmsub) after the NaN check. A NaN operand
+/// propagates as the first NaN of `a`, `b`, `c`, made quiet (⚠️ that
+/// order: the operands' roles, compared with qemu by `avx/fma`).
+pub(crate) fn fma(
+    double: bool,
+    operands: [u64; 3],
+    negate_product: bool,
+    negate_addend: bool,
+    env: Env,
+) -> (u64, u16) {
+    let bits = operands.map(|raw| Bits::new(raw, double));
+    if let Some(first) = bits.iter().find(|v| v.is_nan()) {
+        let snan = bits.iter().any(|v| v.is_snan());
+        return (first.quiet(), if snan { FLAG_INVALID } else { 0 });
+    }
+    let [(va, fa), (vb, fb), (vc, fc)] = bits.map(|v| input(v, env));
+    let va = if negate_product { va.negate() } else { va };
+    let vc = if negate_addend { vc.negate() } else { vc };
+    let mode = Mode::float(double, env.rc, env.ftz);
+    let (value, flags) = finish(f80::fma(va, vb, vc, mode), fa | fb | fc, bits[0]);
+    let flags = unmasked_post(flags, double, env, || {
+        f80::fma(va, vb, vc, Mode::register(env.rc, precision(double)))
+    });
+    (value, flags)
+}
+
+/// vcvtph2ps (F16C): a half-precision value as a single, exactly; a
+/// signalling NaN made quiet with IE (⚠️ no DE for a denormal half, and
+/// DAZ not applied: the SDM lists only IE; checked against qemu, which
+/// raises no DE anyway).
+pub(crate) fn half_to_single(half: u16) -> (u64, u16) {
+    let sign = u64::from(half >> 15) << 31;
+    let (exp, frac) = (u64::from(half >> 10) & 0x1f, u64::from(half) & 0x3ff);
+    match (exp, frac) {
+        (0, 0) => (sign, 0),
+        (0, _) => {
+            // A denormal half, frac * 2^-24, is a normal single.
+            let shift = frac.leading_zeros() - 53;
+            let frac = (frac << shift) & 0x3ff;
+            (
+                sign | ((127 - 14 - u64::from(shift)) << 23) | (frac << 13),
+                0,
+            )
+        }
+        (0x1f, 0) => (sign | 0x7f80_0000, 0),
+        (0x1f, _) => {
+            let flags = if frac & 0x200 == 0 { FLAG_INVALID } else { 0 };
+            (sign | 0x7fc0_0000 | (frac << 13), flags)
+        }
+        _ => (sign | ((exp + 127 - 15) << 23) | (frac << 13), 0),
+    }
+}
+
+/// vcvtps2ph (F16C): a single rounded to half precision by `rc`, with its
+/// flags: IE for a signalling NaN (made quiet, the payload's top bits
+/// kept), DE for a denormal operand unless DAZ, OE, UE, PE; FTZ does not
+/// apply (⚠️ as recalled from the SDM; checked against qemu by
+/// `avx/f16c`).
+pub(crate) fn single_to_half(single: u64, rc: Rounding, env: Env) -> (u64, u16) {
+    let x = Bits::new(single, false);
+    if x.is_nan() {
+        let flags = if x.is_snan() { FLAG_INVALID } else { 0 };
+        let sign = (single >> 31) << 15;
+        return (sign | 0x7e00 | ((single >> 13) & 0x3ff), flags);
+    }
+    let (v, f) = input(x, env);
+    let out = f80::to_half(v, rc);
+    (out.value, priority(out.flags | f))
+}
+
 fn precision(double: bool) -> u32 {
     if double { 53 } else { 24 }
 }

@@ -305,6 +305,14 @@ fn declared(op: &Op) -> bool {
             ..
         } => Features::XSAVE,
         Op::Movbe { .. } => Features::MOVBE,
+        Op::Avx {
+            op: armor_x86::AvxOp::Fma { .. },
+            ..
+        } => Features::FMA,
+        Op::Avx {
+            op: armor_x86::AvxOp::Ph2Ps | armor_x86::AvxOp::Ps2Ph(_),
+            ..
+        } => Features::F16C,
         Op::Vex { avx2: true, .. } | Op::Avx { avx2: true, .. } => Features::AVX2,
         Op::Vex { .. } | Op::Avx { .. } | Op::Vzero { .. } | Op::VexMxcsr { .. } => Features::AVX,
         Op::Bmi { op, .. } => match op {
