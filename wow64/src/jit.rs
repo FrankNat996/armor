@@ -1,11 +1,12 @@
 //! The JIT's engine in a Wine process (ADR-0047): the translator of
-//! `armor-jit` (compatibility mode, reads and writes checked by the host's
-//! protections, which Wine keeps as the guest's) around a code buffer from
+//! `armor-jit` (compatibility mode for the WoW64 backend, 64-bit mode for
+//! the ARM64EC one; reads and writes checked by the host's protections,
+//! which Wine keeps as the guest's) around a code buffer from
 //! `NtAllocateVirtualMemory`, as `armor-jit`'s Linux engine does around
 //! its own: a block cache, chained exits, the indirect-jump table, the
 //! interpreter for what the translator does not handle. A fault in
 //! translated code resumes at the instruction's slow path
-//! (`resume_at_slow_path`, from `BTCpuResetToConsistentState`).
+//! (`slow_path`, from the backend's exception hook).
 
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
@@ -17,10 +18,10 @@ use armor_cpu::{Cpu, CpuError, INITIAL_MXCSR, MXCSR_CONTROL, Step};
 use armor_guest::GuestMemory;
 use armor_jit::encoder::branch_word;
 use armor_jit::translator::{
-    BlockEnd, CHAINED_ENTRY, Context, EXIT_CHAIN, EXIT_INTERPRET, FLAG_TABLE, GuestInstruction,
-    HostFeatures, MAX_BLOCK_INSTRUCTIONS, Options, TARGET_ENTRIES, ends_block, enter_routine,
-    flags_routine, leave_routine, supported, supported_concurrent, target_slot, translate_block,
-    uses_mxcsr_control,
+    BlockEnd, CHAINED_ENTRY, Context, EXIT_CHAIN, EXIT_INTERPRET, EXIT_SYSCALL, FLAG_TABLE,
+    GuestInstruction, HostFeatures, MAX_BLOCK_INSTRUCTIONS, Options, TARGET_ENTRIES,
+    UNCHECKED_ENTRY, ends_block, enter_routine, flags_routine, leave_routine, supported,
+    supported_concurrent, target_slot, translate_block, uses_mxcsr_control,
 };
 use armor_x86::{MAX_INSTRUCTION_LEN, Mode, decode_in};
 
@@ -38,6 +39,7 @@ enum Entry {
 }
 
 /// `enter_routine`: `enter(cpu, page_table, context, block)`.
+#[cfg(not(target_arch = "arm64ec"))]
 type EnterFn = unsafe extern "C" fn(*mut Cpu, *const u8, *mut Context, *const u8) -> u64;
 
 pub struct Engine {
@@ -54,7 +56,51 @@ pub struct Engine {
     epoch: u64,
     default_mxcsr: bool,
     concurrent: bool,
+    /// 32-bit code (WoW64) rather than 64-bit code (ARM64EC).
+    compat: bool,
     features: HostFeatures,
+}
+
+/// Calls `enter_routine` for the block at `code`.
+///
+/// # Safety
+/// `enter` and `code` are this epoch's routine and block.
+#[cfg(not(target_arch = "arm64ec"))]
+unsafe fn enter(enter: *const u8, cpu: *mut Cpu, context: *mut Context, code: *const u8) -> u64 {
+    // SAFETY: the caller's contract; the routine follows the C ABI.
+    unsafe {
+        let enter: EnterFn = core::mem::transmute(enter);
+        enter(cpu, core::ptr::null(), context, code)
+    }
+}
+
+/// ARM64EC: a call through a pointer goes through the loader's call
+/// checker, which would take the code buffer (not ARM64EC code in the
+/// PEB's bitmap) for x86-64 code; the routine is called directly. It
+/// follows the C ABI (x19–x30 saved), and uses only registers the C ABI
+/// lets a callee change besides those, and x18: in 64-bit mode r10 lives
+/// there while translated code runs, and the TEB is put back after.
+///
+/// # Safety
+/// As above.
+#[cfg(target_arch = "arm64ec")]
+unsafe fn enter(enter: *const u8, cpu: *mut Cpu, context: *mut Context, code: *const u8) -> u64 {
+    let status: u64;
+    // SAFETY: the caller's contract; the TEB waits on the stack.
+    unsafe {
+        core::arch::asm!(
+            "str x18, [sp, #-16]!",
+            "blr {enter}",
+            "ldr x18, [sp], #16",
+            enter = in(reg) enter,
+            inlateout("x0") cpu => status,
+            in("x1") 0u64,
+            in("x2") context,
+            in("x3") code,
+            clobber_abi("C"),
+        )
+    };
+    status
 }
 
 fn clear_fpsr() {
@@ -98,7 +144,7 @@ fn sync_caches(at: *const u8, len: usize) {
 }
 
 impl Engine {
-    pub fn new() -> Option<Engine> {
+    pub fn new(compat: bool) -> Option<Engine> {
         let mut base: *mut c_void = core::ptr::null_mut();
         let mut size = BUFFER_SIZE;
         // SAFETY: a new region for generated code.
@@ -127,6 +173,7 @@ impl Engine {
             epoch: 0,
             default_mxcsr: true,
             concurrent: false,
+            compat,
             features: HostFeatures::from_id_registers(),
         };
         engine.context.targets = engine.targets.as_ptr() as u64;
@@ -169,10 +216,10 @@ impl Engine {
         self.targets.fill([NO_RIP, 0]);
         self.faults.clear();
         self.used = 0;
-        // The shared routines (compatibility mode: 32-bit code).
-        let flags = flags_routine().expect("the flags routine encodes");
-        let enter = enter_routine(true).expect("the entry routine encodes");
-        let leave = leave_routine(true).expect("the exit routine encodes");
+        // The shared routines.
+        let flags = flags_routine(false).expect("the flags routine encodes");
+        let enter = enter_routine(self.compat, false).expect("the entry routine encodes");
+        let leave = leave_routine(self.compat, false).expect("the exit routine encodes");
         let flags = self.publish(&flags).expect("fits in an empty buffer");
         self.enter = self.publish(&enter).expect("fits in an empty buffer");
         let leave = self.publish(&leave).expect("fits in an empty buffer");
@@ -199,7 +246,9 @@ impl Engine {
 
     /// Runs about `budget` instructions; stops at what the interpreter
     /// reports (`int 0x2e` at the stubs, an exception), the instruction's
-    /// address in `rip`.
+    /// address in `rip`, at a `syscall` (64-bit mode), and before an
+    /// address `outside` names (ARM64EC code, which the backend runs
+    /// natively).
     pub fn run(
         &mut self,
         cpu: &mut Cpu,
@@ -207,6 +256,7 @@ impl Engine {
         budget: i64,
         rip: *mut u64,
         running: *mut bool,
+        outside: impl Fn(u64) -> bool,
     ) -> Result<Step, CpuError> {
         let generation = mem.code_generation();
         if generation != self.generation {
@@ -216,6 +266,9 @@ impl Engine {
         self.sync_mxcsr(cpu);
         let mut budget = budget;
         while budget > 0 {
+            if outside(cpu.rip) {
+                break;
+            }
             let interpret = match self.entry(cpu.rip, mem) {
                 Entry::Interpret => true,
                 Entry::Code(code) => {
@@ -226,15 +279,17 @@ impl Engine {
                     // guest memory, whose faults resume at slow paths.
                     let status = unsafe {
                         clear_fpsr();
-                        let enter: EnterFn = core::mem::transmute(self.enter);
-                        enter(cpu, core::ptr::null(), &mut self.context, code)
+                        enter(self.enter, cpu, &mut self.context, code)
                     };
                     cpu.mxcsr |= mxcsr_flags(read_fpsr());
                     budget = self.context.budget;
-                    if status == EXIT_CHAIN {
+                    if status == EXIT_CHAIN && !outside(cpu.rip) {
                         self.chain(self.context.site, epoch, cpu.rip, mem);
                     }
                     self.context.exit_kind = 0;
+                    if status == EXIT_SYSCALL {
+                        return Ok(Step::Syscall);
+                    }
                     status == EXIT_INTERPRET
                 }
             };
@@ -267,7 +322,14 @@ impl Engine {
         if self.epoch != epoch {
             return;
         }
-        let entry = code.wrapping_add(CHAINED_ENTRY);
+        // Bit 0: a jump forward, past the target's budget check.
+        let offset = if site & 1 != 0 {
+            UNCHECKED_ENTRY
+        } else {
+            CHAINED_ENTRY
+        };
+        let site = site & !1;
+        let entry = code.wrapping_add(offset);
         let word = branch_word(site as usize, entry as usize).expect("within the buffer");
         // SAFETY: the exit's `b`, in this epoch's buffer; no guest code
         // runs while the engine does.
@@ -299,7 +361,12 @@ impl Engine {
             }
             let mut window = [0u8; MAX_INSTRUCTION_LEN];
             let available = mem.fetch(at, &mut window);
-            match decode_in(&window[..available], Mode::Compat32) {
+            let mode = if self.compat {
+                Mode::Compat32
+            } else {
+                Mode::Long
+            };
+            match decode_in(&window[..available], mode) {
                 Ok(insn)
                     if (if self.concurrent {
                         supported_concurrent(&insn)
@@ -308,7 +375,10 @@ impl Engine {
                     }) && (self.default_mxcsr || !uses_mxcsr_control(&insn)) =>
                 {
                     block.push(GuestInstruction { rip: at, insn });
-                    at = (at + insn.len as u64) & 0xffff_ffff;
+                    at += insn.len as u64;
+                    if self.compat {
+                        at &= 0xffff_ffff;
+                    }
                     if ends_block(&insn) {
                         break BlockEnd::Continue(at);
                     }
@@ -323,11 +393,14 @@ impl Engine {
             features: self.features,
             chain: true,
             concurrent: self.concurrent,
-            compat: true,
-            // Addresses wrap at 4 GiB: every one passes the region test,
-            // and the host's protections are the guest's.
-            host_reads: Some(32),
+            compat: self.compat,
+            // The host's protections are the guest's. In compatibility
+            // mode addresses wrap at 4 GiB: every one passes the region
+            // test; in 64-bit mode those above the user half (2^47) go to
+            // the interpreter, which faults as the guest.
+            host_reads: Some(if self.compat { 32 } else { 47 }),
             page_table: false,
+            kind_register: false,
             entry_kind: core::mem::take(&mut self.context.exit_kind),
         };
         let Ok(translation) = translate_block(&block, end, options) else {

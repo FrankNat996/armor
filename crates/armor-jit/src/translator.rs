@@ -99,7 +99,8 @@ pub struct Context {
     pub status: u64,
     /// Lazy flags across blocks: 0 when `FLAGS` is current, otherwise the
     /// pending operation (`Pending::code`) whose operands are in `FA`/`FB`
-    /// (in memory since 2026-10-20: its register holds r9).
+    /// (in memory since 2026-10-20: its register holds r9). In `KIND_REG`
+    /// instead with `Options::kind_register`.
     pub kind: u64,
     /// Address of the indirect-jump table: `TARGET_ENTRIES` pairs (guest
     /// address, executable address of that block's `CHAINED_ENTRY`),
@@ -111,6 +112,9 @@ pub struct Context {
     /// Executable address of `leave_routine`, where blocks go back to the
     /// engine. Kept by the engine.
     pub leave: u64,
+    /// The page table (`MemView::page_table`), for the rare paths that
+    /// read it with `Options::kind_register` (`PAGES` holds `KIND` then).
+    pub page_table: u64,
 }
 
 /// Entries of the indirect-jump table (`Context::targets`).
@@ -145,6 +149,11 @@ pub struct Options {
     /// Windows backend, ADR-0047) a misaligned write that crosses a page
     /// goes to the interpreter.
     pub page_table: bool,
+    /// `KIND` in `KIND_REG` rather than in `Context::kind`: with host
+    /// protection (`host_reads`), whose checks read the page table only out
+    /// of line. One instruction less where an exit publishes it and where a
+    /// block reads it.
+    pub kind_register: bool,
     /// `Context::kind` when the block was first reached: what the blocks
     /// before it usually leave pending. An instruction that needs only CF
     /// of those flags computes it inline when `KIND` still says so, and
@@ -237,11 +246,15 @@ enum Unaligned {
     },
 }
 
-// Host registers. Arguments: x0 = &mut Cpu, x1 = page table, x2 = &mut
+// Host registers. Arguments: x0 = &mut Cpu, x1 = page table (`KIND_REG`
+// with host protection), x2 = &mut
 // Context. Kept from block to block (chaining): the guest's rflags, the
 // budget, the lazy flags and the mapped guest registers (`GUEST`).
 const CPU: HostReg = HostReg::new(0);
 const PAGES: HostReg = HostReg::new(1);
+/// `KIND` with `Options::kind_register`: the page table's register, which
+/// translated code then needs only out of line (`Context::page_table`).
+const KIND_REG: HostReg = PAGES;
 const CONTEXT: HostReg = HostReg::new(2);
 const FLAGS: HostReg = HostReg::new(12);
 const BUDGET: HostReg = HostReg::new(13);
@@ -267,11 +280,13 @@ const T3: HostReg = HostReg::new(14);
 const T4: HostReg = HostReg::new(15);
 
 /// Guest registers kept in host registers (ADR-0021 §4), by guest number:
-/// rax..rdi in x22..x29, r12..r15 in x3, x9, x16, x17. r8..r11 stay in
-/// `Cpu::regs`: in the python profile they were under 4% of the register
-/// uses (`tech/performance.md`). The prologue loads them, the epilogue
-/// stores them back; between chained blocks they stay where they are.
-/// x16 and x17 are free here: generated code goes through no veneer.
+/// rax..rdi in x22..x29, r8..r11 in x8, x21, x18, x30, r12..r15 in x3, x9,
+/// x16, x17. The prologue loads them, the epilogue stores them back;
+/// between chained blocks they stay where they are. x16 and x17 are free
+/// here: generated code goes through no veneer. In an ARM64EC image
+/// (Windows' x86-64 emulator, ADR-0047) x18 is the TEB, which Wine's
+/// signal handling reads while translated code runs: r10 is in x1 there,
+/// free with neither the page table nor `KIND` in it (`Options`).
 const GUEST: [Option<HostReg>; 16] = {
     const fn h(n: u8) -> Option<HostReg> {
         Some(HostReg::new(n))
@@ -287,7 +302,7 @@ const GUEST: [Option<HostReg>; 16] = {
         h(29),
         h(8),
         h(21),
-        h(18),
+        h(if cfg!(target_arch = "arm64ec") { 1 } else { 18 }),
         h(30),
         h(3),
         h(9),
@@ -797,6 +812,59 @@ fn copy_fuses(mov: &Instruction, next: &Instruction) -> bool {
     }
 }
 
+/// Whether the value `load` reads from guest memory into a register is
+/// dead: `next` writes the whole register without reading it. In
+/// concurrent mode the load then needs no acquire (`Translator::relaxed`):
+/// x86 orders it before later loads, but nothing can observe when a value
+/// nobody reads was read. The load goes to a scratch register, and
+/// `next`'s slow paths and faults go back to `load`
+/// (`Translator::restart`), which the interpreter runs at once (the engine
+/// interprets a slow path's instruction before anything else): the state
+/// there is the state before `load`, which the interpreter reads again.
+/// (7-Zip's match finder reads the next node this way, as a prefetch.)
+fn value_dead(load: &Instruction, next: &Instruction) -> bool {
+    let r = match load.op {
+        Op::Mov {
+            dst: Operand::Reg(Reg::Gpr(r)),
+            src: Operand::Mem(_),
+        }
+        | Op::Extend {
+            dst: Reg::Gpr(r),
+            src: Operand::Mem(_),
+            ..
+        } => r,
+        _ => return false,
+    };
+    let uses = |m: &Mem| m.base == Base::Gpr(r) || m.index == Some(r);
+    if !matches!(next.size, Size::B32 | Size::B64) {
+        return false;
+    }
+    match next.op {
+        Op::Mov {
+            dst: Operand::Reg(Reg::Gpr(d)),
+            src,
+        }
+        | Op::Extend {
+            dst: Reg::Gpr(d),
+            src,
+            ..
+        } => {
+            d == r
+                && match src {
+                    Operand::Imm(_) => true,
+                    Operand::Reg(Reg::Gpr(s)) => s != r,
+                    Operand::Mem(m) => !uses(&m),
+                    _ => false,
+                }
+        }
+        Op::Lea {
+            dst: Reg::Gpr(d),
+            src,
+        } => d == r && !uses(&src),
+        _ => false,
+    }
+}
+
 /// The status flags `insn` writes, as the interpreter does, on every path
 /// that goes on inside the block: for the liveness of `live_flags`. An
 /// under-estimate is safe (flags then pass through as live). Shifts and
@@ -1176,10 +1244,10 @@ pub fn translate_block(
             t.a.logic_imm(Logic::Orr, Width::X, T1, T1, 1)?;
         }
         t.a.str(MemSize::B64, T1, CONTEXT, field(offset_of!(Context, site)))?;
-        t.a.ldr(MemSize::B64, T1, CONTEXT, field(offset_of!(Context, kind)))?;
+        let kind = t.kind(T1)?;
         t.a.str(
             MemSize::B64,
-            T1,
+            kind,
             CONTEXT,
             field(offset_of!(Context, exit_kind)),
         )?;
@@ -1202,8 +1270,19 @@ pub fn translate_block(
             t.a.b(slow);
             continue;
         }
-        t.a.shift_imm(Shift::Lsr, Width::X, T1, ADDR, 12)?;
-        t.a.load_store_reg(true, MemSize::B8, T1, PAGES, T1, false);
+        if t.options.kind_register {
+            t.a.ldr(
+                MemSize::B64,
+                T1,
+                CONTEXT,
+                field(offset_of!(Context, page_table)),
+            )?;
+            t.a.add(Width::X, T1, T1, ADDR, Shift::Lsr, 12)?;
+            t.a.ldr(MemSize::B8, T1, T1, 0)?;
+        } else {
+            t.a.shift_imm(Shift::Lsr, Width::X, T1, ADDR, 12)?;
+            t.a.load_store_reg(true, MemSize::B8, T1, PAGES, T1, false);
+        }
         t.a.tbz(false, T1, PAGE_WRITABLE_DATA_SPAN_BIT, slow);
         t.a.b(back);
     }
@@ -1297,8 +1376,8 @@ pub fn translate_block(
 /// block (its `CHAINED_ENTRY`), which leaves through `leave_routine`.
 /// Shared by every block of a code buffer (`compat`: compatibility mode,
 /// whose blocks keep r8–r15's host registers untouched).
-pub fn enter_routine(compat: bool) -> Result<Vec<u32>, EncodeError> {
-    let mut t = Translator::bare(routine_options(compat));
+pub fn enter_routine(compat: bool, kind_register: bool) -> Result<Vec<u32>, EncodeError> {
+    let mut t = Translator::bare(routine_options(compat, kind_register));
     // The block's address, before x3 takes a guest register.
     t.a.mov(Width::X, T1, HostReg::new(3));
     t.a.pair(
@@ -1329,6 +1408,8 @@ pub fn enter_routine(compat: bool) -> Result<Vec<u32>, EncodeError> {
         CONTEXT,
         field(offset_of!(Context, budget)),
     )?;
+    // Nothing pending, as `leave_routine` leaves it.
+    t.clear_kind()?;
     t.a.br(T1);
     t.a.finish()
 }
@@ -1337,8 +1418,8 @@ pub fn enter_routine(compat: bool) -> Result<Vec<u32>, EncodeError> {
 /// the exit's rip in `EXIT_RIP` and its status in `Context::status`: the
 /// flags pending into `rflags`, the guest's registers and the budget back
 /// into the `Cpu` and the `Context`, x19–x30 restored, the status returned.
-pub fn leave_routine(compat: bool) -> Result<Vec<u32>, EncodeError> {
-    let mut t = Translator::bare(routine_options(compat));
+pub fn leave_routine(compat: bool, kind_register: bool) -> Result<Vec<u32>, EncodeError> {
+    let mut t = Translator::bare(routine_options(compat, kind_register));
     t.lazy = Lazy::Dynamic;
     t.materialize()?;
     t.a.str(MemSize::B64, FLAGS, CPU, field(offset_of!(Cpu, rflags)))?;
@@ -1381,7 +1462,7 @@ pub fn leave_routine(compat: bool) -> Result<Vec<u32>, EncodeError> {
     t.a.finish()
 }
 
-fn routine_options(compat: bool) -> Options {
+fn routine_options(compat: bool, kind_register: bool) -> Options {
     Options {
         features: HostFeatures::BASELINE,
         chain: false,
@@ -1389,6 +1470,7 @@ fn routine_options(compat: bool) -> Options {
         compat,
         host_reads: None,
         page_table: true,
+        kind_register,
         entry_kind: 0,
     }
 }
@@ -1398,27 +1480,26 @@ fn routine_options(compat: bool) -> Options {
 /// `FLAGS` when the operation is not known at translation time: at the
 /// start of a block, whatever the block before left pending. Clears
 /// `KIND`; uses `R` and `T1`–`T3`.
-pub fn flags_routine() -> Result<Vec<u32>, EncodeError> {
-    let mut t = Translator::bare(Options {
-        features: HostFeatures::BASELINE,
-        chain: false,
-        concurrent: false,
-        compat: false,
-        host_reads: None,
-        page_table: true,
-        entry_kind: 0,
-    });
-    // A table of branches indexed by `KIND` (codes are below 32): one
+pub fn flags_routine(kind_register: bool) -> Result<Vec<u32>, EncodeError> {
+    let mut t = Translator::bare(routine_options(false, kind_register));
+    // A table of branches indexed by `KIND` (codes are below `KIND_CODES`): one
     // computed jump to the code for that operation.
     let table = t.a.new_label();
     let done = t.a.new_label();
-    t.a.ldr(MemSize::B64, T1, CONTEXT, field(offset_of!(Context, kind)))?;
-    t.a.logic_imm(Logic::And, Width::X, T1, T1, 31)?;
+    let kind = t.kind(T1)?;
+    t.a.logic_imm(Logic::And, Width::X, T1, kind, KIND_CODES as u64 - 1)?;
     t.a.adr(T2, table);
     t.a.add(Width::X, T2, T2, T1, Shift::Lsl, 2)?;
     t.a.br(T2);
-    let mut targets = vec![done; 32];
+    let mut targets = vec![done; KIND_CODES];
     let mut bodies = Vec::new();
+    for code in SHIFT_CODE..MUL_CODE + 8 {
+        let p = Pending::from_code(u64::from(code)).expect("a shift or multiplication");
+        debug_assert_eq!(p.code(), Some(code));
+        let body = t.a.new_label();
+        targets[usize::from(code)] = body;
+        bodies.push((body, p));
+    }
     for kind in [FlagKind::Add, FlagKind::Sub, FlagKind::Logic] {
         for size in [Size::B8, Size::B16, Size::B32, Size::B64] {
             for partial in [false, true] {
@@ -1566,10 +1647,10 @@ enum FlagKind {
     Logic,
     /// shl, shr or sar of the value in `FA` by a constant count, or by the
     /// count in `FB` (masked; 0 leaves the flags as they are in `FLAGS`).
-    /// Known only inside the block: exits compute it first.
+    /// Exits publish it as a count in `FB` (`Pending::code`).
     Shift(ShiftOp, Option<u8>),
     /// A multiplication of `FA` by `FB` (both extended to 64 bits): CF and
-    /// OF say that the product does not fit `size`. Inside the block only.
+    /// OF say that the product does not fit `size`.
     Mul { signed: bool },
     /// comisd, comiss, ucomisd, ucomiss of the bits in `FA` and `FB`: ZF,
     /// PF and CF from the comparison, OF, SF and AF cleared. Inside the
@@ -1652,19 +1733,29 @@ impl Pending {
         if !self.plain() {
             return None;
         }
-        let kind = match self.kind {
-            FlagKind::Add => 1,
-            FlagKind::Sub => 2,
-            FlagKind::Logic => 3,
-            FlagKind::Shift(..) | FlagKind::Mul { .. } | FlagKind::FloatCompare { .. } => {
-                return None;
-            }
-        };
         let size = match self.size {
             Size::B8 => 0,
             Size::B16 => 1,
             Size::B32 => 2,
             Size::B64 => 3,
+        };
+        let kind = match self.kind {
+            FlagKind::Add => 1,
+            FlagKind::Sub => 2,
+            FlagKind::Logic => 3,
+            // From 32: shifts by the count in `FB` (32 and 64 bits), then
+            // multiplications. A shift by a constant has the count put in
+            // `FB` first (`publish_lazy`).
+            FlagKind::Shift(op, None) if self.mask == STATUS_FLAGS && size >= 2 => {
+                let op = SHIFT_CODES.iter().position(|&o| o == op)? as u16;
+                return Some(SHIFT_CODE + op * 2 + (size - 2));
+            }
+            FlagKind::Mul { signed } if self.mask == STATUS_FLAGS => {
+                return Some(MUL_CODE + u16::from(signed) * 4 + size);
+            }
+            FlagKind::Shift(..) | FlagKind::Mul { .. } | FlagKind::FloatCompare { .. } => {
+                return None;
+            }
         };
         Some(kind | size << 2 | u16::from(self.mask & FLAG_CF == 0) << 4)
     }
@@ -1672,6 +1763,17 @@ impl Pending {
     /// The operation of a `KIND` value (`code`'s inverse), operands in
     /// `FA`/`FB`.
     fn from_code(code: u64) -> Option<Pending> {
+        let sizes = [Size::B8, Size::B16, Size::B32, Size::B64];
+        if (u64::from(SHIFT_CODE)..u64::from(MUL_CODE)).contains(&code) {
+            let i = (code - u64::from(SHIFT_CODE)) as usize;
+            let kind = FlagKind::Shift(SHIFT_CODES[i / 2], None);
+            return Some(Pending::new(kind, sizes[2 + i % 2], STATUS_FLAGS));
+        }
+        if (u64::from(MUL_CODE)..u64::from(MUL_CODE) + 8).contains(&code) {
+            let i = (code - u64::from(MUL_CODE)) as usize;
+            let kind = FlagKind::Mul { signed: i >= 4 };
+            return Some(Pending::new(kind, sizes[i % 4], STATUS_FLAGS));
+        }
         let kind = match code & 3 {
             1 => FlagKind::Add,
             2 => FlagKind::Sub,
@@ -1690,6 +1792,14 @@ impl Pending {
         Some(Pending::new(kind, size, mask))
     }
 }
+
+/// The shifts with a `KIND` value of their own (`Pending::code`), from
+/// `SHIFT_CODE`; the multiplications follow, from `MUL_CODE`.
+const SHIFT_CODES: [ShiftOp; 3] = [ShiftOp::Shl, ShiftOp::Shr, ShiftOp::Sar];
+const SHIFT_CODE: u16 = 32;
+const MUL_CODE: u16 = SHIFT_CODE + 6;
+/// `KIND` values are below this (`flags_routine`'s table).
+const KIND_CODES: usize = 64;
 
 /// Where the status flags are, at a point of the generated code.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1766,6 +1876,15 @@ struct Translator {
     first: Option<HostReg>,
     /// The current instruction's copy is left to the next (`copy_fuses`).
     fuse_copy: bool,
+    /// The current instruction's load needs no order (`value_dead`): a
+    /// plain load even in concurrent mode.
+    relaxed: bool,
+    /// adc or sbb takes its carry from the pending operation, redone into
+    /// the host NZCV just before it (`carry_in_host`), not from `FLAGS`.
+    carry_redo: Option<Pending>,
+    /// Where the current instruction's slow paths and faults go back to:
+    /// the relaxed load before it (`value_dead`).
+    restart: Option<u64>,
     /// The slow path of the read `check` just let the host check
     /// (`Options::host_reads`): the next guest load records it in
     /// `faults` (`mark_access`).
@@ -1841,6 +1960,14 @@ impl Translator {
             self.fuse_copy = block
                 .get(i + 1)
                 .is_some_and(|n| copy_fuses(&g.insn, &n.insn));
+            // Not a load that is itself the next one of a relaxed load: its
+            // slow paths go back to that one.
+            let relaxed = self.options.concurrent
+                && !self.relaxed
+                && block
+                    .get(i + 1)
+                    .is_some_and(|n| value_dead(&g.insn, &n.insn));
+            self.restart = core::mem::replace(&mut self.relaxed, relaxed).then(|| block[i - 1].rip);
             fell_through = self.instruction(g)?;
             if !core::mem::take(&mut self.fuse_copy) {
                 debug_assert!(self.first.is_none(), "a copy left to {:?}", g.insn);
@@ -1865,6 +1992,7 @@ impl Translator {
                 self.a.dmb(Barrier::IshLd);
             }
         }
+        self.restart = None;
         if fell_through {
             match end {
                 BlockEnd::Continue(rip) => self.exit_direct(rip)?,
@@ -1889,6 +2017,8 @@ impl Translator {
 
     /// A translator with nothing emitted, the flags current.
     fn bare(options: Options) -> Translator {
+        // r10 is in `KIND_REG` in an ARM64EC image (`GUEST`).
+        debug_assert!(!cfg!(target_arch = "arm64ec") || !options.kind_register);
         Translator {
             a: Assembler::new(),
             epilogue: None,
@@ -1910,6 +2040,9 @@ impl Translator {
             nzcv_now: false,
             first: None,
             fuse_copy: false,
+            relaxed: false,
+            restart: None,
+            carry_redo: None,
             access_slow: None,
             simple_address: None,
             const_address: None,
@@ -2013,11 +2146,26 @@ impl Translator {
                 self.materialize_carry()?;
             }
         } else if needs_earlier && reads == FLAG_CF && written == STATUS_FLAGS {
-            self.materialize_carry()?;
+            self.carry_redo = self.carry_in_host(insn);
+            if self.carry_redo.is_none() {
+                self.materialize_carry()?;
+            }
         } else if needs_earlier && !lazy_flags(insn) && !overwrites {
             self.materialize()?;
         }
         self.flags_emitted = 0;
+        // adc and sbb whose flags nothing observes: the result alone, from
+        // the carry they read.
+        if matches!(
+            insn.op,
+            Op::Alu {
+                op: AluOp::Adc | AluOp::Sbb,
+                ..
+            }
+        ) && written & self.live == 0
+        {
+            self.skip_flags = true;
+        }
         if self.options.concurrent && needs_atomic(insn) {
             self.atomic(insn, at, &mut slow)?;
             self.flags_done(insn, written);
@@ -2025,6 +2173,26 @@ impl Translator {
         }
         match insn.op {
             Op::Nop => {}
+            // A load whose value nobody reads (`value_dead`): only the
+            // access, for its fault, into a scratch register. The register
+            // keeps its value, so the next instruction's slow paths, which
+            // go back here (`restart`), find the state before this one.
+            Op::Mov {
+                src: Operand::Mem(m),
+                ..
+            }
+            | Op::Extend {
+                src: Operand::Mem(m),
+                ..
+            } if self.relaxed => {
+                let size = match insn.op {
+                    Op::Extend { src_size, .. } => src_size,
+                    _ => size,
+                };
+                self.address(&m, next, true)?;
+                self.check(Check::Read, bytes(size), at.rip, &mut slow)?;
+                self.guest_load(false, size, R)?;
+            }
             // syscall in 64-bit mode, as the interpreter runs it: rcx = the
             // next rip, r11 = rflags (exact), then to the engine, which
             // hands it to the kernel's emulation. In compatibility mode, the
@@ -2162,19 +2330,28 @@ impl Translator {
                         FlagKind::Sub
                     }
                     AluOp::Adc => {
-                        // Host carry = CF (32 and 64 bits only).
-                        self.a.shift_imm(Shift::Lsl, Width::X, T1, FLAGS, 29)?;
-                        self.a.logic_imm(Logic::And, Width::X, T1, T1, 1 << 29)?;
-                        self.a.write_flags(T1);
+                        // Host carry = CF (32 and 64 bits only): from the
+                        // pending operation redone, or from `FLAGS`.
+                        if let Some(p) = self.carry_redo.take() {
+                            self.carry_redone(p, a, b, true)?;
+                        } else {
+                            self.a.shift_imm(Shift::Lsl, Width::X, T1, FLAGS, 29)?;
+                            self.a.logic_imm(Logic::And, Width::X, T1, T1, 1 << 29)?;
+                            self.a.write_flags(T1);
+                        }
                         self.a.adc(w, R, a, b, true);
                         FlagKind::Add
                     }
                     AluOp::Sbb => {
                         // Host carry = !CF (AArch64 subtracts NOT carry).
-                        self.a.shift_imm(Shift::Lsl, Width::X, T1, FLAGS, 29)?;
-                        self.a.logic_imm(Logic::Eor, Width::X, T1, T1, 1 << 29)?;
-                        self.a.logic_imm(Logic::And, Width::X, T1, T1, 1 << 29)?;
-                        self.a.write_flags(T1);
+                        if let Some(p) = self.carry_redo.take() {
+                            self.carry_redone(p, a, b, false)?;
+                        } else {
+                            self.a.shift_imm(Shift::Lsl, Width::X, T1, FLAGS, 29)?;
+                            self.a.logic_imm(Logic::Eor, Width::X, T1, T1, 1 << 29)?;
+                            self.a.logic_imm(Logic::And, Width::X, T1, T1, 1 << 29)?;
+                            self.a.write_flags(T1);
+                        }
                         self.a.sbc(w, R, a, b, true);
                         FlagKind::Sub
                     }
@@ -2196,7 +2373,9 @@ impl Translator {
                     self.write_destination(dst, size, R)?;
                 }
                 if matches!(op, AluOp::Adc | AluOp::Sbb) {
-                    self.flags(kind, a, b, STATUS_FLAGS)?;
+                    if !self.skip_flags {
+                        self.flags(kind, a, b, STATUS_FLAGS)?;
+                    }
                 } else if op == AluOp::Cmp
                     && a == FA
                     && whole_register(src, size).is_some()
@@ -4412,6 +4591,7 @@ impl Translator {
 
     /// The slow path of the instruction at `rip`, created on first use.
     fn slow_path(&mut self, rip: u64, slow: &mut Option<Label>) -> Label {
+        let rip = self.restart.unwrap_or(rip);
         *slow.get_or_insert_with(|| {
             let label = self.a.new_label();
             self.slow_paths.push((label, rip, self.lazy));
@@ -4432,7 +4612,7 @@ impl Translator {
     /// (LDAPR, ADR-0023), out of line with a barrier if `ADDR` is not
     /// aligned to the size.
     fn guest_load(&mut self, signed: bool, size: Size, rt: HostReg) -> Emit {
-        if !self.options.concurrent {
+        if !self.options.concurrent || self.relaxed {
             self.mark_access();
             return self.load(signed, size, rt, ADDR, 0);
         }
@@ -5524,7 +5704,8 @@ impl Translator {
             let misaligned = u64::from(bytes.next_power_of_two() - 1);
             // The alignment this access needs tested: writes, and ordered
             // reads, must not cross into a page they may not touch.
-            let align = if bytes > 1 && (check == Check::Write || self.options.concurrent) {
+            let ordered = self.options.concurrent && !self.relaxed;
+            let align = if bytes > 1 && (check == Check::Write || ordered) {
                 bytes.next_power_of_two()
             } else {
                 1
@@ -5571,7 +5752,7 @@ impl Translator {
                 self.known_aligned = true;
                 return Ok(());
             }
-            if check == Check::Read && bytes > 1 && self.options.concurrent {
+            if check == Check::Read && bytes > 1 && ordered {
                 // Ordered loads need alignment: one test for both, the
                 // unaligned case out of line (`read_edges`).
                 let (edge, after, unaligned) =
@@ -5610,6 +5791,10 @@ impl Translator {
         self.a
             .logic_imm(Logic::Ands, Width::X, ZR, ADDR, !((1u64 << 47) - 1))?;
         self.a.b_cond(Cond::Ne, slow);
+        debug_assert!(
+            !self.options.kind_register,
+            "the page table's register holds KIND"
+        );
         self.a.shift_imm(Shift::Lsr, Width::X, T1, ADDR, 12)?;
         self.a
             .load_store_reg(true, MemSize::B8, T1, PAGES, T1, false);
@@ -5742,6 +5927,43 @@ impl Translator {
     /// Before an instruction that keeps CF (inc, dec) while CF is live:
     /// only the pending CF goes into `FLAGS`; the other pending flags are
     /// all replaced by the instruction's. Uses `R`, `T1`, `T3`.
+    /// The pending operation whose host carry, redone, is the carry adc or
+    /// sbb `insn` wants (CF for adc, !CF for sbb): a subtraction's for sbb,
+    /// an addition's for adc, or a logical one's (CF = 0). Its CF stays
+    /// pending, out of `FLAGS`: adc and sbb write every flag, or none that
+    /// anything observes.
+    fn carry_in_host(&self, insn: &Instruction) -> Option<Pending> {
+        let Op::Alu { op, .. } = insn.op else {
+            return None;
+        };
+        let Lazy::Static(p) = self.lazy else {
+            return None;
+        };
+        let fits = match p.kind {
+            FlagKind::Sub => op == AluOp::Sbb,
+            FlagKind::Add => op == AluOp::Adc,
+            FlagKind::Logic => true,
+            _ => false,
+        };
+        (fits && p.mask & FLAG_CF != 0).then_some(p)
+    }
+
+    /// The host carry for adc or sbb from `p` (`carry_in_host`), just before
+    /// it: its operands `a` and `b` are already in place, out of the
+    /// registers `redo` uses.
+    fn carry_redone(&mut self, p: Pending, a: HostReg, b: HostReg, adc: bool) -> Emit {
+        debug_assert!(![R, T3, T4].contains(&a) && ![R, T3, T4].contains(&b));
+        if p.kind == FlagKind::Logic {
+            // CF = 0: host carry clear for adc, set for sbb.
+            return if adc {
+                self.a.adds(Width::X, ZR, ZR, ZR, Shift::Lsl, 0)
+            } else {
+                self.a.subs(Width::X, ZR, ZR, ZR, Shift::Lsl, 0)
+            };
+        }
+        self.redo(p)
+    }
+
     fn materialize_carry(&mut self) -> Emit {
         match self.lazy {
             Lazy::Current => Ok(()),
@@ -5769,8 +5991,10 @@ impl Translator {
                 self.a.bfm_insert(Width::X, FLAGS, T1, 0, 0)
             }
             Lazy::Dynamic => match Pending::from_code(self.options.entry_kind) {
-                Some(p) => self.carry_from_kind(p),
-                None => self.materialize(),
+                Some(p) if matches!(p.kind, FlagKind::Add | FlagKind::Sub | FlagKind::Logic) => {
+                    self.carry_from_kind(p)
+                }
+                _ => self.materialize(),
             },
             _ => self.materialize(),
         }
@@ -5784,9 +6008,8 @@ impl Translator {
     fn carry_from_kind(&mut self, p: Pending) -> Emit {
         let code = p.code().expect("a plain operation");
         let (generic, back) = (self.a.new_label(), self.a.new_label());
-        self.a
-            .ldr(MemSize::B64, T1, CONTEXT, field(offset_of!(Context, kind)))?;
-        self.a.subs_imm(Width::X, ZR, T1, u32::from(code))?;
+        let kind = self.kind(T1)?;
+        self.a.subs_imm(Width::X, ZR, kind, u32::from(code))?;
         self.a.b_cond(Cond::Ne, generic);
         if p.mask & FLAG_CF != 0 {
             match p.kind {
@@ -5946,10 +6169,28 @@ impl Translator {
         Ok(())
     }
 
-    /// `Context::kind` = 0: nothing pending.
+    /// `KIND` = 0: nothing pending.
     fn clear_kind(&mut self) -> Emit {
+        if self.options.kind_register {
+            return self.a.movz(Width::X, KIND_REG, 0, 0);
+        }
         self.a
             .str(MemSize::B64, ZR, CONTEXT, field(offset_of!(Context, kind)))
+    }
+
+    /// The register holding `KIND`: `KIND_REG`, or `scratch` loaded from
+    /// `Context::kind`.
+    fn kind(&mut self, scratch: HostReg) -> Emit<HostReg> {
+        if self.options.kind_register {
+            return Ok(KIND_REG);
+        }
+        self.a.ldr(
+            MemSize::B64,
+            scratch,
+            CONTEXT,
+            field(offset_of!(Context, kind)),
+        )?;
+        Ok(scratch)
     }
 
     /// Before leaving the block: `KIND` says what is pending (the flags
@@ -5961,12 +6202,36 @@ impl Translator {
             Lazy::Current => self.clear_kind()?,
             Lazy::Static(p)
                 if !p.plain()
-                    && matches!(p.kind, FlagKind::Add | FlagKind::Sub | FlagKind::Logic) =>
+                    && matches!(
+                        p.kind,
+                        FlagKind::Add
+                            | FlagKind::Sub
+                            | FlagKind::Logic
+                            | FlagKind::Shift(..)
+                            | FlagKind::Mul { .. }
+                    ) =>
             {
                 self.spill()?;
                 return self.publish_lazy();
             }
+            // A constant count into `FB`, as a count in `cl` (never 0).
+            Lazy::Static(
+                p @ Pending {
+                    kind: FlagKind::Shift(op, Some(n)),
+                    ..
+                },
+            ) if p.mask == STATUS_FLAGS && matches!(p.size, Size::B32 | Size::B64) => {
+                self.a.movz(Width::X, FB, u16::from(n), 0)?;
+                self.lazy = Lazy::Static(Pending {
+                    kind: FlagKind::Shift(op, None),
+                    ..p
+                });
+                return self.publish_lazy();
+            }
             Lazy::Static(p) => match p.code() {
+                Some(code) if self.options.kind_register => {
+                    self.a.movz(Width::X, KIND_REG, code, 0)?;
+                }
                 Some(code) => {
                     self.a.movz(Width::X, T1, code, 0)?;
                     self.a
@@ -5991,9 +6256,8 @@ impl Translator {
             Lazy::Static(p) => p,
             Lazy::Dynamic => {
                 let skip = self.a.new_label();
-                self.a
-                    .ldr(MemSize::B64, T1, CONTEXT, field(offset_of!(Context, kind)))?;
-                self.a.cbz(false, Width::X, T1, skip);
+                let kind = self.kind(T1)?;
+                self.a.cbz(false, Width::X, kind, skip);
                 self.a.ldr(
                     MemSize::B64,
                     T1,

@@ -165,7 +165,7 @@ fn thread() -> *mut Thread {
                 entry: nt::Context64([0; 0x390]),
                 rip: 0,
                 running: false,
-                engine: jit::Engine::new(),
+                engine: jit::Engine::new(true),
             })) as u64;
             THREADS.fetch_add(1, Ordering::AcqRel);
         }
@@ -515,6 +515,7 @@ pub extern "C" fn BTCpuSimulate() {
                         1 << 20,
                         &raw mut (*thread).rip,
                         &raw mut (*thread).running,
+                        |_| false,
                     )
                 }
                 None => {

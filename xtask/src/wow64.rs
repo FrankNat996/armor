@@ -61,15 +61,15 @@ pub fn build(root: &Path) -> Result<PathBuf, String> {
 
 /// Writes Wine's builtin mark into the DOS stub, which must leave room for
 /// it before the PE header.
-fn mark_builtin(pe: &mut [u8]) -> Result<(), String> {
+pub(crate) fn mark_builtin(pe: &mut [u8]) -> Result<(), String> {
     let end = MARK_AT + BUILTIN_MARK.len();
     if pe.len() < 0x40 || &pe[..2] != b"MZ" {
-        return Err("armor_wow64.dll is not a PE file".to_string());
+        return Err("the DLL is not a PE file".to_string());
     }
     let pe_header = u32::from_le_bytes(pe[0x3c..0x40].try_into().expect("4 bytes")) as usize;
     if pe_header < end || pe.len() < end {
         return Err(format!(
-            "armor_wow64.dll: the PE header at {pe_header:#x} leaves no room for the builtin mark"
+            "the DLL's PE header at {pe_header:#x} leaves no room for the builtin mark"
         ));
     }
     pe[MARK_AT..end].copy_from_slice(BUILTIN_MARK);

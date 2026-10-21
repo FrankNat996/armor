@@ -1,0 +1,8 @@
+LIBRARY ntdll.dll
+EXPORTS
+NtAllocateVirtualMemory
+NtTerminateProcess
+NtReadVirtualMemory
+RtlAllocateHeap
+RtlFreeHeap
+__wine_dbg_output

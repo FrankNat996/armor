@@ -1196,6 +1196,7 @@ fn random_code_matches_the_interpreter_in_concurrent_mode() {
         let cpu = guest.cpu(&mut rng);
         guest.compare(&code, &cpu, case + 1);
     }
+    dead_loads_match_the_interpreter(&guest, &mut rng);
 }
 
 /// ADR-0046: the random programs with host protection, where the host
@@ -1260,6 +1261,40 @@ fn random_code_matches_the_interpreter_with_host_protection() {
         guest.compare(&code, &cpu, 7);
     }
     host_memory_stays_out_of_reach(&guest, &mut rng);
+    dead_loads_match_the_interpreter(&guest, &mut rng);
+}
+
+/// Loads whose value the next instruction overwrites unread need no order
+/// in concurrent mode (`value_dead`): a plain load, and a fault or slow
+/// path in the next instruction goes back to the load, read again. Aligned
+/// and not, with the second access inside the data, in the guard page
+/// (a fault), in the read-only page, and the first at armor's memory.
+fn dead_loads_match_the_interpreter(guest: &Guest, rng: &mut Rng) {
+    let host = Box::new([0x1234_5678u64; 4]);
+    let guard = guest.data + DATA_SIZE;
+    for code in [
+        &[0x8b, 0x03, 0x0f, 0xb6, 0x04, 0x31][..], // mov eax, [rbx]; movzx eax, byte [rcx+rsi]
+        &[0x8b, 0x03, 0x8b, 0x41, 0x08],           // mov eax, [rbx]; mov eax, [rcx+8]
+        &[0x48, 0x8b, 0x03, 0x8d, 0x41, 0x01],     // mov rax, [rbx]; lea eax, [rcx+1]
+        &[0x0f, 0xb7, 0x03, 0x48, 0x0f, 0xbf, 0x01], // movzx eax, word [rbx]; movsx rax, word [rcx]
+        &[0x8b, 0x03, 0x8b, 0x00],                 // mov eax, [rbx]; mov eax, [rax] (not dead)
+        &[0x8b, 0x03, 0x8b, 0x41, 0x08, 0x8b, 0x01], // three in a row
+    ] {
+        for (rbx, rcx) in [
+            (guest.data + 0x100, guest.data + 0x200),
+            (guest.data + 0x101, guest.data + 0x203),
+            (guest.data + 0x100, guard + 0x10),
+            (guest.data + 0x100, guard + 0x1000),
+            (guard + 0x10, guest.data + 0x200),
+            (host.as_ptr() as u64, guest.data + 0x200),
+        ] {
+            let mut cpu = guest.cpu(rng);
+            cpu.regs[3] = rbx;
+            cpu.regs[1] = rcx;
+            cpu.regs[6] = 3;
+            guest.compare(code, &cpu, 10);
+        }
+    }
 }
 
 /// An access near one whose region test passed needs none, until its base
@@ -1435,6 +1470,7 @@ fn region_tests_cover_nearby_accesses() {
                 compat: false,
                 host_reads: Some(38),
                 page_table: true,
+                kind_register: false,
                 entry_kind: 0,
             },
         )
@@ -1540,6 +1576,7 @@ fn concurrent_mode_emits_ordered_accesses() {
                 compat: false,
                 host_reads: None,
                 page_table: true,
+                kind_register: false,
                 entry_kind: 0,
             },
         )
@@ -1554,6 +1591,53 @@ fn concurrent_mode_emits_ordered_accesses() {
     assert_eq!(ordered.iter().filter(|w| is_stlr_x(w)).count(), 1);
     // Out of line, for unaligned addresses: a load barrier and a full one.
     assert!(ordered.contains(&0xD503_39BF) && ordered.contains(&0xD503_3BBF));
+}
+
+/// In concurrent mode a load whose value the next instruction overwrites
+/// unread (`value_dead`) is a plain one: `mov eax, [rbx]; movzx eax, byte
+/// [rcx]` has one LDR and one LDAPRB, no 32-bit LDAPR.
+#[test]
+fn dead_loads_need_no_order() {
+    use crate::translator::{BlockEnd, GuestInstruction, Options, translate};
+    let words = |code: &[&[u8]]| {
+        let block: Vec<GuestInstruction> = code
+            .iter()
+            .scan(0x1000u64, |rip, bytes| {
+                let insn = armor_x86::decode(bytes).unwrap();
+                let g = GuestInstruction { rip: *rip, insn };
+                *rip += insn.len as u64;
+                Some(g)
+            })
+            .collect();
+        translate(
+            &block,
+            BlockEnd::Continue(0x1005),
+            Options {
+                features: crate::translator::HostFeatures {
+                    lse: true,
+                    rcpc: true,
+                },
+                chain: false,
+                concurrent: true,
+                compat: false,
+                host_reads: None,
+                page_table: true,
+                kind_register: false,
+                entry_kind: 0,
+            },
+        )
+        .unwrap()
+    };
+    let is_ldapr_w = |w: &u32| w & 0xFFFF_FC00 == 0xB8BF_C000;
+    let is_ldaprb = |w: &u32| w & 0xFFFF_FC00 == 0x38BF_C000;
+    let is_ldr_w = |w: &u32| w & 0xFFC0_0000 == 0xB940_0000;
+    let dead = words(&[&[0x8b, 0x03], &[0x0f, 0xb6, 0x01]]);
+    assert!(!dead.iter().any(is_ldapr_w));
+    assert_eq!(dead.iter().filter(|w| is_ldaprb(w)).count(), 1);
+    assert!(dead.iter().any(is_ldr_w));
+    // movzx eax, byte [rax] reads it: ordered.
+    let live = words(&[&[0x8b, 0x03], &[0x0f, 0xb6, 0x00]]);
+    assert!(live.iter().any(is_ldapr_w));
 }
 
 /// ADR-0023 step 4: in concurrent mode `lock add`, `xchg` with memory,
@@ -1579,6 +1663,7 @@ fn concurrent_mode_emits_lse_atomics() {
             compat: false,
             host_reads: None,
             page_table: true,
+            kind_register: false,
             entry_kind: 0,
         };
         translate(&block, end, options).unwrap()
@@ -1638,6 +1723,7 @@ fn dead_flags_are_not_computed() {
         compat: false,
         host_reads: None,
         page_table: true,
+        kind_register: false,
         entry_kind: 0,
     };
     let words = translate(&block, BlockEnd::Continue(0x1000 + at as u64), options).unwrap();
@@ -2438,6 +2524,7 @@ fn dump_translation() {
                 .ok()
                 .map(|b| b.parse().unwrap()),
             page_table: true,
+            kind_register: false,
             entry_kind: 0,
         },
     )
@@ -2591,6 +2678,58 @@ fn loops_start_from_the_state_of_their_back_edge() {
             cpu.regs[1] = 50 + round; // rcx
             cpu.regs[2] = rng.next(); // rdx
             guest.compare(code, &cpu, round);
+        }
+    }
+}
+
+/// adc and sbb after every kind of pending operation (`carry_in_host`:
+/// the carry from the operation redone, or from `FLAGS`), at every size,
+/// with their own flags dead (overwritten by `and`), read (setb, seto,
+/// setp) or published at the block's end, and with a memory destination
+/// that may fault.
+#[test]
+fn carry_into_adc_and_sbb() {
+    let guest = Guest::new();
+    let mut rng = Rng(59);
+    let firsts: [&[u8]; 9] = [
+        &[0x39, 0xd8],             // cmp eax, ebx
+        &[0x38, 0xd8],             // cmp al, bl
+        &[0x66, 0x39, 0xd8],       // cmp ax, bx
+        &[0x48, 0x83, 0xf8, 0x05], // cmp rax, 5
+        &[0x01, 0xd1],             // add ecx, edx
+        &[0x48, 0x01, 0xd1],       // add rcx, rdx
+        &[0x85, 0xf6],             // test esi, esi
+        &[0x83, 0xe7, 0x07],       // and edi, 7
+        &[0xff, 0xc1],             // inc ecx (CF from before)
+    ];
+    let seconds: [&[u8]; 7] = [
+        &[0x19, 0xc0],             // sbb eax, eax
+        &[0x19, 0xca],             // sbb edx, ecx
+        &[0x48, 0x11, 0xd8],       // adc rax, rbx
+        &[0x83, 0xd2, 0x00],       // adc edx, 0
+        &[0x48, 0x83, 0xd8, 0x05], // sbb rax, 5
+        &[0x10, 0xd8],             // adc al, bl
+        &[0x19, 0x43, 0x08],       // sbb [rbx+8], eax
+    ];
+    let thirds: [&[u8]; 4] = [
+        &[0x83, 0xe0, 0xe6], // and eax, -26
+        &[0x0f, 0x92, 0xc1], // setb cl
+        &[0x0f, 0x90, 0xc2], // seto dl
+        &[0x0f, 0x9a, 0xc2], // setp dl
+    ];
+    for (i, first) in firsts.iter().enumerate() {
+        for second in seconds {
+            for third in thirds.iter().map(|t| &t[..]).chain([&[][..]]) {
+                let code = [&[0xf8][..], first, second, third].concat(); // clc first
+                let code = if i % 2 == 0 { code } else { code[1..].to_vec() };
+                for round in 0..4 {
+                    let mut cpu = guest.cpu(&mut rng);
+                    if round == 0 {
+                        cpu.regs[3] = guest.data;
+                    }
+                    guest.compare(&code, &cpu, round);
+                }
+            }
         }
     }
 }
