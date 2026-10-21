@@ -176,6 +176,11 @@ impl Cpu {
                 }
                 result
             }
+            AvxOp::Gather {
+                element,
+                index,
+                index_reg,
+            } => return self.gather(dst, src1, src, wide, element, index, index_reg, next, mem),
             AvxOp::Ph2Ps => {
                 let lanes = size / 4;
                 let halves = self.read_bytes(src, lanes * 2, next, mem)?;
@@ -280,6 +285,71 @@ impl Cpu {
         };
         self.set_vector(d, &result, wide);
         Ok(())
+    }
+
+    /// The AVX2 gathers (`AvxOp::Gather`). The lanes: as many as fit both
+    /// the destination and the index vector; a 128-bit destination with
+    /// a 256-bit index (vpgatherqd ymm index) takes four dwords into xmm.
+    #[allow(clippy::too_many_arguments)]
+    fn gather(
+        &mut self,
+        dst: Operand,
+        mask: Option<u8>,
+        src: Operand,
+        wide: bool,
+        element: armor_x86::Size,
+        index: armor_x86::Size,
+        index_reg: u8,
+        next: u64,
+        mem: &impl GuestMemory,
+    ) -> Exec<()> {
+        let (Operand::Reg(Reg::Xmm(d)), Some(m), Operand::Mem(at)) = (dst, mask, src) else {
+            unreachable!("the decoder's gather operands")
+        };
+        let (bytes, index_bytes) = (element.bytes(), index.bytes());
+        let size = if wide { 32 } else { 16 };
+        let lanes = size / bytes.max(index_bytes);
+        // A destination that holds fewer bytes than `size`: vpgatherqd and
+        // vgatherqps write an xmm register.
+        let dst_wide = wide && lanes * bytes == 32;
+        let indices = self.vector(index_reg);
+        let base = self.address(&armor_x86::Mem { index: None, ..at }, next);
+        let mut values = self.vector(d);
+        let mut masks = self.vector(m);
+        let mut fault = None;
+        for i in 0..lanes {
+            if masks[i * bytes + bytes - 1] & 0x80 == 0 {
+                continue;
+            }
+            let offset = crate::alu::sign_extend(get(&indices, index_bytes, i), index);
+            let addr = base.wrapping_add(offset.wrapping_mul(u64::from(at.scale)));
+            let addr = if at.addr32 || self.mode == armor_x86::Mode::Compat32 {
+                addr & 0xffff_ffff
+            } else {
+                addr
+            };
+            let mut lane = [0u8; 8];
+            if let Err(f) = mem.read(addr, &mut lane[..bytes]) {
+                fault = Some(f);
+                break;
+            }
+            values[i * bytes..(i + 1) * bytes].copy_from_slice(&lane[..bytes]);
+            masks[i * bytes..(i + 1) * bytes].fill(0);
+        }
+        // What completed stays done, also before a fault; the lanes above
+        // `lanes` are zeroed in the destination and, at the end, the mask.
+        values[lanes * bytes..].fill(0);
+        self.set_vector(d, &values, dst_wide);
+        match fault {
+            Some(f) => {
+                self.set_vector(m, &masks, true);
+                Err(f.into())
+            }
+            None => {
+                self.set_vector(m, &[0; 32], false);
+                Ok(())
+            }
+        }
     }
 
     /// ymm register `n` as bytes.

@@ -843,6 +843,17 @@ pub enum AvxOp {
     /// vtestps, vtestpd: ZF if the sign bits of `dst & src` are all 0, CF
     /// if those of `!dst & src` are; the other status flags cleared.
     Test { double: bool },
+    /// vpgatherdd/dq/qd/qq, vgatherdps/dpd/qps/qpd (AVX2): `element`-sized
+    /// lanes of `dst` loaded from `src`'s base and displacement plus each
+    /// `index`-sized lane of vector register `index_reg` times the scale
+    /// (the index field of `src` is unused), where the top bit of the
+    /// lane of the mask `src1` is set; the mask is cleared as each lane
+    /// completes, so a fault leaves the instruction to be restarted.
+    Gather {
+        element: Size,
+        index: Size,
+        index_reg: u8,
+    },
     /// vcvtph2ps (F16C): half-precision lanes of `src` (64 or 128 bits) to
     /// singles.
     Ph2Ps,

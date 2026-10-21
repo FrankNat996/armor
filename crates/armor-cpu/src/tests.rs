@@ -585,3 +585,25 @@ fn masked_off_lanes_are_not_accessed() {
     assert!(matches!(cpu.step(&mem), Err(CpuError::Fault { .. })));
     assert_eq!(cpu.xmm[0], 7);
 }
+
+#[test]
+fn a_gather_fault_keeps_the_lanes_done() {
+    // vpgatherdd xmm0, [rbx + xmm2 * 4], xmm1: lanes 0 and 1 in the
+    // memory, lane 2 past its end, lane 3 masked off.
+    declare_xsave();
+    let mem = FlatMemory::with_code(&[0xc4, 0xe2, 0x71, 0x90, 0x04, 0x93]);
+    mem.write(BASE + 0x800, &0x1111_1111_2222_2222u64.to_le_bytes())
+        .unwrap();
+    let mut cpu = Cpu::new(BASE, STACK_TOP);
+    cpu.regs[RBX] = BASE + 0x800;
+    cpu.xmm[2] = 1 | 0x400 << 64;
+    cpu.xmm[1] = 0x8000_0000_8000_0000_8000_0000_8000_0000 & !(0xffff_ffff << 96);
+    cpu.xmm[0] = u128::MAX;
+    assert!(matches!(cpu.step(&mem), Err(CpuError::Fault { .. })));
+    // Lanes 0 and 1 loaded and their mask cleared; lanes 2 and 3 kept.
+    // Lane 0 reads [rbx + 4], lane 1 [rbx].
+    assert_eq!(cpu.xmm[0] as u64, 0x2222_2222_1111_1111);
+    assert_eq!(cpu.xmm[1] >> 64, 0x8000_0000);
+    assert_eq!(cpu.xmm[0] >> 64, u128::from(u64::MAX));
+    assert_eq!(cpu.rip, BASE);
+}

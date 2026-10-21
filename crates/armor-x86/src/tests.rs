@@ -969,11 +969,36 @@ fn bmi_and_movbe() {
     ] {
         assert_eq!(decode(bytes), Err(DecodeError::Invalid), "{bytes:02x?}");
     }
-    // The gathers are not decoded yet: vpgatherdd xmm0, [rax+xmm1*4], xmm2.
+    // vgatherqps xmm3, [rax + ymm12 * 8 + 16], xmm4: VSIB, VEX.X extends
+    // the vector index.
+    let gather = ok(&[0xc4, 0xa2, 0x5d, 0x93, 0x5c, 0xe0, 0x10]);
+    assert_eq!(gather.len, 7);
     assert!(matches!(
-        decode(&[0xc4, 0xe2, 0x69, 0x90, 0x04, 0x88]),
-        Err(DecodeError::Unsupported(_))
+        gather.op,
+        Op::Avx {
+            op: AvxOp::Gather {
+                element: Size::B32,
+                index: Size::B64,
+                index_reg: 12,
+            },
+            src1: Some(4),
+            wide: true,
+            src: Operand::Mem(Mem {
+                index: None,
+                scale: 8,
+                disp: 16,
+                ..
+            }),
+            ..
+        }
     ));
+    // The mask equal to the destination, and no SIB: #UD.
+    for bytes in [
+        &[0xc4, 0xe2, 0x79, 0x90, 0x04, 0x88][..],
+        &[0xc4, 0xe2, 0x71, 0x90, 0x00],
+    ] {
+        assert_eq!(decode(bytes), Err(DecodeError::Invalid), "{bytes:02x?}");
+    }
     // In compatibility mode: andn eax, ebx, ecx (VEX.W ignored).
     assert!(matches!(
         decode_in(&[0xc4, 0xe2, 0xe0, 0xf2, 0xc1], Mode::Compat32).unwrap(),

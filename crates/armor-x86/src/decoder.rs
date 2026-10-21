@@ -1187,6 +1187,22 @@ impl Decoder<'_> {
         }
     }
 
+    /// The byte `offset` bytes after the next one, not consumed.
+    pub(crate) fn peek_after(&self, offset: usize) -> Result<u8, DecodeError> {
+        if self.pos + offset >= MAX_INSTRUCTION_LEN {
+            return Err(DecodeError::TooLong);
+        }
+        self.bytes
+            .get(self.pos + offset)
+            .copied()
+            .ok_or(DecodeError::Truncated)
+    }
+
+    /// REX.X (from VEX.X): the high bit of an index register.
+    pub(crate) fn rex_x(&self) -> u8 {
+        self.rex_bit(REX_X)
+    }
+
     /// The next byte (the ModRM byte, for the x87 FOP), not consumed.
     pub(crate) fn peek_modrm(&self) -> Result<u8, DecodeError> {
         if self.pos >= MAX_INSTRUCTION_LEN {

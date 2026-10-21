@@ -48,6 +48,11 @@ pub(crate) fn decode(d: &mut Decoder) -> Result<(Op, Size), DecodeError> {
             d.u8()?;
             avx(d, vex, opcode)
         }
+        // The AVX2 gathers: map 2 (VEX.66) 90–93.
+        (2, 0x90..=0x93) if vex.prefix == 0x66 => {
+            d.u8()?;
+            gather(d, vex, opcode)
+        }
         // FMA3: map 2 (VEX.66) 96–9F, A6–AF, B6–BF.
         (2, 0x96..=0x9f | 0xa6..=0xaf | 0xb6..=0xbf) if vex.prefix == 0x66 => {
             d.u8()?;
@@ -296,6 +301,49 @@ fn avx(d: &mut Decoder, vex: Vex, opcode: u8) -> Result<(Op, Size), DecodeError>
             src,
             wide: vex.l,
             avx2,
+        },
+        Size::B64,
+    ))
+}
+
+/// The gathers: VEX.W the element size, opcode bit 0 the index size; the
+/// memory operand uses VSIB (a SIB byte whose index is a vector register,
+/// xmm4 included). #UD without SIB, or when the destination, the mask and
+/// the index are not three different registers.
+fn gather(d: &mut Decoder, vex: Vex, opcode: u8) -> Result<(Op, Size), DecodeError> {
+    let modrm = d.peek_modrm()?;
+    if modrm >> 6 == 3 || modrm & 7 != 4 {
+        return Err(DecodeError::Invalid);
+    }
+    let sib = d.peek_after(1)?;
+    let index_reg = ((sib >> 3) & 7) | d.rex_x();
+    let (reg, rm) = d.modrm()?;
+    let Rm::Mem(mut mem) = rm else {
+        unreachable!("checked above")
+    };
+    mem.index = None;
+    let index_reg = if d.compat() { index_reg & 7 } else { index_reg };
+    if reg == vex.vvvv || reg == index_reg || vex.vvvv == index_reg {
+        return Err(DecodeError::Invalid);
+    }
+    let element = if vex.w { Size::B64 } else { Size::B32 };
+    let index = if opcode & 1 == 1 {
+        Size::B64
+    } else {
+        Size::B32
+    };
+    Ok((
+        Op::Avx {
+            op: AvxOp::Gather {
+                element,
+                index,
+                index_reg,
+            },
+            dst: xmm(reg),
+            src1: Some(vex.vvvv),
+            src: Operand::Mem(mem),
+            wide: vex.l,
+            avx2: true,
         },
         Size::B64,
     ))
