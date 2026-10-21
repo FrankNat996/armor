@@ -2019,6 +2019,34 @@ fn copies_fused_with_the_next_operation() {
     }
 }
 
+/// Thread-local accesses (`fs:disp`, `gs:disp`, the segment base added to
+/// the address): displacements small and large, positive and negative,
+/// reads, writes and read-modify-writes, inside the data and past it.
+#[test]
+fn segment_relative_accesses() {
+    let guest = Guest::new();
+    let mut rng = Rng(61);
+    #[rustfmt::skip]
+    let codes: [&[u8]; 6] = [
+        &[0x64, 0x48, 0x8b, 0x04, 0x25, 0x10, 0x00, 0x00, 0x00], // mov rax, fs:[0x10]
+        &[0x64, 0x48, 0x8b, 0x04, 0x25, 0xf8, 0xff, 0xff, 0xff], // mov rax, fs:[-8]
+        &[0x64, 0x48, 0x8b, 0x04, 0x25, 0x00, 0x18, 0x00, 0x00], // mov rax, fs:[0x1800]
+        &[0x64, 0x48, 0x89, 0x0c, 0x25, 0x28, 0x00, 0x00, 0x00], // mov fs:[0x28], rcx
+        &[0x64, 0x48, 0x01, 0x0c, 0x25, 0xf0, 0xff, 0xff, 0xff], // add fs:[-16], rcx
+        &[0x65, 0x8b, 0x04, 0x25, 0x08, 0x00, 0x00, 0x00],       // mov eax, gs:[8]
+    ];
+    for code in codes {
+        let mut cpu = guest.cpu(&mut rng);
+        cpu.fs_base = guest.data + 0x100;
+        cpu.gs_base = guest.data + 0x200;
+        guest.compare(code, &cpu, 3);
+        // A base past the data: the access faults where the interpreter's does.
+        cpu.fs_base = guest.data + DATA_SIZE + 0x10;
+        cpu.gs_base = cpu.fs_base;
+        guest.compare(code, &cpu, 3);
+    }
+}
+
 /// Permission checks of nearby accesses with the same base: they must
 /// follow the base register's changes and rsp's moves, and fault where
 /// the interpreter does, at the edges of the stack and of the mappings.
