@@ -86,6 +86,8 @@ pub(crate) struct Vex {
     pub vvvv: u8,
     /// VEX.L: 256-bit vectors.
     pub l: bool,
+    /// VEX.W, an opcode bit for some instructions.
+    pub w: bool,
 }
 
 /// The r/m half of a ModRM byte.
@@ -1012,6 +1014,7 @@ impl Decoder<'_> {
             prefix: [0, 0x66, 0xf3, 0xf2][usize::from(last & 3)],
             vvvv,
             l: last & 4 != 0,
+            w,
         });
         crate::vex::decode(self)
     }
@@ -1019,6 +1022,11 @@ impl Decoder<'_> {
     /// The VEX prefix of the instruction being decoded (`vex_prefix`).
     pub(crate) fn vex(&self) -> Vex {
         self.vex.expect("decoding a VEX instruction")
+    }
+
+    /// Compatibility mode (32-bit code).
+    pub(crate) fn compat(&self) -> bool {
+        self.compat
     }
 
     /// Whether the instruction has a VEX prefix.

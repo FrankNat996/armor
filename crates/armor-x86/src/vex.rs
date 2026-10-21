@@ -5,7 +5,8 @@
 //! given their VEX.vvvv operand (docs/tech/avx.md).
 
 use crate::decoder::{Decoder, Rm, Vex};
-use crate::{BmiOp, DecodeError, IntOp, Op, Operand, Reg, Size, SseOp};
+use crate::sse::{xmm, xmm_rm};
+use crate::{AvxOp, BmiOp, DecodeError, IntOp, Op, Operand, Reg, ShiftKind, Size, SseOp};
 
 pub(crate) fn decode(d: &mut Decoder) -> Result<(Op, Size), DecodeError> {
     let vex = d.vex();
@@ -41,6 +42,28 @@ pub(crate) fn decode(d: &mut Decoder) -> Result<(Op, Size), DecodeError> {
         }
         // crc32 and movbe have no VEX form.
         (2, 0xf0 | 0xf1) => Err(DecodeError::Invalid),
+        (2 | 3, _) if vex.prefix == 0x66 && new_instruction(vex, opcode).is_some() => {
+            d.u8()?;
+            avx(d, vex, opcode)
+        }
+        // One of them with a VEX.W it does not have.
+        (
+            2,
+            0x0c..=0x0f
+            | 0x16
+            | 0x18..=0x1a
+            | 0x2c..=0x2f
+            | 0x36
+            | 0x46
+            | 0x58..=0x5a
+            | 0x78
+            | 0x79,
+        )
+        | (3, 0x00..=0x02 | 0x04..=0x06 | 0x18 | 0x19 | 0x38 | 0x39 | 0x46 | 0x4a..=0x4c)
+            if vex.prefix == 0x66 =>
+        {
+            Err(DecodeError::Invalid)
+        }
         (1, _) => {
             d.u8()?;
             sse(vex, opcode, crate::sse::decode(d, opcode)?)
@@ -48,6 +71,219 @@ pub(crate) fn decode(d: &mut Decoder) -> Result<(Op, Size), DecodeError> {
         (2, _) => sse(vex, opcode, crate::maps::decode_38(d)?),
         _ => sse(vex, opcode, crate::maps::decode_3a(d)?),
     }
+}
+
+/// What decoding an instruction AVX or AVX2 adds needs (`new_instruction`).
+struct New {
+    op: AvxOp,
+    form: Form,
+    length: Length,
+    /// AVX2 (for some, only in their 256-bit or register forms: `avx`).
+    avx2: bool,
+    /// An immediate byte follows.
+    imm: bool,
+}
+
+/// The vector lengths an instruction has.
+#[derive(PartialEq)]
+enum Length {
+    Both,
+    Only256,
+}
+
+/// The instructions of maps 2 and 3 (VEX.66) that AVX and AVX2 add, or
+/// `None` for the others (and for a VEX.W they do not have).
+fn new_instruction(vex: Vex, opcode: u8) -> Option<New> {
+    use AvxOp::*;
+    use Form::{Source, Unused};
+    use Length::{Both, Only256};
+    let lane = |w: bool| if w { Size::B64 } else { Size::B32 };
+    let new = |op, form, length, avx2| New {
+        op,
+        form,
+        length,
+        avx2,
+        imm: vex.map == 3,
+    };
+    let w = vex.w;
+    Some(match (vex.map, opcode) {
+        (2, 0x0c | 0x0d) if !w => new(
+            Permil {
+                double: opcode == 0x0d,
+                imm: None,
+            },
+            Source,
+            Both,
+            false,
+        ),
+        (2, 0x0e | 0x0f) if !w => new(
+            Test {
+                double: opcode == 0x0f,
+            },
+            Unused,
+            Both,
+            false,
+        ),
+        (2, 0x16 | 0x36) if !w => new(Permd, Source, Only256, true),
+        (2, 0x18) if !w => new(Broadcast(Size::B32), Unused, Both, false),
+        (2, 0x19) if !w => new(Broadcast(Size::B64), Unused, Only256, false),
+        (2, 0x1a) if !w => new(Broadcast128, Unused, Only256, false),
+        (2, 0x5a) if !w => new(Broadcast128, Unused, Only256, true),
+        (2, 0x58) if !w => new(Broadcast(Size::B32), Unused, Both, true),
+        (2, 0x59) if !w => new(Broadcast(Size::B64), Unused, Both, true),
+        (2, 0x78) if !w => new(Broadcast(Size::B8), Unused, Both, true),
+        (2, 0x79) if !w => new(Broadcast(Size::B16), Unused, Both, true),
+        (2, 0x2c..=0x2f) if !w => new(
+            MaskMov {
+                lane: lane(opcode & 1 == 1),
+                store: opcode >= 0x2e,
+            },
+            Source,
+            Both,
+            false,
+        ),
+        (2, 0x8c | 0x8e) => new(
+            MaskMov {
+                lane: lane(w),
+                store: opcode == 0x8e,
+            },
+            Source,
+            Both,
+            true,
+        ),
+        (2, 0x45) => new(
+            ShiftVar {
+                kind: ShiftKind::RightLogical,
+                lane: lane(w),
+            },
+            Source,
+            Both,
+            true,
+        ),
+        (2, 0x46) if !w => new(
+            ShiftVar {
+                kind: ShiftKind::RightArithmetic,
+                lane: Size::B32,
+            },
+            Source,
+            Both,
+            true,
+        ),
+        (2, 0x47) => new(
+            ShiftVar {
+                kind: ShiftKind::Left,
+                lane: lane(w),
+            },
+            Source,
+            Both,
+            true,
+        ),
+        (3, 0x00 | 0x01) if w => new(Permq(0), Unused, Only256, true),
+        (3, 0x02) if !w => new(Blendd(0), Source, Both, true),
+        (3, 0x04 | 0x05) if !w => new(
+            Permil {
+                double: opcode == 0x05,
+                imm: Some(0),
+            },
+            Unused,
+            Both,
+            false,
+        ),
+        (3, 0x06 | 0x46) if !w => new(Perm2x128(0), Source, Only256, opcode == 0x46),
+        (3, 0x18 | 0x38) if !w => new(Insert128(0), Source, Only256, opcode == 0x38),
+        (3, 0x19 | 0x39) if !w => new(Extract128(0), Unused, Only256, opcode == 0x39),
+        (3, 0x4a..=0x4c) if !w => new(
+            BlendV {
+                lane: match opcode {
+                    0x4a => Size::B32,
+                    0x4b => Size::B64,
+                    _ => Size::B8,
+                },
+                mask: 0,
+            },
+            Source,
+            Both,
+            false,
+        ),
+        _ => return None,
+    })
+}
+
+/// An instruction AVX or AVX2 adds (`new_instruction`), after its opcode.
+fn avx(d: &mut Decoder, vex: Vex, opcode: u8) -> Result<(Op, Size), DecodeError> {
+    let New {
+        op,
+        form,
+        length,
+        avx2,
+        imm,
+    } = new_instruction(vex, opcode).expect("checked by `decode`");
+    if length == Length::Only256 && !vex.l {
+        return Err(DecodeError::Invalid);
+    }
+    let (reg, rm) = d.modrm()?;
+    let is_mem = matches!(rm, Rm::Mem(_));
+    let (mut dst, mut src) = (xmm(reg), xmm_rm(rm));
+    let imm = if imm { d.u8()? } else { 0 };
+    let op = match op {
+        AvxOp::Permq(_) => AvxOp::Permq(imm),
+        AvxOp::Blendd(_) => AvxOp::Blendd(imm),
+        AvxOp::Permil {
+            double,
+            imm: Some(_),
+        } => AvxOp::Permil {
+            double,
+            imm: Some(imm),
+        },
+        AvxOp::Perm2x128(_) => AvxOp::Perm2x128(imm),
+        AvxOp::Insert128(_) => AvxOp::Insert128(imm & 1),
+        AvxOp::Extract128(_) => {
+            // vextractf128 xmm/m128, ymm, imm8.
+            (dst, src) = (src, dst);
+            AvxOp::Extract128(imm & 1)
+        }
+        AvxOp::BlendV { lane, .. } => AvxOp::BlendV {
+            lane,
+            // The fourth register in imm8[7:4]; bit 7 is ignored outside
+            // 64-bit mode.
+            mask: (imm >> 4) & if d.compat() { 7 } else { 15 },
+        },
+        AvxOp::MaskMov { lane, store } => {
+            if !is_mem {
+                return Err(DecodeError::Invalid);
+            }
+            if store {
+                (dst, src) = (src, dst);
+            }
+            AvxOp::MaskMov { lane, store }
+        }
+        op => op,
+    };
+    // The 128-bit broadcasts read memory only; vbroadcastss and
+    // vbroadcastsd from a register are AVX2.
+    let avx2 = match op {
+        AvxOp::Broadcast128 if !is_mem => return Err(DecodeError::Invalid),
+        AvxOp::Broadcast(Size::B32 | Size::B64) if !avx2 => !is_mem,
+        // vpblendvb ymm is AVX2.
+        AvxOp::BlendV { lane: Size::B8, .. } => vex.l,
+        _ => avx2,
+    };
+    let src1 = match form {
+        Form::Source => Some(vex.vvvv),
+        Form::Unused if vex.vvvv != 0 => return Err(DecodeError::Invalid),
+        _ => None,
+    };
+    Ok((
+        Op::Avx {
+            op,
+            dst,
+            src1,
+            src,
+            wide: vex.l,
+            avx2,
+        },
+        Size::B64,
+    ))
 }
 
 /// How an SSE operation's VEX form uses VEX.vvvv.

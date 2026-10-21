@@ -462,11 +462,14 @@ fn unmasked_sse_exceptions_follow_the_hardware() {
     }
 }
 
-/// Declares XSAVE for the XSAVE tests. The declaration is process-wide and
-/// tests run in parallel, so tests only ever add XSAVE; none relies on its
-/// absence (the #UD without it is checked by `faults/xgetbv_undeclared`).
+/// Declares XSAVE, AVX and AVX2 for the tests that need them. The
+/// declaration is process-wide and tests run in parallel, so every test
+/// declares the same set and none relies on their absence (the #UD
+/// without them is checked by `faults/xgetbv_undeclared` and
+/// `faults/vex_undeclared`).
 fn declare_xsave() {
-    cpuid::declare(cpuid::Features::XSAVE);
+    use cpuid::Features;
+    cpuid::declare(Features::XSAVE.union(Features::AVX).union(Features::AVX2));
 }
 
 #[test]
@@ -518,23 +521,31 @@ fn signal_xstate_round_trip_and_initial_components() {
     declare_xsave();
     let mut cpu = Cpu::new(BASE, STACK_TOP);
     cpu.xmm[5] = 0x55;
+    cpu.ymm_hi[5] = 0x66;
     cpu.mxcsr = 0x1fa0;
     let image = cpu.xsave_image();
-    assert_eq!(image.len(), 576);
+    assert_eq!(image.len(), 832);
     assert_eq!(
         image[512..520],
-        3u64.to_le_bytes(),
-        "XSTATE_BV: x87 and SSE"
+        7u64.to_le_bytes(),
+        "XSTATE_BV: x87, SSE and AVX"
     );
+    assert_eq!(image[576 + 80..576 + 96], 0x66u128.to_le_bytes());
     let mut other = Cpu::new(BASE, STACK_TOP);
+    other.restore_signal_xstate(&image, 7).unwrap();
+    assert_eq!(
+        (other.xmm, other.ymm_hi, other.mxcsr),
+        (cpu.xmm, cpu.ymm_hi, cpu.mxcsr)
+    );
+    // A frame without AVX: the upper halves to their initial state.
     other.restore_signal_xstate(&image, 3).unwrap();
-    assert_eq!((other.xmm, other.mxcsr), (cpu.xmm, cpu.mxcsr));
+    assert_eq!((other.xmm[5], other.ymm_hi[5]), (0x55, 0));
     // A frame with only x87: SSE to its initial state, MXCSR unchanged.
     other.restore_signal_xstate(&image, 1).unwrap();
     assert_eq!((other.xmm[5], other.mxcsr), (0, 0x1fa0));
     // A header xrstor refuses: nothing changes.
     let mut bad = image.clone();
-    bad[512] = 7;
+    bad[512] = 0xf;
     other.xmm[5] = 9;
     assert!(other.restore_signal_xstate(&bad, 3).is_err());
     assert_eq!(other.xmm[5], 9);
@@ -550,4 +561,27 @@ fn fxrstor_leaves_the_upper_ymm_halves() {
     cpu.xmm[2] = 1;
     cpu.step(&mem).unwrap();
     assert_eq!((cpu.xmm[2], cpu.ymm_hi[2]), (0, 0xabcd));
+}
+
+#[test]
+fn masked_off_lanes_are_not_accessed() {
+    // vmaskmovps xmm0, xmm4, [0x400ff8]: lanes 0 and 1 in the memory,
+    // lanes 2 and 3 past its end. Only lane 1 enabled: no fault.
+    declare_xsave();
+    let code = [0xc4, 0xe2, 0x59, 0x2c, 0x04, 0x25, 0xf8, 0x0f, 0x40, 0x00];
+    let mem = FlatMemory::with_code(&code);
+    mem.write(BASE + 0xffc, &0x1234_5678u32.to_le_bytes())
+        .unwrap();
+    let mut cpu = Cpu::new(BASE, STACK_TOP);
+    cpu.xmm[4] = 0x8000_0000 << 32;
+    cpu.xmm[0] = u128::MAX;
+    cpu.ymm_hi[0] = 1;
+    cpu.step(&mem).unwrap();
+    assert_eq!((cpu.xmm[0], cpu.ymm_hi[0]), (0x1234_5678 << 32, 0));
+    // Lane 2 enabled: a fault, and nothing written.
+    let mut cpu = Cpu::new(BASE, STACK_TOP);
+    cpu.xmm[4] = 0x8000_0000 << 64;
+    cpu.xmm[0] = 7;
+    assert!(matches!(cpu.step(&mem), Err(CpuError::Fault { .. })));
+    assert_eq!(cpu.xmm[0], 7);
 }

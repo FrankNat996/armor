@@ -797,6 +797,54 @@ pub enum BmiOp {
     Shrx,
 }
 
+/// The instructions AVX and AVX2 add (`Op::Avx`), with no legacy SSE
+/// form.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AvxOp {
+    /// vbroadcastss, vbroadcastsd, vpbroadcastb/w/d/q: the low element of
+    /// `src` (a register or memory of the element's size) in every lane.
+    Broadcast(Size),
+    /// vbroadcastf128, vbroadcasti128: m128 into both halves.
+    Broadcast128,
+    /// vinsertf128, vinserti128: `src` (xmm or m128) into the half of
+    /// `src1` that bit 0 selects.
+    Insert128(u8),
+    /// vextractf128, vextracti128: the half of `src` (ymm) that bit 0
+    /// selects into `dst` (xmm or m128).
+    Extract128(u8),
+    /// vperm2f128, vperm2i128: each half of the result one of the four
+    /// halves of `src1` and `src` (bits 1:0, 5:4), or zero (bits 3, 7).
+    Perm2x128(u8),
+    /// vpermq, vpermpd: the 64-bit lanes of `src` chosen by the
+    /// immediate, two bits each.
+    Permq(u8),
+    /// vpermd, vpermps: the 32-bit lanes of `src` chosen by the low three
+    /// bits of each lane of `src1`.
+    Permd,
+    /// vpermilps, vpermilpd: lanes within each 128-bit half, chosen by
+    /// the immediate (`Some`, applied to `src`) or by the lanes of `src`
+    /// (applied to `src1`).
+    Permil { double: bool, imm: Option<u8> },
+    /// vblendvps, vblendvpd, vpblendvb: each lane from `src` where the
+    /// top bit of the lane of xmm/ymm register `mask` is set, otherwise
+    /// from `src1`.
+    BlendV { lane: Size, mask: u8 },
+    /// vpblendd: dword i from `src` if bit i of the immediate is set,
+    /// otherwise from `src1`.
+    Blendd(u8),
+    /// vpsllvd/q, vpsrlvd/q, vpsravd: each lane of `src1` shifted by the
+    /// same lane of `src`.
+    ShiftVar { kind: ShiftKind, lane: Size },
+    /// vmaskmovps/pd, vpmaskmovd/q: the lanes whose top bit is set in the
+    /// mask (`src1`) loaded from `src` (memory; the others zeroed), or
+    /// stored from `src` into `dst` (memory; the others left). Masked-off
+    /// lanes are not accessed.
+    MaskMov { lane: Size, store: bool },
+    /// vtestps, vtestpd: ZF if the sign bits of `dst & src` are all 0, CF
+    /// if those of `!dst & src` are; the other status flags cleared.
+    Test { double: bool },
+}
+
 /// SSE/x87 state instructions of the 0F AE group.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StateOp {
@@ -1058,6 +1106,17 @@ pub enum Op {
     /// adds.
     Vex {
         op: SseOp,
+        dst: Operand,
+        src1: Option<u8>,
+        src: Operand,
+        wide: bool,
+        avx2: bool,
+    },
+    /// An instruction AVX or AVX2 adds (`AvxOp`): `dst = op(src1, src)` on
+    /// 128 bits (bits 255:128 of a destination register zeroed) or 256
+    /// (`wide`); `avx2`: an AVX2 instruction.
+    Avx {
+        op: AvxOp,
         dst: Operand,
         src1: Option<u8>,
         src: Operand,

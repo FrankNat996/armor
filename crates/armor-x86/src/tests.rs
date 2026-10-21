@@ -685,6 +685,102 @@ fn vex_sse_forms() {
     ));
 }
 
+/// The instructions AVX and AVX2 add, bytes from the GNU assembler and
+/// objdump.
+#[test]
+fn avx_new_instructions() {
+    let xmm = |n| Operand::Reg(Reg::Xmm(n));
+    let avx = |bytes: &[u8], op, dst, src1, src, avx2| {
+        let insn = ok(bytes);
+        assert_eq!(
+            (insn.op, insn.len),
+            (
+                Op::Avx {
+                    op,
+                    dst,
+                    src1,
+                    src,
+                    wide: true,
+                    avx2,
+                },
+                bytes.len()
+            ),
+            "{bytes:02x?}"
+        );
+    };
+    // vpbroadcastb ymm1, xmm2
+    avx(
+        &[0xc4, 0xe2, 0x7d, 0x78, 0xca],
+        AvxOp::Broadcast(Size::B8),
+        xmm(1),
+        None,
+        xmm(2),
+        true,
+    );
+    // vinserti128 ymm1, ymm2, xmm3, 1
+    avx(
+        &[0xc4, 0xe3, 0x6d, 0x38, 0xcb, 0x01],
+        AvxOp::Insert128(1),
+        xmm(1),
+        Some(2),
+        xmm(3),
+        true,
+    );
+    // vextractf128 [rax], ymm4, 1
+    let at_rax = mem(Base::Gpr(RAX), None, 1, 0);
+    avx(
+        &[0xc4, 0xe3, 0x7d, 0x19, 0x20, 0x01],
+        AvxOp::Extract128(1),
+        at_rax,
+        None,
+        xmm(4),
+        false,
+    );
+    // vpermq ymm1, ymm2, 0x1b (VEX.W1)
+    avx(
+        &[0xc4, 0xe3, 0xfd, 0x00, 0xca, 0x1b],
+        AvxOp::Permq(0x1b),
+        xmm(1),
+        None,
+        xmm(2),
+        true,
+    );
+    // vblendvps ymm1, ymm2, ymm3, ymm4: the fourth register in imm8[7:4].
+    let blend = AvxOp::BlendV {
+        lane: Size::B32,
+        mask: 4,
+    };
+    avx(
+        &[0xc4, 0xe3, 0x6d, 0x4a, 0xcb, 0x40],
+        blend,
+        xmm(1),
+        Some(2),
+        xmm(3),
+        false,
+    );
+    // vpmaskmovq [rdi], ymm2, ymm3: a store, the mask in VEX.vvvv.
+    let store = AvxOp::MaskMov {
+        lane: Size::B64,
+        store: true,
+    };
+    let at_rdi = mem(Base::Gpr(RDI), None, 1, 0);
+    avx(
+        &[0xc4, 0xe2, 0xed, 0x8e, 0x1f],
+        store,
+        at_rdi,
+        Some(2),
+        xmm(3),
+        true,
+    );
+    // vpermq with VEX.W0, and with VEX.L0: #UD.
+    for bytes in [
+        &[0xc4, 0xe3, 0x7d, 0x00, 0xca, 0x1b][..],
+        &[0xc4, 0xe3, 0xf9, 0x00, 0xca, 0x1b],
+    ] {
+        assert_eq!(decode(bytes), Err(DecodeError::Invalid), "{bytes:02x?}");
+    }
+}
+
 /// BMI1, BMI2 (VEX) and MOVBE, bytes from the GNU assembler and objdump.
 #[test]
 fn bmi_and_movbe() {
@@ -837,9 +933,9 @@ fn bmi_and_movbe() {
     ] {
         assert_eq!(decode(bytes), Err(DecodeError::Invalid), "{bytes:02x?}");
     }
-    // An AVX-only instruction is not decoded yet: vbroadcastss xmm0, [rdi].
+    // FMA is not decoded yet: vfmadd132ps xmm0, xmm1, xmm2.
     assert!(matches!(
-        decode(&[0xc4, 0xe2, 0x79, 0x18, 0x07]),
+        decode(&[0xc4, 0xe2, 0x71, 0x98, 0xc2]),
         Err(DecodeError::Unsupported(_))
     ));
     // In compatibility mode: andn eax, ebx, ecx (VEX.W ignored).

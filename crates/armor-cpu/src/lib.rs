@@ -18,6 +18,7 @@ extern crate alloc;
 
 mod alu;
 mod avx;
+mod avx_ops;
 mod bmi;
 pub mod cpuid;
 mod f80;
@@ -304,8 +305,8 @@ fn declared(op: &Op) -> bool {
             ..
         } => Features::XSAVE,
         Op::Movbe { .. } => Features::MOVBE,
-        Op::Vex { avx2: true, .. } => Features::AVX2,
-        Op::Vex { .. } | Op::Vzero { .. } | Op::VexMxcsr { .. } => Features::AVX,
+        Op::Vex { avx2: true, .. } | Op::Avx { avx2: true, .. } => Features::AVX2,
+        Op::Vex { .. } | Op::Avx { .. } | Op::Vzero { .. } | Op::VexMxcsr { .. } => Features::AVX,
         Op::Bmi { op, .. } => match op {
             BmiOp::Andn | BmiOp::Bextr | BmiOp::Blsi | BmiOp::Blsmsk | BmiOp::Blsr => {
                 Features::BMI1
@@ -1022,6 +1023,7 @@ impl Cpu {
             Op::Int1 => return Err(Trap::Exception(Exception::Debug)),
             Op::Sse { op, dst, src } => self.sse(op, dst, src, next, mem)?,
             Op::Vex { .. } => self.vex(&insn.op, next, mem)?,
+            Op::Avx { .. } => self.avx(&insn.op, next, mem)?,
             Op::Vzero { all } => self.vzero(all),
             Op::VexMxcsr { store, mem: m } => {
                 let op = if store {
