@@ -1,6 +1,7 @@
 LIBRARY ntdll.dll
 EXPORTS
 NtAllocateVirtualMemory
+NtAllocateVirtualMemoryEx
 NtTerminateProcess
 NtReadVirtualMemory
 RtlAllocateHeap
