@@ -4333,7 +4333,24 @@ impl Translator {
             1
         };
         if !self.covered(base, disp, bytes, align) {
-            return None;
+            // A read at a constant within the guard's distance: the base's
+            // own test covers it (below the region's end, base + constant
+            // is in the region or in the guard), and the accesses near the
+            // base after it.
+            let bits = self.options.host_reads?;
+            if check != Check::Read || disp + n > REGION_GUARD {
+                return None;
+            }
+            self.flush_misaligned();
+            let slow = self.slow_path(rip, slow);
+            self.a
+                .logic_imm(Logic::Ands, Width::X, ZR, base, !((1u64 << bits) - 1))
+                .ok()?;
+            self.a.b_cond(Cond::Ne, slow);
+            self.checked.push((base, 0, 1));
+            self.access_slow = Some(slow);
+            self.mark_access();
+            return Some((base, disp as u32));
         }
         self.flush_misaligned();
         self.access_slow = Some(self.slow_path(rip, slow));

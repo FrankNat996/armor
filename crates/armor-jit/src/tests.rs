@@ -1225,6 +1225,8 @@ fn random_code_matches_the_interpreter_with_host_protection() {
     let mut rng = Rng(0x6a09_e667_f3bc_c908);
     for case in 0..6000 {
         if case == 3000 {
+            // Before concurrent mode, the plain accesses' ways too.
+            host_memory_stays_out_of_reach(&guest, &mut rng);
             guest.mem.enter_concurrent_mode();
         }
         let mut code = Vec::new();
@@ -1257,9 +1259,13 @@ fn random_code_matches_the_interpreter_with_host_protection() {
         let cpu = guest.cpu(&mut rng);
         guest.compare(&code, &cpu, 7);
     }
-    // An access near one whose region test passed needs none, until its
-    // base changes: here to host memory above the region (armor's own),
-    // which the next access must not read.
+    host_memory_stays_out_of_reach(&guest, &mut rng);
+}
+
+/// An access near one whose region test passed needs none, until its base
+/// changes: here to host memory above the region (armor's own), which the
+/// next access must not read or write. In the mode the guest is in.
+fn host_memory_stays_out_of_reach(guest: &Guest, rng: &mut Rng) {
     let host = Box::new([0x1234_5678u64; 4]);
     let host_address = host.as_ptr() as u64;
     let end = guest.mem.host_protection().expect("host protection");
@@ -1272,7 +1278,7 @@ fn random_code_matches_the_interpreter_with_host_protection() {
         ] {
             let mut code = vec![0x8b, 0x03, 0x48, 0x89, 0xcb]; // mov eax, [rbx]; mov rbx, rcx
             code.extend_from_slice(second);
-            let mut cpu = guest.cpu(&mut rng);
+            let mut cpu = guest.cpu(rng);
             cpu.regs[3] = guest.data;
             cpu.regs[1] = host_address;
             guest.compare(&code, &cpu, 8);
