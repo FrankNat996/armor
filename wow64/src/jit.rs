@@ -18,9 +18,9 @@ use armor_guest::GuestMemory;
 use armor_jit::encoder::branch_word;
 use armor_jit::translator::{
     BlockEnd, CHAINED_ENTRY, Context, EXIT_CHAIN, EXIT_INTERPRET, FLAG_TABLE, GuestInstruction,
-    HostFeatures, MAX_BLOCK_INSTRUCTIONS, Options, TARGET_ENTRIES, ends_block, enter_routine,
-    flags_routine, leave_routine, supported, supported_concurrent, target_slot, translate_block,
-    uses_mxcsr_control,
+    HostFeatures, MAX_BLOCK_INSTRUCTIONS, Options, TARGET_ENTRIES, UNCHECKED_ENTRY, ends_block,
+    enter_routine, flags_routine, leave_routine, supported, supported_concurrent, target_slot,
+    translate_block, uses_mxcsr_control,
 };
 use armor_x86::{MAX_INSTRUCTION_LEN, Mode, decode_in};
 
@@ -267,7 +267,14 @@ impl Engine {
         if self.epoch != epoch {
             return;
         }
-        let entry = code.wrapping_add(CHAINED_ENTRY);
+        // Bit 0: a jump forward, past the target's budget check.
+        let offset = if site & 1 != 0 {
+            UNCHECKED_ENTRY
+        } else {
+            CHAINED_ENTRY
+        };
+        let site = site & !1;
+        let entry = code.wrapping_add(offset);
         let word = branch_word(site as usize, entry as usize).expect("within the buffer");
         // SAFETY: the exit's `b`, in this epoch's buffer; no guest code
         // runs while the engine does.
