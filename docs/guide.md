@@ -38,7 +38,7 @@ To add a case: a C file in `tests/guest/c/` (built in three x86-64 variants, and
 ```bash
 cargo xtask app-check [id...]
 ```
-installs pinned real applications (each installer checked by SHA-256) into a throwaway data directory and runs them under Xvfb: level 1 when the application's window appears, level 3 when its output is byte-for-byte that of a native build (7-Zip's archives). `--x86-engine armor` runs the 32-bit code of Windows applications under armor's own WoW64 backend instead of FEX (ADR-0047). To add an application, add an entry to `APPS` in `xtask/src/app_check.rs`: installer URL and SHA-256, installer arguments, and the check.
+installs pinned real applications (each installer checked by SHA-256) into a throwaway data directory and runs them under Xvfb: level 1 when the application's window appears, level 3 when its output is byte-for-byte that of a native build (7-Zip's archives). `--x86-engine armor` runs the 32-bit code of Windows applications under armor's own WoW64 backend instead of FEX, `--x64-engine armor` their x86-64 code under armor's own ARM64EC emulator (ADR-0047). To add an application, add an entry to `APPS` in `xtask/src/app_check.rs`: installer URL and SHA-256, installer arguments, and the check.
 
 ## 6. Record the result
 Add `--report` to `difftest`, `app-check`, `distro-check` or `bench`: the result goes into `docs/results/<machine>.tsv` with the machine (CPU, page size, system, native or virtual), the date, the commit and the command. `cargo xtask matrix` renders the compatibility matrix and the README's summary from those files (ADR-0045). What cannot run unattended (an account, a store) goes into `docs/results/by-hand.tsv`, with how and when it was checked.

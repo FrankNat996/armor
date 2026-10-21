@@ -103,12 +103,14 @@ commands:
                                  podman containers of Fedora and Arch Linux
                                  ARM: x86-64 and i386 programs, an x86-64
                                  .deb, the Windows engine (ADR-0043)
-  app-check [--report] [--x86-engine armor|fex] [id...]
+  app-check [--report] [--x86-engine armor|fex] [--x64-engine armor|fex] [id...]
                                  install and run real applications under
                                  Xvfb: a window, or 7-Zip's archive against
                                  its ARM64 build (ADR-0045); --x86-engine
                                  armor: Windows 32-bit code under armor's
-                                 WoW64 backend instead of FEX (ADR-0047)
+                                 WoW64 backend instead of FEX (ADR-0047);
+                                 --x64-engine armor: x86-64 code under
+                                 armor's ARM64EC emulator
   matrix [--check]               render the matrix in COMPATIBILITY_MATRIX.md
                                  and README.md from docs/results/ (ADR-0045)";
 

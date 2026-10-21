@@ -61,6 +61,10 @@ pub struct AppConf {
     /// WoW64 CPU backend, `HODLL`): empty or `fex` (FEX), or `armor`
     /// (armor's own, `armor-wow64.dll`, ADR-0047).
     pub x86_engine: String,
+    /// The engine of x86-64 code in a Windows program (Hangover's ARM64EC
+    /// emulator, `HODLL64`): empty or `fex` (FEX), or `armor` (armor's
+    /// own, `armor-arm64ec.dll`, ADR-0047).
+    pub x64_engine: String,
     pub env: Vec<(String, String)>,
 }
 
@@ -84,6 +88,9 @@ pub fn render_app_conf(conf: &AppConf, reasons: &[(String, String)]) -> String {
     }
     if conf.x86_engine == "armor" {
         text.push_str("x86-engine = armor\n");
+    }
+    if conf.x64_engine == "armor" {
+        text.push_str("x64-engine = armor\n");
     }
     for (name, value) in &conf.env {
         if let Some((_, why)) = reasons.iter().find(|(n, _)| n == name) {
@@ -118,6 +125,9 @@ pub fn parse_app_conf(text: &str) -> Result<AppConf, String> {
             "host-gl" if value == "yes" || value == "no" => conf.host_gl = value == "yes",
             "x86-engine" if value == "armor" || value == "fex" => {
                 conf.x86_engine = value.to_string()
+            }
+            "x64-engine" if value == "armor" || value == "fex" => {
+                conf.x64_engine = value.to_string()
             }
             "env" => {
                 let (name, val) = value
@@ -584,7 +594,7 @@ fn wine_command(program: &Path, app: &Path, conf: &AppConf) -> Command {
         disabled.to_string()
     };
     let hodll = match x86_engine(conf) {
-        "armor" => match install_wow64_dll(&app.join("prefix")) {
+        "armor" => match install_dll(&app.join("prefix"), wow64_dll(), "armor-wow64.dll") {
             Ok(true) => "armor-wow64.dll",
             // The prefix is being made: Wine's own setup runs under FEX.
             Ok(false) => "libwow64fex.dll",
@@ -595,8 +605,21 @@ fn wine_command(program: &Path, app: &Path, conf: &AppConf) -> Command {
         },
         _ => "libwow64fex.dll",
     };
+    // Hangover's own default for x86-64 code is FEX's emulator.
+    let hodll64 = match x64_engine(conf) {
+        "armor" => match install_dll(&app.join("prefix"), arm64ec_dll(), "armor-arm64ec.dll") {
+            Ok(true) => "armor-arm64ec.dll",
+            Ok(false) => "libarm64ecfex.dll",
+            Err(why) => {
+                eprintln!("armor: armor's engine for x86-64 code is not available ({why}): FEX");
+                "libarm64ecfex.dll"
+            }
+        },
+        _ => "libarm64ecfex.dll",
+    };
     let mut defaults = vec![
         ("HODLL".to_string(), hodll.to_string()),
+        ("HODLL64".to_string(), hodll64.to_string()),
         ("WINEDLLOVERRIDES".to_string(), overrides),
         // Only the loader's errors: the missing DLLs `armor run` explains.
         ("WINEDEBUG".to_string(), "-all,err+module".to_string()),
@@ -628,6 +651,36 @@ fn x86_engine(conf: &AppConf) -> &str {
     }
 }
 
+/// The engine of a Windows program's x86-64 code:
+/// `ARMOR_WINDOWS_X64_ENGINE`, else the application's `x64-engine`, else
+/// FEX.
+fn x64_engine(conf: &AppConf) -> &str {
+    match std::env::var("ARMOR_WINDOWS_X64_ENGINE").as_deref() {
+        Ok("armor") => "armor",
+        Ok("fex") => "fex",
+        _ if conf.x64_engine == "armor" => "armor",
+        _ => "fex",
+    }
+}
+
+/// armor's ARM64EC emulator (ADR-0047): `ARMOR_ARM64EC_DLL`, else
+/// `../lib/armor/aarch64-windows/armor-arm64ec.dll` from armor's directory
+/// (the package), else `../arm64ec/armor-arm64ec.dll` (`cargo xtask
+/// arm64ec` in `target/`).
+pub fn arm64ec_dll() -> Option<PathBuf> {
+    if let Some(path) = std::env::var_os("ARMOR_ARM64EC_DLL").filter(|v| !v.is_empty()) {
+        return Some(PathBuf::from(path));
+    }
+    let exe = std::env::current_exe().ok()?;
+    let dir = exe.parent()?;
+    [
+        dir.join("../lib/armor/aarch64-windows/armor-arm64ec.dll"),
+        dir.join("../arm64ec/armor-arm64ec.dll"),
+    ]
+    .into_iter()
+    .find(|p| p.is_file())
+}
+
 /// armor's WoW64 CPU backend (ADR-0047): `ARMOR_WOW64_DLL`, else
 /// `../lib/armor/aarch64-windows/armor-wow64.dll` from armor's directory
 /// (the package), else `../wow64/armor-wow64.dll` (`cargo xtask wow64` in
@@ -646,17 +699,18 @@ pub fn wow64_dll() -> Option<PathBuf> {
     .find(|p| p.is_file())
 }
 
-/// Puts armor's WoW64 backend into the prefix's `system32`, where Wine's
-/// wow64 loads `HODLL` from (replaced when it differs); false when the
-/// prefix has no `system32` yet.
-fn install_wow64_dll(prefix: &Path) -> Result<bool, String> {
+/// Puts one of armor's Windows backends (`dll`, if found) into the
+/// prefix's `system32` as `name`, where Wine loads `HODLL` and `HODLL64`
+/// from (replaced when it differs); false when the prefix has no
+/// `system32` yet.
+fn install_dll(prefix: &Path, dll: Option<PathBuf>, name: &str) -> Result<bool, String> {
     let system32 = prefix.join("drive_c/windows/system32");
     if !system32.is_dir() {
         return Ok(false);
     }
-    let dll = wow64_dll().ok_or("armor-wow64.dll not found")?;
+    let dll = dll.ok_or(format!("{name} not found"))?;
     let bytes = fs::read(&dll).map_err(|e| format!("{}: {e}", dll.display()))?;
-    let target = system32.join("armor-wow64.dll");
+    let target = system32.join(name);
     if fs::read(&target).ok().as_deref() != Some(&bytes[..]) {
         let partial = target.with_extension("dll.new");
         fs::write(&partial, &bytes)
@@ -3508,6 +3562,11 @@ mod tests {
             "armor"
         );
         assert!(parse_app_conf("x86-engine = box64\n").is_err());
+        assert_eq!(
+            parse_app_conf("x64-engine = armor\n").unwrap().x64_engine,
+            "armor"
+        );
+        assert!(parse_app_conf("x64-engine = box64\n").is_err());
         assert!(parse_app_conf("kind = macos\n").is_err());
         assert!(parse_app_conf("dxvk = maybe\n").is_err());
         assert!(parse_app_conf("env = =x\n").is_err());
@@ -3650,6 +3709,7 @@ mod tests {
             engine: "proton".to_string(),
             host_gl: true,
             x86_engine: "armor".to_string(),
+            x64_engine: "armor".to_string(),
             env: vec![(
                 "DXVK_FILTER_DEVICE_NAME".to_string(),
                 "llvmpipe".to_string(),
