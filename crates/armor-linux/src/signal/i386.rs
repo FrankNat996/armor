@@ -11,15 +11,17 @@
 //! - old frame: pretcode, sig, sigcontext, an unused 624-byte FPU area,
 //!   the high half of the mask, and 8 bytes of return code;
 //! - FPU state above the frame: a 112-byte FSAVE header converted from
-//!   FXSAVE, then the 64-byte-aligned 512-byte FXSAVE image, whose
-//!   software-reserved bytes say how large the state is.
+//!   FXSAVE, then the 64-byte-aligned FXSAVE or XSAVE image
+//!   (`xstate.rs`), whose software-reserved bytes say how large the state
+//!   is.
 
 use armor_cpu::{Cpu, RAX, RBP, RBX, RCX, RDI, RDX, RSI, RSP, USER_DS, USER32_CS};
 use armor_mem::{AddressSpace, GuestMemory};
 
 use super::{
     ENTRY_CLEARED_FLAGS, FIX_EFLAGS, FXSAVE_SIZE, FaultContext, Pending, SA_NODEFER, SA_RESETHAND,
-    SA_RESTORER, SIGINFO_SIZE, SS_DISABLE, SS_ONSTACK, Signals, bit, field, update_host,
+    SA_RESTORER, SIGINFO_SIZE, SS_DISABLE, SS_ONSTACK, Signals, UC_FP_XSTATE, bit, field,
+    update_host, xstate,
 };
 
 /// SA_SIGINFO: the handler takes a siginfo and a ucontext (rt frame).
@@ -47,12 +49,6 @@ const FRAME_RETCODE: u64 = 724;
 /// passes its own restorer, but there for debuggers and old programs.
 const RT_RETCODE_BYTES: [u8; 8] = [0xb8, 173, 0, 0, 0, 0xcd, 0x80, 0];
 const RETCODE_BYTES: [u8; 8] = [0x58, 0xb8, 119, 0, 0, 0, 0xcd, 0x80];
-/// `_fpx_sw_bytes` in the FXSAVE image of an i386 frame on a CPU without
-/// XSAVE: magic, extended size (512 + 4 + the FSAVE header), features 0,
-/// state size 512 (✅ measured on the Xeon X5675, docs/tech/signals.md).
-const FP_XSTATE_MAGIC1: u32 = 0x4650_5853;
-const SW_RESERVED: usize = 464;
-const EXTENDED_SIZE: u32 = 512 + 4 + FREGS_SIZE as u32;
 
 fn mask32(value: u64) -> u64 {
     value & 0xffff_ffff
@@ -93,13 +89,13 @@ impl Signals {
         // FXSAVE image 64-byte aligned, the FSAVE header right below it,
         // then the frame, aligned so that ((sp + 4) & 15) == 0 on entry,
         // as after a call (Linux's get_sigframe).
-        let fx = mask32(sp.wrapping_sub(FXSAVE_SIZE) & !63);
+        let image = xstate::image(cpu, true, FREGS_SIZE as u32);
+        let fx = mask32(sp.wrapping_sub(image.len() as u64) & !63);
         let fpstate = mask32(fx.wrapping_sub(FREGS_SIZE));
         let size = if rt { RT_FRAME_SIZE } else { FRAME_SIZE };
         let frame = mask32((fpstate.wrapping_sub(size).wrapping_add(4) & !15).wrapping_sub(4));
 
         let old_mask = self.saved_mask.take().unwrap_or(self.mask);
-        let image = cpu.fx_image();
         let sigcontext = sigcontext(cpu, esp, fault, fpstate, old_mask);
         let mut bytes = vec![0u8; size as usize];
         let mut put = |at: u64, data: &[u8]| {
@@ -111,7 +107,11 @@ impl Signals {
             put(8, &((frame + RT_INFO) as u32).to_le_bytes());
             put(12, &((frame + RT_UC) as u32).to_le_bytes());
             put(RT_INFO, &siginfo32(&pending.info));
-            // uc_flags 0 (no XSAVE), uc_link 0, then the alternate stack.
+            // uc_flags: UC_FP_XSTATE with an XSAVE image, else 0 (✅ Xeon
+            // X5675, without XSAVE); uc_link 0; then the alternate stack.
+            if image.len() as u64 != FXSAVE_SIZE {
+                put(RT_UC, &(UC_FP_XSTATE as u32).to_le_bytes());
+            }
             let stack_flags = if on_stack {
                 SS_ONSTACK
             } else if self.alt_stack.disabled {
@@ -134,12 +134,9 @@ impl Signals {
             put(FRAME_RETCODE, &RETCODE_BYTES);
         }
 
-        mem.write(fpstate, &fregs_header(&image)).map_err(|_| ())?;
-        let mut image = image;
-        image[SW_RESERVED..SW_RESERVED + 4].copy_from_slice(&FP_XSTATE_MAGIC1.to_le_bytes());
-        image[SW_RESERVED + 4..SW_RESERVED + 8].copy_from_slice(&EXTENDED_SIZE.to_le_bytes());
-        image[SW_RESERVED + 16..SW_RESERVED + 20]
-            .copy_from_slice(&(FXSAVE_SIZE as u32).to_le_bytes());
+        let legacy: &[u8; FXSAVE_SIZE as usize] =
+            image[..FXSAVE_SIZE as usize].try_into().expect("512 bytes");
+        mem.write(fpstate, &fregs_header(legacy)).map_err(|_| ())?;
         mem.write(fx, &image).map_err(|_| ())?;
         mem.write(frame, &bytes).map_err(|_| ())?;
         cpu.reset_fpu();
@@ -203,14 +200,10 @@ impl Signals {
         let mask = if rt { mask } else { mask | word(80) };
         let fpstate = word(76);
         if fpstate != 0 {
-            // The FXSAVE image after the FSAVE header ⚠️: Linux also takes
-            // the x87 environment and registers of the header, which a
-            // handler could have changed.
-            let mut image = [0u8; FXSAVE_SIZE as usize];
-            mem.read(fpstate + FREGS_SIZE, &mut image)
-                .map_err(|e| format!("{name}: unreadable FPU state ({e})"))?;
-            cpu.load_fx_image(&image)
-                .map_err(|what| format!("{name}: {what}"))?;
+            // The FXSAVE or XSAVE image after the FSAVE header ⚠️: Linux
+            // also takes the x87 environment and registers of the header,
+            // which a handler could have changed.
+            xstate::restore(cpu, mem, fpstate + FREGS_SIZE, name)?;
         }
         // gs and fs as the frame has them: a selector that names no segment
         // makes the return fail, as loading it fails in Linux.

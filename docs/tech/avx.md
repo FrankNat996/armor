@@ -1,13 +1,13 @@
 # AVX and AVX2 (x86-64-v3)
 
-**Roadmap:** M11, item "AVX and AVX2 (x86-64-v3)". **Code:** `crates/armor-cpu/src/cpuid.rs` (`Features`), `crates/armor-cpu/src/xsave.rs`, the decoder in `crates/armor-x86`. **Tests:** `tests/guest/asm/xsave/`, `faults/xgetbv_undeclared`, unit tests in `armor-cpu` and `armor-x86`.
+**Roadmap:** M11, item "AVX and AVX2 (x86-64-v3)". **Code:** `crates/armor-cpu/src/cpuid.rs` (`Features`), `crates/armor-cpu/src/xsave.rs`, `crates/armor-linux/src/signal/xstate.rs`, the decoder in `crates/armor-x86`. **Tests:** `tests/guest/asm/xsave/`, `faults/xgetbv_undeclared`, `c/signal_xstate`, unit tests in `armor-cpu`, `armor-x86` and `armor-linux`.
 
 Every statement is marked ✅ (verified, with how) or ⚠️ (to verify, with how).
 
 ## Status
 - ✅ By default armor's CPUID is unchanged: it declares x86-64-v2 and nothing of v3 (`basic/cpuid` in `difftest`, identical to qemu's `qemu64` model, `tech/cpuid.md`).
-- ✅ Implemented, declared only on request (`ARMOR_CPU_FEATURES`, below): XSAVE. That is `xgetbv`, `xsave`, `xrstor`, CPUID leaf 0xD with XCR0 = x87 | SSE, and the upper halves of the ymm registers in the CPU state (`Cpu::ymm_hi`), which no instruction changes yet.
-- Not yet: signal frames in the XSAVE format, the VEX decoder, BMI1, BMI2, LZCNT, MOVBE, AVX, AVX2, FMA, F16C, and their JIT translation. The order of the work is in "Recommended order" at the end.
+- ✅ Implemented, declared only on request (`ARMOR_CPU_FEATURES`, below): XSAVE. That is `xgetbv`, `xsave`, `xrstor`, CPUID leaf 0xD with XCR0 = x87 | SSE, signal frames in the XSAVE format (`tech/signals.md`, "The FPU state with XSAVE"), and the upper halves of the ymm registers in the CPU state (`Cpu::ymm_hi`), which no instruction changes yet.
+- Not yet: the VEX decoder, BMI1, BMI2, LZCNT, MOVBE, AVX, AVX2, FMA, F16C, and their JIT translation. The order of the work is in "Recommended order" at the end.
 - The full x86-64-v3 set will be declared by default only when all of it works (psABI: v3 is AVX, AVX2, BMI1, BMI2, F16C, FMA, LZCNT, MOVBE and OSXSAVE together, section 2).
 
 ## Declaring features on request: `ARMOR_CPU_FEATURES`
@@ -203,7 +203,7 @@ Sizes are rough estimates (⚠️, from the size of the comparable SSE code: `ar
 4. **LZCNT/TZCNT semantics.** ✅ F3 0F BC/BD run as `bsf`/`bsr` on purpose (`decoder.rs`, `docs/tech/cpuid.md`). Declaring BMI1/LZCNT changes their result for a zero source (the operand size) and their flags (CF, ZF). glibc's AVX2 functions use `tzcnt` (✅ the `-cpu max` trace above: 11). ⚠️ Size: small; the JIT translates `bsf`/`bsr` (`jit.md`) and will need the new forms too, depending on the declared features (hence the features in the cache key).
 5. **MOVBE** (0F 38 F0/F1 without F2): ✅ not decoded (`maps.rs` handles only the F2 forms, crc32). ⚠️ Size: small.
 6. **XGETBV, XSAVE, XRSTOR.** ✅ Done (section "XSAVE"). `xsaveopt` and `xsavec` are not needed while CPUID does not declare them: glibc then uses `xsave` (✅ traces above).
-7. **Signal frames.** ✅ The x86_64 frame has a 512-byte FXSAVE image (`crates/armor-linux/src/signal.rs`; `docs/tech/signals.md`); the i386 one has MAGIC1 with `xfeatures` 0 (`signal/i386.rs`). What is needed with XSAVE declared, as Linux does (⚠️ list taken from FEX's `UContext.h:36-137` and the x86 uapi header `asm/sigcontext.h`; to check against the kernel's `arch/x86/kernel/fpu/signal.c`): an XSAVE image with the header and YMM_Hi128 at 576; `_fpx_sw_bytes` with MAGIC1, `extended_size`, `xfeatures`, `xstate_size`; MAGIC2 at the end; `uc_flags |= UC_FP_XSTATE`; `rt_sigreturn` restoring the components; a larger frame.
+7. **Signal frames.** ✅ Done for XSAVE with XCR0 = x87 | SSE (`signal/xstate.rs`, `tech/signals.md`): the XSAVE image, `_fpx_sw_bytes`, MAGIC2, `UC_FP_XSTATE`, and `rt_sigreturn` restoring the components, compared with qemu by `c/signal_xstate`. With AVX the same code saves YMM_Hi128 at 576 (832 bytes): ⚠️ to test with the first AVX instructions.
    - ✅ The auxiliary vector has no `AT_MINSIGSTKSZ` (`crates/armor-linux/src/loader.rs`: only `AT_HWCAP`, `AT_HWCAP2`). ⚠️ Whether glibc's `sysconf(_SC_MINSIGSTKSZ)` then uses leaf 0xD: read glibc. ⚠️ Size: 150–300 lines.
 8. **Interpreter semantics.** VEX.128 forms of the SSE ops already implemented (most of the work is reusing them with three operands). Beyond those:
    - 256-bit forms (two lanes of 128);
@@ -224,7 +224,7 @@ Sizes are rough estimates (⚠️, from the size of the comparable SSE code: `ar
     - What is needed: asm tests per family; a C test with `-mavx2 -mfma`, built by `build-guest` (⚠️ check that the cross-compiler accepts it); lockstep for the JIT; an AVX2 machine for `difftest --oracle`, since the current one (Xeon X5675) has no AVX (`docs/testing.md`) ⚠️. Without that machine, qemu's mistakes would go unnoticed (they already did for SSE: `sse/mxcsr_hardware`, roadmap M4).
 
 ## Recommended order
-1. **XGETBV, XSAVE/XRSTOR, leaf 0xD, `ymm_hi` and signal frames with xstate.** Without these, the AVX bit cannot be declared (OSXSAVE and XCR0 are part of v3's definition, psABI ✅). They are also what glibc runs first, on every lazy-bound call. ✅ Testable before any AVX instruction exists: XSAVE and OSXSAVE declared with XCR0 = 0x3, compared in `difftest` against `qemu64,+xsave` (done, except the signal frames).
+1. **XGETBV, XSAVE/XRSTOR, leaf 0xD, `ymm_hi` and signal frames with xstate.** Without these, the AVX bit cannot be declared (OSXSAVE and XCR0 are part of v3's definition, psABI ✅). They are also what glibc runs first, on every lazy-bound call. ✅ Done, tested before any AVX instruction exists: XSAVE and OSXSAVE declared with XCR0 = 0x3, compared in `difftest` against `qemu64,+xsave`.
 2. **VEX decoder with BMI1, BMI2, LZCNT, MOVBE** (general registers only, no ymm). They are small, they are what zstd's fast paths use (✅ section 1), and they are part of glibc's v3 functions (✅ `tzcnt`, `movbe` in the `-cpu max` trace). They must not be declared before AVX if armor follows FEX, which declares all of them together; `ARMOR_CPU_FEATURES` declares them one by one for testing.
 3. **VEX.128 forms of the SSE ops already implemented**, then **256-bit AVX/AVX2**, then **FMA** and **F16C**, in the interpreter. Only when all of v3 is there, declare it in CPUID by default (glibc's `x86-64-v3` level and the `-march=x86-64-v3` programs need the whole set; ✅ psABI).
 4. **JIT**: translate first what real programs leave to the interpreter: `vmovdqu`/`vmovdqa`, `vpcmpeqb`, `vpmovmskb`, `vzeroupper` and `vpxor` dominate glibc's functions (✅ `-cpu max` trace); `vfmadd*`, `vshufps` and `vcvtph2ps` dominate XnView (✅ objdump).

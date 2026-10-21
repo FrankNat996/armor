@@ -58,13 +58,13 @@ State as of 2026-10-12 (with additions of 2026-10-14, marked): **delivery to the
 ## The frame (x86_64, Linux's `struct rt_sigframe`)
 From the guest's stack (or from the alternate stack with `SA_ONSTACK`), downwards:
 1. 128 bytes of red zone (not with the alternate stack);
-2. the FPU state, 512 bytes aligned to 64: an FXSAVE image (`Cpu::fx_image`), as Linux does on a CPU without XSAVE (armor's CPU model has no XSAVE, ADR-0010);
+2. the FPU state aligned to 64 (`signal/xstate.rs`): by default 512 bytes, an FXSAVE image (`Cpu::fx_image`), as Linux does on a CPU without XSAVE (armor's default CPU model has no XSAVE, ADR-0010; ⚠️ Linux also writes `_fpx_sw_bytes` with the magic and `xfeatures` 0 there, as in the i386 frame below, while armor leaves zeros: not measured on the Xeon for 64-bit); with XSAVE declared (`ARMOR_CPU_FEATURES=+xsave`, `tech/avx.md`), the XSAVE image of the XCR0 components and MAGIC2, "The FPU state with XSAVE" below;
 3. the frame, aligned so that rsp + 8 is a multiple of 16, as after a `call`:
 
 | Offset | Field |
 |---|---|
 | 0 | `pretcode` = `sa_restorer` (mandatory on x86_64: without `SA_RESTORER` → SIGSEGV) |
-| 8 | `uc_flags` = 6 (`UC_SIGCONTEXT_SS` \| `UC_STRICT_RESTORE_SS`) ⚠️ |
+| 8 | `uc_flags` = 6 (`UC_SIGCONTEXT_SS` \| `UC_STRICT_RESTORE_SS`) ⚠️, 7 with `UC_FP_XSTATE` when the FPU state is an XSAVE image (✅ the bit as qemu with `+xsave`, which leaves out the other two) |
 | 16 | `uc_link` = 0 |
 | 24 | `uc_stack` (sp, flags, size of the alternate stack) |
 | 48 | `uc_mcontext` = `struct sigcontext`, 256 bytes: r8–r15, rdi, rsi, rbp, rbx, rdx, rax, rcx, rsp, rip, eflags, cs (0x33), gs, fs, ss (0x2b), err, trapno, oldmask, cr2, pointer to the FPU state |
@@ -79,7 +79,7 @@ On entry to the handler: rdi = number, rsi = &siginfo, rdx = &ucontext, rax = 0,
 
 ## The i386 frame (ADR-0029, since 2026-10-14)
 A 32-bit process on an x86-64 kernel receives the frames of `ia32_setup_rt_frame` (with `SA_SIGINFO`) and `ia32_setup_frame` (without), in `crates/armor-linux/src/signal/i386.rs`. From the stack (or from the alternate stack), downwards, without a red zone:
-1. the 512-byte FXSAVE image aligned to 64, with the software-reserved bytes (464–511) of `_fpx_sw_bytes`: magic `0x46505853`, `extended_size` 628 (512 + 4 + 112), `xfeatures` 0, `xstate_size` 512 ✅ Xeon;
+1. the 512-byte FXSAVE image aligned to 64, with the software-reserved bytes (464–511) of `_fpx_sw_bytes`: magic `0x46505853`, `extended_size` 628 (512 + 4 + 112), `xfeatures` 0, `xstate_size` 512 ✅ Xeon. With XSAVE declared, the XSAVE image and MAGIC2 as in 64-bit mode, with `extended_size` 692 (576 + 4 + 112) and `uc_flags` `UC_FP_XSTATE` in the rt frame ⚠️ (Linux's `ia32_setup_rt_frame` and `save_sw_bytes` as recalled, not read; qemu-i386 has the frame of a 32-bit kernel, so nothing compares it; unit test in `xstate.rs`);
 2. right below it, the 112-byte **FSAVE header** that the kernel converts from the FXSAVE state (`convert_from_fxsr`): `cw` and `sw` with the upper half at `0xffff`, the full tag word computed from the registers, `cssel` = 0x23 (the process's `cs`), `datasel` = `0xffff002b`, the 8 10-byte registers, `status` = sw and `magic` = 0 (FXSR format) ✅ Xeon (`c32/signal_context`). FIP and FDP are 0: armor does not keep them. The `fpstate` pointer of the `sigcontext` points here;
 3. the frame, aligned so that `(esp + 4) & 15` is 0 on entry, as after a `call`.
 
@@ -87,13 +87,20 @@ A 32-bit process on an x86-64 kernel receives the frames of `ia32_setup_rt_frame
 **Old frame** (732 bytes): `pretcode`, the number, `sigcontext_32`, 624 unused bytes, the upper half of the mask (the lower half is in `oldmask`), return code (`popl %eax; movl $119, %eax; int $0x80`). glibc uses it for handlers without `SA_SIGINFO`, returning with `sigreturn`.
 **`sigcontext_32`** (88 bytes): gs, fs, es, ds (32-bit selectors: gs the TLS one, 0x63; es and ds 0x2b), edi, esi, ebp, esp, ebx, edx, ecx, eax, trapno, err, eip, cs (0x23), eflags, esp at the signal, ss (0x2b), `fpstate`, `oldmask`, cr2 ✅ Xeon.
 On entry: eax = number, edx = &info and ecx = &uc (for `-mregparm=3` handlers; 0 and 0 in the old frame), esp = frame, eip = handler; TF, DF, RF cleared; initial FPU as in 64-bit.
-**`rt_sigreturn`/`sigreturn`** (173 and 119): the frame is 4 or 8 bytes below esp; they restore the registers, the modifiable eflags, gs and fs (a selector that does not name a segment terminates with SIGSEGV), the mask and the FXSAVE image ⚠️ (Linux also takes the x87 environment and the registers of the FSAVE header, which a handler might have changed; armor does not).
+**`rt_sigreturn`/`sigreturn`** (173 and 119): the frame is 4 or 8 bytes below esp; they restore the registers, the modifiable eflags, gs and fs (a selector that does not name a segment terminates with SIGSEGV), the mask and the FXSAVE or XSAVE image (as in 64-bit mode, below) ⚠️ (Linux also takes the x87 environment and the registers of the FSAVE header, which a handler might have changed; armor does not).
 ✅ `c32/signals32` (`qemu-i386` and Xeon): `kill` and `raise` with `SA_SIGINFO`, a handler without `SA_SIGINFO` (old frame), `sa_mask`, `SA_RESETHAND`, a signal blocked and delivered on unblocking, SIGSEGV with `si_addr` and `eip` moved, SIGFPE and `siglongjmp`, SIGILL, alternate stack, x87/SSE state restored after a handler that changes it. `c32/signals_async`: timer (i386 `setitimer`), `pause`, interrupted and restarted syscalls, `rt_sigsuspend`.
 
 ## `rt_sigreturn`
 It reads the frame at rsp (the handler's `ret` has already removed `pretcode`), restores all registers, only the modifiable RFLAGS bits (AC, OF, DF, TF, SF, ZF, AF, PF, CF, RF), the FPU state from the pointer (if not null) and the mask. An unreadable frame or an FPU state that armor does not support terminates the guest with SIGSEGV and a message.
 
+## The FPU state with XSAVE (since 2026-10-21)
+With XSAVE declared (`ARMOR_CPU_FEATURES=+xsave`, `tech/avx.md`) the FPU state of a frame follows the x86 uapi header `asm/sigcontext.h` (`struct _xstate`, `_fpx_sw_bytes`, `FP_XSTATE_MAGIC1/2`), in `crates/armor-linux/src/signal/xstate.rs`:
+- the XSAVE image of every XCR0 component (`Cpu::xsave_image`, 576 bytes with XCR0 = x87 | SSE), its header zeroed but XSTATE_BV = XCR0, then FP_XSTATE_MAGIC2 (`0x46505845`) at offset `xstate_size`; the area (580 bytes) is aligned to 64 below the red zone, the frame below it;
+- `_fpx_sw_bytes` at 464: magic1 `0x46505853`, `extended_size` = `xstate_size` + 4 (+ 112 in the i386 frame), `xfeatures` = XCR0, `xstate_size` 576;
+- ✅ `c/signal_xstate` (also `c-pie/`, `c-dyn/`, run with `+xsave`) compares with qemu: `UC_FP_XSTATE`, the 64-byte alignment, the area right below the red zone, the software bytes (580, 3, 576), MAGIC2, XSTATE_BV 3 with the rest of the header zero, the saved xmm7 and MXCSR, and what `rt_sigreturn` restores: a changed xmm7 and MXCSR, XSTATE_BV without SSE (xmm to 0), magic1 or MAGIC2 damaged (the FXSAVE part only). Identical with the interpreter and the JIT (2026-10-21).
+- **`rt_sigreturn`** (`xstate::restore`), as Linux's `__fpu_restore_sig` and `check_xstate_in_sigframe` as recalled ⚠️ (not read here): if magic1 is wrong, `xstate_size` is outside 576..=XCR0's size or above `extended_size`, or MAGIC2 is missing at `xstate_size`, only the FXSAVE image is loaded and the other components go to their initial state; otherwise the components in `xfeatures` & XCR0 are restored as `xrstor` does (from the image if their XSTATE_BV bit is set, else initial) and the others go to their initial state. A header `xrstor` refuses or reserved MXCSR bits: SIGSEGV.
+- ⚠️ Where qemu differs from Linux (as recalled), so `c/signal_xstate` leaves them out: qemu's `uc_flags` is 1 (Linux 7); qemu puts the siginfo right below the FPU state (Linux, and armor: 16 bytes lower, `round_down(fpstate - 440, 16) - 8` for the frame); an `xfeatures` without SSE leaves the xmm registers as the image has them under qemu, while Linux (and armor) set them to their initial state. How to verify: the same program on an x86-64 machine with XSAVE (the Xeon X5675 has none).
+
 ## Not yet
 - Stop and continue signals (SIGTSTP & co.) with a handler: they behave like the others; without a handler the host kernel handles them, which stops armor.
 - `signalfd`: not yet required by a measured program (`rt_sigtimedwait` since 2026-10-14, above).
-- The XSAVE extended state in the frame: the CPU model has no XSAVE.

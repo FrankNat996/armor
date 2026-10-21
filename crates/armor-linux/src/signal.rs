@@ -15,8 +15,9 @@
 //!   mask, minus the signals armor needs itself.
 //! - **Delivery** builds the x86_64 `rt_sigframe` on the guest stack:
 //!   return address (`sa_restorer`), `ucontext` with the registers, the
-//!   `siginfo`, and the FPU state as a 512-byte FXSAVE image, as Linux does
-//!   on a CPU without XSAVE. `rt_sigreturn` reads it back.
+//!   `siginfo`, and the FPU state: a 512-byte FXSAVE image as Linux writes
+//!   on a CPU without XSAVE, or with XSAVE declared an XSAVE image
+//!   (`xstate.rs`). `rt_sigreturn` reads it back.
 //!
 //! Layouts: the kernel's `struct rt_sigframe`, `struct ucontext` and
 //! `struct sigcontext` for x86_64 (docs/tech/signals.md).
@@ -32,6 +33,7 @@ use armor_mem::{AddressSpace, GuestMemory};
 use armor_x86::{DecodeError, Mode};
 
 mod i386;
+mod xstate;
 pub use i386::siginfo32;
 
 pub const NSIG: u64 = 64;
@@ -82,6 +84,8 @@ const FXSAVE_SIZE: u64 = 512;
 const RED_ZONE: u64 = 128;
 /// UC_SIGCONTEXT_SS | UC_STRICT_RESTORE_SS, as Linux sets on x86_64.
 const UC_FLAGS_VALUE: u64 = 0x6;
+/// UC_FP_XSTATE: the FPU state is an XSAVE image (`xstate.rs`).
+const UC_FP_XSTATE: u64 = 0x1;
 const USER_CS: u16 = 0x33;
 const USER_SS: u16 = 0x2b;
 
@@ -614,7 +618,8 @@ impl Signals {
         };
         // FPU state, 64-byte aligned, then the frame, so that the handler
         // starts with rsp + 8 aligned to 16, as after a call.
-        sp = sp.wrapping_sub(FXSAVE_SIZE) & !63;
+        let fpu = xstate::image(cpu, false, 0);
+        sp = sp.wrapping_sub(fpu.len() as u64) & !63;
         let fpstate = sp;
         let frame = (sp.wrapping_sub(FRAME_SIZE) & !15).wrapping_sub(8);
 
@@ -663,7 +668,12 @@ impl Signals {
             bytes[at as usize..at as usize + data.len()].copy_from_slice(data);
         };
         put(0, &restorer.to_le_bytes());
-        put(UC_FLAGS, &UC_FLAGS_VALUE.to_le_bytes());
+        let uc_flags = if fpu.len() as u64 == FXSAVE_SIZE {
+            UC_FLAGS_VALUE
+        } else {
+            UC_FLAGS_VALUE | UC_FP_XSTATE
+        };
+        put(UC_FLAGS, &uc_flags.to_le_bytes());
         put(UC_LINK, &0u64.to_le_bytes());
         let stack_flags = if on_stack {
             SS_ONSTACK
@@ -679,7 +689,7 @@ impl Signals {
         put(UC_SIGMASK, &old_mask.to_le_bytes());
         put(FRAME_INFO, &pending.info);
 
-        mem.write(fpstate, &cpu.fx_image()).map_err(|_| ())?;
+        mem.write(fpstate, &fpu).map_err(|_| ())?;
         mem.write(frame, &bytes).map_err(|_| ())?;
         // The handler starts with the initial floating-point state; the
         // frame keeps the interrupted one for sigreturn.
@@ -725,11 +735,7 @@ impl Signals {
         let reg = |i: u64| word(sc + i * 8);
         let fpstate = word(sc + 184);
         if fpstate != 0 {
-            let mut image = [0u8; FXSAVE_SIZE as usize];
-            mem.read(fpstate, &mut image)
-                .map_err(|e| format!("rt_sigreturn: unreadable FPU state ({e})"))?;
-            cpu.load_fx_image(&image)
-                .map_err(|what| format!("rt_sigreturn: {what}"))?;
+            xstate::restore(cpu, mem, fpstate, "rt_sigreturn")?;
         }
         for (i, r) in [
             R8, R9, R10, R11, R12, R13, R14, R15, RDI, RSI, RBP, RBX, RDX, RAX, RCX, RSP,
