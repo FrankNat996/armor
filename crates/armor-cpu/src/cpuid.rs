@@ -47,9 +47,10 @@ impl Features {
 
     /// The names `parse` accepts, qemu's (`qemu-x86_64 -cpu help`): only
     /// features armor implements.
-    const NAMES: [(&'static str, Features); 6] = [
+    const NAMES: [(&'static str, Features); 7] = [
         ("xsave", Features::XSAVE),
         ("avx", Features::AVX),
+        ("avx2", Features::AVX2),
         ("bmi1", Features::BMI1),
         ("bmi2", Features::BMI2),
         ("abm", Features::LZCNT),
@@ -88,6 +89,9 @@ impl Features {
         // could use it (qemu then raises #UD on xgetbv).
         if features.contains(Features::AVX) && !features.contains(Features::XSAVE) {
             return Err("CPU feature `avx` needs `xsave`".into());
+        }
+        if features.contains(Features::AVX2) && !features.contains(Features::AVX) {
+            return Err("CPU feature `avx2` needs `avx`".into());
         }
         Ok(features)
     }
@@ -208,8 +212,13 @@ pub fn query_with(features: Features, leaf: u32, subleaf: u32) -> [u32; 4] {
         // MONITOR/MWAIT leaf: only the extension bits.
         5 => [0, 0, 3, 0],
         // Structured extended features, subleaf 0 (the only one): on
-        // request BMI1 (ebx bit 3) and BMI2 (bit 8).
-        7 if subleaf == 0 => [0, bit(Features::BMI1, 3) | bit(Features::BMI2, 8), 0, 0],
+        // request BMI1 (ebx bit 3), AVX2 (bit 5) and BMI2 (bit 8).
+        7 if subleaf == 0 => [
+            0,
+            bit(Features::BMI1, 3) | bit(Features::AVX2, 5) | bit(Features::BMI2, 8),
+            0,
+            0,
+        ],
         // Extended topology: one thread per core, one core.
         0xb => match subleaf {
             0 => [0, 1, 0x100, 0],
@@ -364,6 +373,10 @@ mod tests {
         assert_eq!(query_with(f, 0xd, 3), [0; 4]);
         assert_eq!(xcr0(f), 7);
         assert!(Features::parse("+avx").is_err());
+        // ✅ `+avx2`: leaf 7 ebx 0x20.
+        let f = Features::parse("+xsave,+avx,+avx2").unwrap();
+        assert_eq!(query_with(f, 7, 0)[1], 0x20);
+        assert!(Features::parse("+xsave,+avx2").is_err());
     }
 
     #[test]
