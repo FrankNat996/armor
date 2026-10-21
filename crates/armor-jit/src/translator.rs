@@ -4040,6 +4040,9 @@ impl Translator {
         rip: u64,
         slow: &mut Option<Label>,
     ) -> Emit {
+        if aligned && self.options.host_reads.is_some() {
+            return self.check_aligned(check, 16, 16, rip, slow);
+        }
         if aligned {
             let slow = self.slow_path(rip, slow);
             self.a.logic_imm(Logic::Ands, Width::X, ZR, ADDR, 15)?;
@@ -5159,6 +5162,20 @@ impl Translator {
     /// take the slow path too, so that the interpreter invalidates the
     /// translated code (self-modifying code).
     fn check(&mut self, check: Check, bytes: u32, rip: u64, slow: &mut Option<Label>) -> Emit {
+        self.check_aligned(check, bytes, 1, rip, slow)
+    }
+
+    /// `check`, for an access the instruction requires aligned to
+    /// `required` bytes (#GP otherwise, from the interpreter): with host
+    /// protection one test covers both, as the two go to the slow path.
+    fn check_aligned(
+        &mut self,
+        check: Check,
+        bytes: u32,
+        required: u32,
+        rip: u64,
+        slow: &mut Option<Label>,
+    ) -> Emit {
         self.flush_misaligned();
         let slow = self.slow_path(rip, slow);
         // ADR-0046: the host checks reads below the guest's region's end;
@@ -5173,7 +5190,8 @@ impl Translator {
                 bytes.next_power_of_two()
             } else {
                 1
-            };
+            }
+            .max(required);
             let here = self.a.len();
             // An address known now: the test is decided now.
             if let Some((value, at)) = self.const_address.take()
@@ -5196,12 +5214,24 @@ impl Translator {
                     self.known_aligned = align > 1;
                     return Ok(());
                 }
-                let tested = if bytes > 1 && (check == Check::Write || self.options.concurrent) {
-                    align
-                } else {
-                    1
-                };
-                self.checked.push((base, disp, tested));
+                // The alignment proven: only a required one, whose
+                // misaligned case goes to the slow path (a write's or an
+                // ordered read's goes on out of line).
+                self.checked.push((base, disp, required));
+            }
+            if required > 1 {
+                // Misaligned or outside: the interpreter (#GP, or the
+                // region). An aligned access cannot cross a page.
+                self.a.logic_imm(
+                    Logic::Ands,
+                    Width::X,
+                    ZR,
+                    ADDR,
+                    outside | u64::from(required - 1),
+                )?;
+                self.a.b_cond(Cond::Ne, slow);
+                self.known_aligned = true;
+                return Ok(());
             }
             if check == Check::Read && bytes > 1 && self.options.concurrent {
                 // Ordered loads need alignment: one test for both, the

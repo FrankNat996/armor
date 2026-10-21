@@ -1424,11 +1424,15 @@ fn region_tests_cover_nearby_accesses() {
     let load_8 = [0x8b, 0x43, 0x08]; // mov eax, [rbx+8]
     let store_4 = [0x89, 0x4b, 0x04]; // mov [rbx+4], ecx
     let store_12 = [0x89, 0x4b, 0x0c]; // mov [rbx+12], ecx
-    // Near: one test. A read tests no alignment, so a write after it
-    // tests again; a write's test covers reads and aligned writes.
+    // Near: one test. A write needs its alignment proven, and neither a
+    // read's test nor a write's proves it (a misaligned write goes on out
+    // of line): a write tests again; a write's test covers reads.
     assert_eq!(tests(&[&load, &load_8]), 1);
     assert_eq!(tests(&[&load, &load_8, &store_4]), 2);
-    assert_eq!(tests(&[&store_4, &load, &load_8, &store_12]), 1);
+    assert_eq!(tests(&[&store_4, &load, &load_8, &store_12]), 2);
+    // movdqa's required alignment is proven (misaligned: the slow path):
+    // movaps to the same address after it needs no test.
+    assert_eq!(tests(&[&[0x66, 0x0f, 0x6f, 0x03], &[0x0f, 0x29, 0x0b]]), 1);
     // rbx written: the test again.
     assert_eq!(tests(&[&load, &[0x48, 0x89, 0xcb], &load_8]), 2);
     // add rbx, 0x9000, then [rbx+0x9000]: 0x12000 from the first.

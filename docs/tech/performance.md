@@ -629,3 +629,5 @@ Startups of real programs of the test root (`target/guest/rootfs`), best of 5, w
 
 **Scalar floating point** (`float`, 2026-10-21; `jit.md`, "Operands known not to be denormal"): without the denormal tests, or without the underflow tests (builds made to measure, not modes of armor), 136 ms instead of 186; with the operands known not to be denormal skipping their tests, 167 ms (best of 5; box64 135).
 
+**SSE with required alignment** (`simd`, 2026-10-21; `jit.md`, "Required alignment in the region's test"): one test instead of two for each aligned 16-byte access, and the alignment proven for the accesses near it: 128 → 84 ms (box64 92).
+
