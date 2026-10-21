@@ -2232,6 +2232,117 @@ fn dump_translation() {
     );
 }
 
+/// Scalar floating point where `Translator::normal` skips the denormal
+/// tests: chains of operations on denormals, results that underflow to
+/// denormals, zeros and ±the smallest normal number, conversions, copies,
+/// zeroing and comparisons, at both widths; MXCSR (DE, UE) and the
+/// results compared with the interpreter.
+#[test]
+fn denormal_tests_skipped_only_where_known() {
+    let guest = Guest::new();
+    let mut rng = Rng(0x5851_f42d_4c95_7f2d);
+    let doubles = [
+        0u64,
+        0x8000_0000_0000_0000,
+        1,                     // the smallest denormal
+        0x000f_ffff_ffff_ffff, // the largest denormal
+        0x0010_0000_0000_0000, // the smallest normal
+        0x2010_0000_0000_0000, // 2^-510: squares to a denormal
+        0x1ff0_0000_0000_0000, // 2^-512
+        0x3ff0_0000_0000_0000, // 1
+        0xbff8_0000_0000_0000, // -1.5
+        0x4340_0000_0000_0000, // 2^53
+        0x7ff0_0000_0000_0000, // infinity
+        0x0000_0000_0080_0000, // a single's smallest normal in the low half
+        0x0000_0000_0000_0001,
+        0x2000_0000_0000_0000, // 2^-511
+        // Their differences with the smallest normals are denormal.
+        0x0010_0000_0000_0001,
+        0x8010_0000_0000_0000,
+        0x0000_0000_0080_0001,
+        0x0000_0000_8080_0000,
+    ];
+    // (prefix, opcode): scalar operations, then the others.
+    let ops: &[(u8, u8)] = &[
+        (0xf2, 0x58),
+        (0xf2, 0x59),
+        (0xf2, 0x5c),
+        (0xf2, 0x5e),
+        (0xf2, 0x51),
+        (0xf2, 0x5d),
+        (0xf2, 0x5f),
+        (0xf3, 0x58),
+        (0xf3, 0x59),
+        (0xf3, 0x5e),
+        (0xf3, 0x51),
+        (0xf2, 0x5a),
+        (0xf3, 0x5a),
+        (0x66, 0x28),
+        (0xf2, 0x10),
+        (0xf3, 0x10),
+        (0x66, 0x57),
+        (0x66, 0x2e),
+        (0xf2, 0x2a),
+        (0xf3, 0x5d),
+    ];
+    for round in 0..3000u64 {
+        let mut code = Vec::new();
+        for n in 0..4u8 {
+            // mov rax, imm64; movq xmmN, rax
+            code.extend([0x48, 0xb8]);
+            code.extend(rng.pick(&doubles).to_le_bytes());
+            code.extend([0x66, 0x48, 0x0f, 0x6e, 0xc0 | n << 3]);
+        }
+        for _ in 0..1 + rng.below(10) {
+            let (prefix, opcode) = ops[rng.below(ops.len() as u64) as usize];
+            let (d, s) = (rng.below(4) as u8, rng.below(4) as u8);
+            // cvtsi2sd's source is eax (a small integer).
+            let modrm = 0xc0 | d << 3 | if opcode == 0x2a { 0 } else { s };
+            code.extend([prefix, 0x0f, opcode, modrm]);
+        }
+        let mut cpu = guest.cpu(&mut rng);
+        cpu.regs[0] = rng.below(5);
+        guest.compare(&code, &cpu, round);
+    }
+    // No denormal to start with (DE is sticky): the result of an exact
+    // subtraction, addition, multiplication or conversion is one, then an
+    // operand.
+    let load = |code: &mut Vec<u8>, n: u8, v: u64| {
+        code.extend([0x48, 0xb8]);
+        code.extend(v.to_le_bytes());
+        code.extend([0x66, 0x48, 0x0f, 0x6e, 0xc0 | n << 3]);
+    };
+    for (prefix, op, a, b) in [
+        (
+            0xf2u8,
+            0x5cu8,
+            0x0010_0000_0000_0001u64,
+            0x0010_0000_0000_0000u64,
+        ), // subsd
+        (0xf2, 0x58, 0x0010_0000_0000_0001, 0x8010_0000_0000_0000), // addsd
+        (0xf2, 0x59, 0x2010_0000_0000_0000, 0x2000_0000_0000_0000), // mulsd
+        (0xf2, 0x5e, 0x0020_0000_0000_0000, 0x4340_0000_0000_0000), // divsd
+        (0xf3, 0x5c, 0x0080_0001, 0x0080_0000),                     // subss
+        (0xf3, 0x58, 0x0080_0001, 0x8080_0000),                     // addss
+        (0xf2, 0x5a, 0x3690_0000_0000_0000, 0),                     // cvtsd2ss
+    ] {
+        for use_op in [0x58u8, 0x59, 0x5d, 0x51] {
+            let mut code = Vec::new();
+            load(&mut code, 0, a);
+            load(&mut code, 1, b);
+            load(&mut code, 2, 0x3ff0_0000_0000_0000);
+            // op xmm0, xmm1 (cvtsd2ss: xmm0 from xmm0); then the result as
+            // an operand, at the width it was made at.
+            let src = if op == 0x5a { 0 } else { 1 };
+            code.extend([prefix, 0x0f, op, 0xc0 | src]);
+            let width = if op == 0x5a { 0xf3 } else { prefix };
+            code.extend([width, 0x0f, use_op, 0xd0]); // op xmm2, xmm0
+            let cpu = guest.cpu(&mut rng);
+            guest.compare(&code, &cpu, 9);
+        }
+    }
+}
+
 /// A block entered with flags pending from blocks of different kinds
 /// (an 8-bit subtraction, a 32-bit addition, a logical operation, an
 /// increment that keeps CF), whose `inc` needs only CF of them: inline for

@@ -1075,6 +1075,7 @@ pub fn translate_block(
         }
         fell_through = t.instruction(g)?;
         t.flush_misaligned();
+        t.update_normal(&g.insn);
         // Checked addresses follow a base that moved by a constant; those
         // of any other base the instruction wrote are dropped.
         let mut written = registers_written(&g.insn);
@@ -1197,8 +1198,8 @@ pub fn translate_block(
         t.a.b(slow);
     }
     // UFC raised by the host, made x86's UE.
-    for (entry, back) in core::mem::take(&mut t.underflows) {
-        t.underflow_fixup(entry, back)?;
+    for (entry, back, slow) in core::mem::take(&mut t.underflows) {
+        t.underflow_fixup(entry, back, slow)?;
     }
     // Slow paths: the instruction at `rip` goes to the interpreter, which
     // finds the state exactly as before it.
@@ -1454,6 +1455,15 @@ fn bytes(size: Size) -> u32 {
     size.bits() / 8
 }
 
+/// The bit of an xmm register's vector register in `Translator::normal`
+/// (0 for the scratch registers, never known).
+fn normal_bit(v: VReg) -> u32 {
+    match v.bits() {
+        n @ 16..32 => 1 << n,
+        _ => 0,
+    }
+}
+
 fn lanes(size: Size) -> Lanes {
     match size {
         Size::B8 => Lanes::B,
@@ -1651,7 +1661,12 @@ struct Translator {
     unaligned: Vec<(Label, Label, Unaligned)>,
     /// Out of line: UFC raised by the host, made x86's UE (entry, back;
     /// `underflow`).
-    underflows: Vec<(Label, Label)>,
+    underflows: Vec<(Label, Label, Label)>,
+    /// xmm registers whose low lane is known not to be denormal, as a
+    /// double (`[0]`) and as a single (`[1]`), by host vector register
+    /// (bits 16–31): `slow_if_denormal` needs no test for them
+    /// (`update_normal`).
+    normal: [u32; 2],
     /// Out of line: the rest of `slow_if_denormal` (entry, back, slow
     /// path, width).
     denormals: Vec<(Label, Label, Label, Width)>,
@@ -1744,6 +1759,7 @@ impl Translator {
             const_address: None,
             checked: Vec::new(),
             known_aligned: false,
+            normal: [0; 2],
             faults: Vec::new(),
             write_edges: Vec::new(),
             read_edges: Vec::new(),
@@ -3382,7 +3398,7 @@ impl Translator {
                         }
                         self.slow_if_nan(double, V2, at.rip, slow);
                         if matches!(op, FloatOp::Mul | FloatOp::Div) {
-                            self.underflow(double, V2)?;
+                            self.underflow(double, V2, at.rip, slow)?;
                         }
                     }
                 }
@@ -3486,7 +3502,7 @@ impl Translator {
                 self.slow_if_denormal(!to_double, a, at.rip, slow)?;
                 self.a.fcvt(to_double, V2, a);
                 if !to_double {
-                    self.underflow(false, V2)?;
+                    self.underflow(false, V2, at.rip, slow)?;
                 }
                 // Exact to a double: no flag.
                 self.scalar_result(to_double, xreg(&dst))
@@ -3805,6 +3821,13 @@ impl Translator {
         rip: u64,
         slow: &mut Option<Label>,
     ) -> Emit {
+        // Known not denormal; after the test, it is.
+        let bit = normal_bit(v);
+        let width = usize::from(!double);
+        if self.normal[width] & bit != 0 {
+            return Ok(());
+        }
+        self.normal[width] |= bit;
         let slow = self.slow_path(rip, slow);
         let entry = self.a.new_label();
         let back = self.a.new_label();
@@ -3826,13 +3849,16 @@ impl Translator {
     /// After a host operation that may underflow (a multiplication, a
     /// division, `cvtsd2ss`) with result `v`: out of line if `|v|` is at
     /// most the smallest normal number, the only results for which the
-    /// host can raise UFC. There (`underflow_fixup`) UFC, if raised, is
-    /// cleared, and becomes UE in MXCSR unless `v` is ±the smallest normal
-    /// number: x86 detects tininess after rounding, and that result is not
-    /// tiny for it. Translated code thus never leaves UFC in FPSR, so a
-    /// UFC seen there was raised by the operation just done. Uses `T1`,
-    /// `T2` and the host's flags.
-    fn underflow(&mut self, double: bool, v: VReg) -> Emit {
+    /// host can raise UFC. There (`underflow_fixup`) a denormal result
+    /// goes to the interpreter (so that a result that comes back is never
+    /// denormal, `update_normal`); for 0 or ±the smallest normal number
+    /// UFC, if raised, is cleared, and becomes UE in MXCSR unless `v` is
+    /// ±the smallest normal number: x86 detects tininess after rounding,
+    /// and that result is not tiny for it. Translated code thus never
+    /// leaves UFC in FPSR, so a UFC seen there was raised by the operation
+    /// just done. Uses `T1`, `T2` and the host's flags.
+    fn underflow(&mut self, double: bool, v: VReg, rip: u64, slow: &mut Option<Label>) -> Emit {
+        let slow = self.slow_path(rip, slow);
         let (w, smallest) = if double {
             (Width::X, 1u64 << 52)
         } else {
@@ -3847,29 +3873,114 @@ impl Translator {
         self.a.subs(w, ZR, T1, T2, Shift::Lsl, 0)?;
         self.a.b_cond(Cond::Ls, entry);
         self.a.bind(back);
-        self.underflows.push((entry, back));
+        self.underflows.push((entry, back, slow));
         Ok(())
     }
 
     /// The out-of-line part of `underflow`; the host's flags still hold
-    /// the comparison of `|v|` with the smallest normal number.
-    fn underflow_fixup(&mut self, entry: Label, back: Label) -> Emit {
+    /// the comparison of `|v|` with the smallest normal number, and `T1`
+    /// is `|v|` shifted left by one.
+    fn underflow_fixup(&mut self, entry: Label, back: Label, slow: Label) -> Emit {
         const UFC: u32 = 3;
         const UE: u64 = 1 << 4;
+        let not_denormal = self.a.new_label();
         self.a.bind(entry);
-        self.a.read_fpsr(T1);
-        self.a.tbz(false, T1, UFC, back);
+        // ±the smallest normal number, or 0: comes back. (CBZ keeps NZCV.)
+        self.a.b_cond(Cond::Eq, not_denormal);
+        self.a.cbz(false, Width::X, T1, not_denormal);
+        // Denormal: the interpreter, without the host's UFC.
+        self.a.read_fpsr(T2);
         self.a
-            .logic_imm(Logic::And, Width::X, T1, T1, !(1u64 << UFC))?;
-        self.a.write_fpsr(T1);
+            .logic_imm(Logic::And, Width::X, T2, T2, !(1u64 << UFC))?;
+        self.a.write_fpsr(T2);
+        self.a.b(slow);
+        self.a.bind(not_denormal);
+        self.a.read_fpsr(T2);
+        self.a.tbz(false, T2, UFC, back);
+        self.a
+            .logic_imm(Logic::And, Width::X, T2, T2, !(1u64 << UFC))?;
+        self.a.write_fpsr(T2);
         // ±the smallest normal number: not tiny on x86.
         self.a.b_cond(Cond::Eq, back);
         let mxcsr = field(offset_of!(Cpu, mxcsr));
-        self.a.ldr(MemSize::B32, T2, CPU, mxcsr)?;
-        self.a.logic_imm(Logic::Orr, Width::W, T2, T2, UE)?;
-        self.a.str(MemSize::B32, T2, CPU, mxcsr)?;
+        self.a.ldr(MemSize::B32, T1, CPU, mxcsr)?;
+        self.a.logic_imm(Logic::Orr, Width::W, T1, T1, UE)?;
+        self.a.str(MemSize::B32, T1, CPU, mxcsr)?;
         self.a.b(back);
         Ok(())
+    }
+
+    /// After `insn`: what is known of the xmm registers' low lanes
+    /// (`normal`). A result is known not denormal when it cannot be one
+    /// (an integer converted, a square root, min or max of tested
+    /// operands, a multiplication, division or `cvtsd2ss` that passed
+    /// `underflow`, a comparison's mask, a register zeroed with xor), or
+    /// copied from one known; anything else an instruction writes is not.
+    /// The operands `slow_if_denormal` tested are known from then on.
+    fn update_normal(&mut self, insn: &Instruction) {
+        let Op::Sse { op, dst, src } = insn.op else {
+            if matches!(insn.op, Op::State { .. }) {
+                self.normal = [0; 2];
+            }
+            return;
+        };
+        let bit = |o: &Operand| match o {
+            Operand::Reg(Reg::Xmm(n)) => 1u32 << (16 + u32::from(*n)),
+            _ => 0,
+        };
+        let (d, s) = (bit(&dst), bit(&src));
+        let [double_known, single_known] = &mut self.normal;
+        // The width a result is known at (`Some(double)`), the other not.
+        let result = |known: Option<bool>, dk: &mut u32, sk: &mut u32| {
+            *dk &= !d;
+            *sk &= !d;
+            match known {
+                Some(true) => *dk |= d,
+                Some(false) => *sk |= d,
+                None => {}
+            }
+        };
+        match op {
+            SseOp::FloatArith { op, double } => {
+                let known = !matches!(op, FloatOp::Add | FloatOp::Sub);
+                result(known.then_some(double), double_known, single_known);
+            }
+            SseOp::FloatCompare { .. } | SseOp::FloatToInt { .. } => {}
+            SseOp::FloatCmpMask { double, .. } | SseOp::IntToFloat { double, .. } => {
+                result(Some(double), double_known, single_known)
+            }
+            SseOp::FloatToFloat { to_double } => {
+                result(Some(to_double), double_known, single_known)
+            }
+            SseOp::Mov128 { .. } if d != 0 && s != 0 => {
+                let (dk, sk) = (*double_known & s != 0, *single_known & s != 0);
+                result(None, double_known, single_known);
+                if dk {
+                    *double_known |= d;
+                }
+                if sk {
+                    *single_known |= d;
+                }
+            }
+            SseOp::MovScalar { double } if d != 0 && s != 0 => {
+                // The low lane from src: as a double too when it is one.
+                let (dk, sk) = (*double_known & s != 0, *single_known & s != 0);
+                result(None, double_known, single_known);
+                if double && dk {
+                    *double_known |= d;
+                }
+                if sk {
+                    *single_known |= d;
+                }
+            }
+            SseOp::Logic(LogicOp::Xor) if d != 0 && d == s => {
+                *double_known |= d;
+                *single_known |= d;
+            }
+            // pcmpestrm and pcmpistrm write xmm0.
+            SseOp::PcmpStr { .. } => self.normal = [0; 2],
+            _ => result(None, double_known, single_known),
+        }
     }
 
     /// To the slow path if `v` is a NaN.

@@ -833,7 +833,7 @@ impl VReg {
         VReg(n)
     }
 
-    fn bits(self) -> u32 {
+    pub fn bits(self) -> u32 {
         u32::from(self.0)
     }
 }

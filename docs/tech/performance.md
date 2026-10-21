@@ -627,3 +627,5 @@ The shared prologue and epilogue take Python's startup from 3.07 to 2.14 million
 
 Startups of real programs of the test root (`target/guest/rootfs`), best of 5, without the cache, on a first run (an empty cache each time) and warm: `python3.13 -c pass` 187, 217, 115 ms; `perl -e 1` 55, 62, 35 ms; `sort --version` 27, 31, 18 ms.
 
+**Scalar floating point** (`float`, 2026-10-21; `jit.md`, "Operands known not to be denormal"): without the denormal tests, or without the underflow tests (builds made to measure, not modes of armor), 136 ms instead of 186; with the operands known not to be denormal skipping their tests, 167 ms (best of 5; box64 135).
+
