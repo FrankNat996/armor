@@ -695,6 +695,14 @@ Every block starts with `subs x13, x13, #n` and `b.mi`; a block reached by a dir
 
 Verification: `indirect_jumps_keep_flags_and_budget` counts at least the 4 instructions of the two blocks entered through their checks in each iteration (80 returns at budget 50); with every exit marked as a jump forward (mutation) it fails, the loop no longer returning to the engine.
 
+## `cmp [mem], imm` at an offset, shifts by `cl` with one copy less (M11, 2026-10-21)
+- A comparison of memory with a constant (and `cmp [mem], reg`) reads its operand through `direct`, as the other reads: `[base, #offset]` when the base is tested or covered, instead of the address computed into `x7`.
+- A shift of a mapped register by `cl` with live flags copies the value before it straight into `FA`, after the test of the count (the out-of-line part for a count of 0 still finds the flags pending before in `FA`/`FB`, and the deferred flags of a count of 0 do not read `FA`): five instructions instead of six.
+
+✅ `python-int` 584 → 558 ms, `python-float` 500 → 488 ms (median of 5); 7-Zip unchanged (9.82 s).
+
+Verification: the random tests and `conditions_after_deferred_and_partial_flags`; mutation caught: the copy into `FA` before the test of the count (the flags pending before were lost for a count of 0).
+
 ## Translations cached on disk (ADR-0048, since 2026-10-20)
 A translated block depends only on its guest bytes, its address and the options: since the shared prologue and epilogue it does not depend on where it is published. `cache.rs` keeps the translations of a program in a file and the engine reuses them in later runs:
 - **Lookup** (`Jit::translate`, before decoding): the records for the block's address and options key (`cache_key`: the `Options` but the entry kind, which is a hint, and MXCSR's default); one is used only if the guest bytes now at the address are exactly its recorded bytes, and if its checksum holds (checked the first time it is needed). A hit is published like a fresh translation (its exits unchained), with its fault table. Not in lockstep.

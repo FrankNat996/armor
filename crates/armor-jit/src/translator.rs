@@ -2118,9 +2118,14 @@ impl Translator {
                     // A comparison's memory operand straight to `FA`, as in
                     // `alu_in_place`: its only access.
                     Operand::Mem(m) if op == AluOp::Cmp && !self.skip_flags => {
-                        self.address(&m, at.next, true)?;
-                        self.check(Check::Read, bytes(size), at.rip, &mut slow)?;
-                        self.guest_load(false, size, FA)?;
+                        match self.direct(&m, bytes(size), Check::Read, at.rip, &mut slow) {
+                            Some((base, offset)) => self.load(false, size, FA, base, offset)?,
+                            None => {
+                                self.address(&m, at.next, true)?;
+                                self.check(Check::Read, bytes(size), at.rip, &mut slow)?;
+                                self.guest_load(false, size, FA)?;
+                            }
+                        }
                         FA
                     }
                     _ => self.destination_in(dst, size, at, &mut slow, op != AluOp::Cmp)?,
@@ -2837,15 +2842,19 @@ impl Translator {
                 self.a.bind(done);
                 return Ok(());
             }
-            // The value before, for the deferred flags; the flags pending
-            // before stay as they are for a count of 0 (`zero_counts`).
-            self.a.mov(Width::X, A, h);
+            // The flags pending before stay as they are for a count of 0
+            // (`zero_counts`, which reads them from `FA`/`FB`); otherwise
+            // the value before goes straight to `FA` for the deferred
+            // flags (a count of 0 does not read it).
             let (zero, back) = (self.a.new_label(), self.a.new_label());
             self.zero_counts.push((zero, back, self.lazy));
             self.a.cbz(false, Width::X, T3, zero);
+            self.a.mov(Width::X, FA, h);
             self.a.shift_reg(shift, w, h, h, T3);
             self.a.bind(back);
-            self.defer_operation(FlagKind::Shift(op, None), size, A, Some(T3));
+            self.flags_emitted |= STATUS_FLAGS;
+            self.a.mov(Width::X, FB, T3);
+            self.lazy = Lazy::Static(Pending::new(FlagKind::Shift(op, None), size, STATUS_FLAGS));
             return Ok(());
         }
         self.load_reg(A, reg, size)?;
