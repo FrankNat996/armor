@@ -27,7 +27,7 @@ use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::PathBuf;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 const MAGIC: &[u8; 8] = b"ARMORJC2";
 /// Records kept for one address and key (code that changes at the same
@@ -100,18 +100,13 @@ struct State {
     /// Where the file's last whole record ends, when bytes follow it (a
     /// write cut short): `save` cuts them before appending.
     tail: Option<usize>,
-    /// The process `new` belongs to: a child of `fork` inherits the
-    /// parent's unsaved records, which are the parent's to save.
-    pid: u32,
 }
 
 impl State {
     /// Drops what a forked child inherited of its parent's unsaved
-    /// records.
+    /// records (`FORKED`).
     fn own(&mut self) {
-        let pid = std::process::id();
-        if pid != self.pid {
-            self.pid = pid;
+        if FORKED.swap(false, Ordering::Relaxed) {
             self.new.clear();
             for places in self.index.values_mut() {
                 places.retain(|p| matches!(p, Place::File(_)));
@@ -121,11 +116,26 @@ impl State {
 }
 
 static STATE: Mutex<Option<State>> = Mutex::new(None);
+/// Set in the child of a `fork` (`pthread_atfork`), which inherits the
+/// parent's unsaved records: they are the parent's to save. A flag rather
+/// than a comparison of pids, as `getpid` at every lookup was a syscall
+/// per block translated.
+static FORKED: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn forked() {
+    FORKED.store(true, Ordering::Relaxed);
+}
 static HITS: AtomicU64 = AtomicU64::new(0);
 static STORED: AtomicU64 = AtomicU64::new(0);
 
 /// Turns the cache on, with its file at `path` (`armor`'s `main`).
 pub fn configure(path: PathBuf) {
+    static ATFORK: std::sync::Once = std::sync::Once::new();
+    // SAFETY: registers a handler that only stores to an atomic, which
+    // is async-signal-safe as a child handler must be.
+    ATFORK.call_once(|| unsafe {
+        libc::pthread_atfork(None, None, Some(forked));
+    });
     *STATE.lock().expect("cache lock") = Some(State {
         path,
         loaded: false,
@@ -134,7 +144,6 @@ pub fn configure(path: PathBuf) {
         index: Index::default(),
         new: Vec::new(),
         tail: None,
-        pid: std::process::id(),
     });
 }
 
@@ -402,7 +411,8 @@ fn hit(body: &[u8]) -> Hit {
         u32_at(body, 24) as usize,
         u32_at(body, 28) as usize,
     );
-    let words = (0..nw).map(|i| u32_at(body, FIXED + nb + 4 * i)).collect();
+    let (words, _) = body[FIXED + nb..FIXED + nb + 4 * nw].as_chunks::<4>();
+    let words = words.iter().map(|w| u32::from_le_bytes(*w)).collect();
     let faults = (0..nf)
         .map(|i| {
             let f = FIXED + nb + 4 * nw + 8 * i;
@@ -416,17 +426,32 @@ fn hit(body: &[u8]) -> Hit {
     }
 }
 
-/// A checksum of `data`, 8 bytes at a time (accidental damage, not an
-/// adversary: ADR-0048).
+/// A checksum of `data`, 32 bytes at a time in four independent lanes
+/// (one chain of multiplications was a fifth of a warm Python startup's
+/// lookups); accidental damage, not an adversary: ADR-0048.
 fn checksum(data: &[u8]) -> u64 {
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325 ^ data.len() as u64;
-    let (chunks, rest) = data.as_chunks::<8>();
-    for chunk in chunks {
-        let w = u64::from_le_bytes(*chunk);
-        h = (h ^ w).wrapping_mul(0x0000_0100_0000_01b3).rotate_left(31);
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mix = |h: u64, w: u64| (h ^ w).wrapping_mul(PRIME).rotate_left(31);
+    let mut lanes = [
+        0xcbf2_9ce4_8422_2325 ^ data.len() as u64,
+        0x9e37_79b9_7f4a_7c15,
+        0xc2b2_ae3d_27d4_eb4f,
+        0x1656_67b1_9e37_79f9,
+    ];
+    let (blocks, rest) = data.as_chunks::<32>();
+    for block in blocks {
+        let (words, _) = block.as_chunks::<8>();
+        for (lane, word) in lanes.iter_mut().zip(words) {
+            *lane = mix(*lane, u64::from_le_bytes(*word));
+        }
     }
-    for &b in rest {
-        h = (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3);
+    let mut h = lanes.iter().fold(0, |h, &lane| mix(h, lane));
+    let (words, bytes) = rest.as_chunks::<8>();
+    for word in words {
+        h = mix(h, u64::from_le_bytes(*word));
+    }
+    for &b in bytes {
+        h = (h ^ u64::from(b)).wrapping_mul(PRIME);
     }
     h
 }

@@ -889,21 +889,31 @@ impl AddressSpace {
         // Freshly mapped host memory is already zero (and stays untouched,
         // so a large sparse mapping costs nothing); host pages shared with
         // earlier guest mappings may not be.
-        for host_page in existing {
-            let from = (host_page * self.host_page_size).max(addr);
-            let to = ((host_page + 1) * self.host_page_size).min(end);
-            if self.region_end != 0 {
-                // With host protection the page may be inaccessible; it gets
-                // its new protection below (`apply_protection`).
-                // SAFETY: a host page owned by this address space.
+        if self.region_end != 0 {
+            // With host protection the pages may be inaccessible: writable
+            // first, a run of consecutive pages at a time (one call each
+            // made ld.so's mappings cost hundreds); they get their new
+            // protection below (`apply_protection`).
+            let mut i = 0;
+            while i < existing.len() {
+                let mut j = i + 1;
+                while j < existing.len() && existing[j] == existing[j - 1] + 1 {
+                    j += 1;
+                }
+                // SAFETY: host pages owned by this address space.
                 unsafe {
                     libc::mprotect(
-                        (host_page * self.host_page_size) as *mut libc::c_void,
-                        self.host_page_size as usize,
+                        (existing[i] * self.host_page_size) as *mut libc::c_void,
+                        ((j - i) as u64 * self.host_page_size) as usize,
                         libc::PROT_READ | libc::PROT_WRITE,
                     )
                 };
+                i = j;
             }
+        }
+        for host_page in existing {
+            let from = (host_page * self.host_page_size).max(addr);
+            let to = ((host_page + 1) * self.host_page_size).min(end);
             // SAFETY: [from, to) lies in a host page owned by this address
             // space, mapped read-write (invariant of `host_pages`; with host
             // protection, made so above).
