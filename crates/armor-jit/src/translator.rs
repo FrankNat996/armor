@@ -1052,59 +1052,34 @@ pub fn translate_block(
     // block straight here (`CHAINED_ENTRY`).
     // The budget: when it runs out, back to the engine before this block.
     let start = block.first().expect("a block has an instruction").rip;
+    if t.options.chain {
+        t.loop_start = Some(start);
+    }
+    let live = live_flags(block);
     let out_of_budget = t.a.new_label();
     t.a.subs_imm(Width::X, BUDGET, BUDGET, block.len() as u32)?;
     t.a.b_cond(Cond::Mi, out_of_budget);
-    let mut fell_through = true;
-    let live = live_flags(block);
-    for (i, (g, &live)) in block.iter().zip(&live).enumerate() {
-        t.live = live;
-        t.last = i + 1 == block.len();
-        debug_assert!(
-            supported(&g.insn),
-            "translating an unsupported {:?}",
-            g.insn
-        );
-        // Vector and floating-point accesses to guest memory have no
-        // acquire/release forms: a full barrier before (release, for a
-        // store) and a load barrier after (acquire, for a load).
-        let vector_access = t.options.concurrent
-            && matches!(g.insn.op, Op::Sse { dst, src, .. } if dst.is_mem() || src.is_mem());
-        if vector_access {
-            t.a.dmb(Barrier::Ish);
-        }
-        fell_through = t.instruction(g)?;
-        t.flush_misaligned();
-        t.update_normal(&g.insn);
-        // Checked addresses follow a base that moved by a constant; those
-        // of any other base the instruction wrote are dropped.
-        let mut written = registers_written(&g.insn);
-        if let Some((moved, delta)) = base_moved(&g.insn) {
-            written &= !(1 << moved.bits());
-            for (base, disp, _) in &mut t.checked {
-                if *base == moved {
-                    *disp = disp.wrapping_sub(delta as u64);
-                }
-            }
-        }
-        t.checked
-            .retain(|&(base, _, _)| written & (1 << base.bits()) == 0);
-        if vector_access {
-            t.a.dmb(Barrier::IshLd);
-        }
-    }
-    if fell_through {
-        match end {
-            BlockEnd::Continue(rip) => t.exit_direct(rip)?,
-            BlockEnd::Interpret(rip) => t.exit(rip, EXIT_INTERPRET)?,
-        }
-    }
-    // Out-of-line code: each piece starts with the lazy-flags state of
-    // the point it is reached from.
-    for (label, rip, lazy) in core::mem::take(&mut t.side_exits) {
-        t.a.bind(label);
+    t.body(block, &live, end)?;
+    t.side_exits_out_of_line()?;
+    // The loop's copy, if an exit asked for one: from the state of that
+    // exit, its own budget check and way out of it.
+    while let Some(i) = t.loops.iter().position(|l| l.3) {
+        let (lazy, normal, head, _) = t.loops[i];
+        t.loops[i].3 = false;
+        t.a.bind(head);
         t.lazy = lazy;
-        t.exit_direct(rip)?;
+        t.normal = normal;
+        t.checked.clear();
+        t.nzcv_valid = false;
+        t.nzcv_now = false;
+        let copy_out_of_budget = t.a.new_label();
+        t.a.subs_imm(Width::X, BUDGET, BUDGET, block.len() as u32)?;
+        t.a.b_cond(Cond::Mi, copy_out_of_budget);
+        t.body(block, &live, end)?;
+        t.side_exits_out_of_line()?;
+        t.a.bind(copy_out_of_budget);
+        t.lazy = lazy;
+        t.exit(start, EXIT_CONTINUE)?;
     }
     t.a.bind(out_of_budget);
     t.lazy = Lazy::Dynamic;
@@ -1526,7 +1501,7 @@ struct Site {
 /// Flags computed lazily: the status flags of the last flag-setting
 /// instruction, not yet merged into `FLAGS`, follow from its operands in
 /// `FA` and `FB` (for logical operations, its result in `FA`).
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 struct Pending {
     kind: FlagKind,
     size: Size,
@@ -1626,7 +1601,7 @@ impl Pending {
 }
 
 /// Where the status flags are, at a point of the generated code.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum Lazy {
     /// In `FLAGS`.
     Current,
@@ -1646,7 +1621,15 @@ struct Translator {
     slow_paths: Vec<(Label, u64, Lazy)>,
     /// Out of line: the taken side of a conditional jump inside the block
     /// (label, target, lazy flags at the jump).
-    side_exits: Vec<(Label, u64, Lazy)>,
+    side_exits: Vec<(Label, u64, Lazy, [u32; 2])>,
+    /// The block's first instruction, when exits may become loops (not in
+    /// lockstep): an exit back to it with the flags known goes to a copy
+    /// of the block translated from that state (`loops`).
+    loop_start: Option<u64>,
+    /// Copies of the block's body (`exit_direct`): the state they are
+    /// translated from (the flags pending, the xmm values known), their
+    /// head, and whether they are still to be emitted.
+    loops: Vec<(Lazy, [u32; 2], Label, bool)>,
     /// The instruction being translated is the block's last.
     last: bool,
     /// Lazy flags at the current point of the emitted code.
@@ -1736,6 +1719,67 @@ struct Translator {
 }
 
 impl Translator {
+    /// The block's instructions, and its exit when the last one falls
+    /// through.
+    fn body(&mut self, block: &[GuestInstruction], live: &[u64], end: BlockEnd) -> Emit {
+        let mut fell_through = true;
+        for (i, (g, &live)) in block.iter().zip(live).enumerate() {
+            self.live = live;
+            self.last = i + 1 == block.len();
+            debug_assert!(
+                supported(&g.insn),
+                "translating an unsupported {:?}",
+                g.insn
+            );
+            // Vector and floating-point accesses to guest memory have no
+            // acquire/release forms: a full barrier before (release, for a
+            // store) and a load barrier after (acquire, for a load).
+            let vector_access = self.options.concurrent
+                && matches!(g.insn.op, Op::Sse { dst, src, .. } if dst.is_mem() || src.is_mem());
+            if vector_access {
+                self.a.dmb(Barrier::Ish);
+            }
+            fell_through = self.instruction(g)?;
+            self.flush_misaligned();
+            self.update_normal(&g.insn);
+            // Checked addresses follow a base that moved by a constant;
+            // those of any other base the instruction wrote are dropped.
+            let mut written = registers_written(&g.insn);
+            if let Some((moved, delta)) = base_moved(&g.insn) {
+                written &= !(1 << moved.bits());
+                for (base, disp, _) in &mut self.checked {
+                    if *base == moved {
+                        *disp = disp.wrapping_sub(delta as u64);
+                    }
+                }
+            }
+            self.checked
+                .retain(|&(base, _, _)| written & (1 << base.bits()) == 0);
+            if vector_access {
+                self.a.dmb(Barrier::IshLd);
+            }
+        }
+        if fell_through {
+            match end {
+                BlockEnd::Continue(rip) => self.exit_direct(rip)?,
+                BlockEnd::Interpret(rip) => self.exit(rip, EXIT_INTERPRET)?,
+            }
+        }
+        Ok(())
+    }
+
+    /// The taken sides of the conditional jumps inside the block: each
+    /// starts with the state of the point it is reached from.
+    fn side_exits_out_of_line(&mut self) -> Emit {
+        for (label, rip, lazy, normal) in core::mem::take(&mut self.side_exits) {
+            self.a.bind(label);
+            self.lazy = lazy;
+            self.normal = normal;
+            self.exit_direct(rip)?;
+        }
+        Ok(())
+    }
+
     /// A translator with nothing emitted, the flags current.
     fn bare(options: Options) -> Translator {
         Translator {
@@ -1744,6 +1788,8 @@ impl Translator {
             status_entries: Vec::new(),
             slow_paths: Vec::new(),
             side_exits: Vec::new(),
+            loop_start: None,
+            loops: Vec::new(),
             last: false,
             chain_stubs: Vec::new(),
             page_edges: Vec::new(),
@@ -1829,7 +1875,12 @@ impl Translator {
                         ..
                     }
                 );
+            // An instruction that writes every flag, all of them dead
+            // (`skip_flags`): what is pending before it is never observed
+            // after it, so nothing need survive the write.
+            let dead = self.skip_flags && flags_written(insn) == STATUS_FLAGS;
             if !replaces
+                && !dead
                 && p.held_registers()
                     .any(|r| written_regs & (1 << r.bits()) != 0)
             {
@@ -2445,7 +2496,7 @@ impl Translator {
                 let taken = self.a.new_label();
                 self.branch_if(cond, taken)?;
                 self.side_exits
-                    .push((taken, target(next, rel, size), self.lazy));
+                    .push((taken, target(next, rel, size), self.lazy, self.normal));
                 return Ok(true);
             }
             Op::Jcc { cond, rel } => {
@@ -4062,6 +4113,26 @@ impl Translator {
 
     /// Leaves the block for a known address: chainable if enabled.
     fn exit_direct(&mut self, rip: u64) -> Emit {
+        // Back to the block's start with the flags known: into a copy of
+        // the block translated from this state, which then loops in itself
+        // (the budget checked at its head). One copy per block; a state
+        // that does not imply the copy's leaves as any exit.
+        if Some(rip) == self.loop_start && matches!(self.lazy, Lazy::Static(_) | Lazy::Current) {
+            let (lazy, normal) = (self.lazy, self.normal);
+            let fits = |l: &Lazy, n: &[u32; 2]| {
+                *l == lazy && n[0] & !normal[0] == 0 && n[1] & !normal[1] == 0
+            };
+            if let Some(&(_, _, head, _)) = self.loops.iter().find(|(l, n, _, _)| fits(l, n)) {
+                self.a.b(head);
+                return Ok(());
+            }
+            if self.loops.is_empty() {
+                let head = self.a.new_label();
+                self.loops.push((lazy, normal, head, true));
+                self.a.b(head);
+                return Ok(());
+            }
+        }
         // Before the `b`: once patched, it goes straight to the next block.
         self.publish_lazy()?;
         if !self.options.chain {
@@ -5595,6 +5666,7 @@ impl Translator {
                 }
                 match p.b {
                     Held::Imm(v) => self.a.mov_imm64(FB, v),
+                    Held::Fb => {}
                     b => {
                         let b = self.held(b, FB);
                         self.a.mov(w, FB, b);

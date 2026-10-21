@@ -2347,6 +2347,39 @@ fn denormal_tests_skipped_only_where_known() {
     }
 }
 
+/// A loop whose back edge leaves flags pending (`cmp edi, edx` before
+/// `jmp loop`) and whose body reads them first (`setb`): the copy of the
+/// block the back edge enters (`Translator::loops`) starts from that state.
+/// Also a loop on a conditional jump inside the block, and one on the last
+/// instruction's jump.
+#[test]
+fn loops_start_from_the_state_of_their_back_edge() {
+    let guest = Guest::new();
+    let mut rng = Rng(0x1b87_3593_cc9e_2d51);
+    #[rustfmt::skip]
+    let programs: [&[u8]; 3] = [
+        // loop: setb al; movzx eax, al; add ebx, eax; lea edi, [rdi+rdi*4+1];
+        // dec ecx; jz out; cmp edi, edx; jmp loop; out:
+        &[0x0f, 0x92, 0xc0, 0x0f, 0xb6, 0xc0, 0x01, 0xc3, 0x8d, 0x7c, 0xbf, 0x01,
+          0xff, 0xc9, 0x74, 0x04, 0x39, 0xd7, 0xeb, 0xec],
+        // loop: adc ebx, 0; lea edi, [rdi+rdi*4+1]; cmp edi, edx; dec ecx
+        // (keeps CF); jnz loop
+        &[0x83, 0xd3, 0x00, 0x8d, 0x7c, 0xbf, 0x01, 0x39, 0xd7, 0xff, 0xc9, 0x75, 0xf2],
+        // loop: cmovb ebx, edi; lea edi, [rdi+rdi*4+1]; dec ecx; jz out;
+        // cmp edi, edx; jnz loop (the last instruction); out:
+        &[0x0f, 0x42, 0xdf, 0x8d, 0x7c, 0xbf, 0x01, 0xff, 0xc9, 0x74, 0x04, 0x39,
+          0xd7, 0x75, 0xf1],
+    ];
+    for round in 0..64u64 {
+        for code in programs {
+            let mut cpu = guest.cpu(&mut rng);
+            cpu.regs[1] = 50 + round; // rcx
+            cpu.regs[2] = rng.next(); // rdx
+            guest.compare(code, &cpu, round);
+        }
+    }
+}
+
 /// A block entered with flags pending from blocks of different kinds
 /// (an 8-bit subtraction, a 32-bit addition, a logical operation, an
 /// increment that keeps CF), whose `inc` needs only CF of them: inline for

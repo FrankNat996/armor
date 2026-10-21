@@ -633,3 +633,5 @@ Startups of real programs of the test root (`target/guest/rootfs`), best of 5, w
 
 **mmap without an address** (`memory`, 2026-10-21): `map_anywhere`'s top-down search moved one host page at a time through every mapping above (`perf record --call-graph=dwarf`: 11% of the workload in a `BTreeSet` range query from `AddressSpace::place`); jumping below the lowest page in the way instead finds the same range: 262 → 211 ms (box64 247).
 
+**Loops** (2026-10-21; `jit.md`, "Loops start from the state of their back edge"): a back edge to the block's own start enters a copy of the block translated from the state it leaves: `float` 167 → 154 ms, `simd` 84 → 75 ms, 7-Zip 10.51 → 10.41 s (best of 5). `memory` measured 211–224 ms in runs of both builds: within its noise.
+
