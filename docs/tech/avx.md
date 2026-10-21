@@ -2,7 +2,7 @@
 
 **Roadmap:** M11, item "AVX and AVX2 (x86-64-v3)". **Code:** `crates/armor-cpu/src/cpuid.rs` (`Features`), `crates/armor-cpu/src/xsave.rs`, `crates/armor-cpu/src/bmi.rs`, `crates/armor-cpu/src/avx.rs`, `crates/armor-cpu/src/avx_ops.rs`, `crates/armor-linux/src/signal/xstate.rs`, the decoder in `crates/armor-x86` (`vex.rs`). **Tests:** `tests/guest/asm/xsave/`, `tests/guest/asm/bmi/`, `tests/guest/asm/avx/`, `tests/guest/asm/fma/`, `tests/guest/asm/f16c/`, `faults/xgetbv_undeclared`, `faults/andn_undeclared`, `faults/movbe_undeclared`, `faults/vex_undeclared`, `c/signal_xstate`, `c/bmi_compiled`, unit tests in `armor-cpu`, `armor-x86` and `armor-linux`.
 
-Every statement is marked ✅ (verified, with how) or ⚠️ (to verify, with how).
+**Decision:** ADR-0049 (proposed). Every statement is marked ✅ (verified, with how) or ⚠️ (to verify, with how).
 
 ## Status
 - ✅ By default armor's CPUID is unchanged: it declares x86-64-v2 and nothing of v3 (`basic/cpuid` in `difftest`, identical to qemu's `qemu64` model, `tech/cpuid.md`).

@@ -87,7 +87,7 @@ armor-wow64 (wow64/, a Windows DLL) ──► armor-jit (no `std`), armor-cpu, a
 
 ## Guest state (`Cpu`)
 - Implemented: `regs[16]` (rax…r15), `rip`, `rflags`, `fs_base`/`gs_base` (set by `arch_prctl`; for an i386 guest by `mov fs`/`mov gs` with a TLS selector), `mode` (64-bit or compatibility, ADR-0029), `segments` (selectors of `fs`/`gs` and the TLS entries 12–14 of the GDT from `set_thread_area`), `xmm[16]` (u128), `mxcsr` (initial value 0x1f80; read and written by `ldmxcsr`/`stmxcsr`/`fxsave`/`fxrstor`, default control only, ADR-0015), `x87` (80-bit stack, control and status word; ADR-0016, `tech/floating-point.md`).
-- *(planned)* upper half of the `ymm` registers with AVX.
+- `ymm_hi[16]` (u128): the upper halves of the `ymm` registers (since 2026-10-21), saved by `xsave`, changed by the VEX instructions, all declared only with `ARMOR_CPU_FEATURES` (`tech/avx.md`). The interpreter's modules for them: `xsave.rs`, `bmi.rs`, `avx.rs` (the VEX forms of SSE), `avx_ops.rs` (the instructions AVX, AVX2, FMA and F16C add); the decoder's `vex.rs`; signal frames in `armor-linux`'s `signal/xstate.rs`.
 
 ## Thread model (M3, ADR-0018; execution: ADR-0023)
 - **1:1:** each guest thread is a host thread (`std::thread`, name `armor-guest`) with its own `Cpu` and its own `syscall::Thread` (signal mask, alternate stack, `clear_child_tid`). The guest's tid is the host's.

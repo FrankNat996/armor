@@ -164,7 +164,7 @@ Increment 14 (chosen by counting the instructions left to the interpreter: in th
 - **8- and 16-bit shifts and rotations**, on a register (by immediate, 1, `cl`) or memory (by immediate or 1; with `cl` a count of 0 must not write, so it goes to the interpreter). The value is kept extended in a 64-bit register, where the interpreter's formulas come out without special cases even for counts beyond the size.
 
 Increment 15:
-- 32/64-bit **`bsf`/`bsr`** with `rbit` + `clz` or `clz`. Only ZF changes; with a zero source the destination stays as it is, as in the interpreter.
+- 32/64-bit **`bsf`/`bsr`** with `rbit` + `clz` or `clz`. Only ZF changes; with a zero source the destination stays as it is, as in the interpreter. Their F3 encodings, `tzcnt`/`lzcnt`, are translated the same way while CPUID does not declare BMI1/LZCNT (the default model); declared (`ARMOR_CPU_FEATURES`, `tech/avx.md`), they count zeros and go to the interpreter. The declared features are part of the cache key (`Jit::cache_key`; with none declared the key is unchanged).
 - 32/64-bit **`bt`/`bts`/`btr`/`btc`**, with a register or immediate on a register, and with an immediate on memory; with a register on memory the address moves, so it goes to the interpreter. Only CF changes, inserted into `rflags` with `bfi`.
 - 32/64-bit **`bswap`** with `rev`.
 

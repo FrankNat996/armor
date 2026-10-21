@@ -26,6 +26,9 @@ With the procedure of this ADR, within the completion of M4: armor implements SS
 - Then SSE4.1 (leaf 1, ecx bit 19): `QEMU_CPU` = `qemu64,-svm,+ssse3,+sse4.1`; only that bit changes. Verification: `difftest` 271/271.
 - Then SSE4.2 and POPCNT (leaf 1, ecx bits 20 and 23): `QEMU_CPU` = `qemu64,-svm,+ssse3,+sse4.1,+sse4.2,+popcnt`; only those two bits change. Verification: `difftest` 272/272.
 
+## Update of 2026-10-22: features declared on request
+The features of x86-64-v3 (XSAVE, AVX, AVX2, FMA, F16C, BMI1, BMI2, LZCNT, MOVBE) are implemented in the interpreter but not declared by the default model: `ARMOR_CPU_FEATURES` adds them, with qemu's names, and `difftest` adds the same ones to qemu's model, so the comparison still sees the same CPU on both sides (ADR-0049, `tech/avx.md`). Without the variable, CPUID is unchanged (`basic/cpuid`).
+
 ## Alternatives considered
 - **Values invented from scratch** (vendor "GenuineIntel", family and model of our choosing): not verifiable against an oracle, and glibc takes different paths for Intel and AMD.
 - **Also copying qemu's brand and hypervisor leaves:** simpler comparison, but armor would declare that it is qemu/TCG.

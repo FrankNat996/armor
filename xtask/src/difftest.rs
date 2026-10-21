@@ -384,6 +384,18 @@ pub fn run(args: &[String]) -> Result<(), String> {
             }
             runnable
         });
+        // The cases that declare CPU features (AVX, BMI, …): the oracle, a
+        // Xeon X5675, has none of them.
+        runs.retain(|run| match case_features(&run.name) {
+            "" => true,
+            features => {
+                println!(
+                    "SKIP {} (needs {features}, which the oracle lacks)",
+                    run.name
+                );
+                false
+            }
+        });
         runs.retain(|run| {
             match ENVIRONMENT_DEPENDENT
                 .iter()

@@ -59,6 +59,7 @@ Every significant decision has its own file `NNNN-title.md`. ADRs are never dele
 | [0046](0046-permission-checks-by-the-host-mmu.md) | Permission checks by the host's MMU on hosts with 4K pages | Accepted (2026-10-20) |
 | [0047](0047-armor-as-the-windows-engine.md) | armor as the engine of Windows programs, behind Wine's WoW64 and ARM64EC interfaces | Accepted (2026-10-20) |
 | [0048](0048-translations-cached-on-disk.md) | Translations cached on disk | Accepted (2026-10-20) |
+| [0049](0049-x86-64-v3-on-request.md) | x86-64-v3 (AVX, AVX2, FMA, F16C, BMI, MOVBE, XSAVE): interpreter first, declared on request | Proposed |
 
 ## Template
 ```markdown

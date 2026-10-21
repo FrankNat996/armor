@@ -32,4 +32,5 @@ armor keeps the translations of file-backed code in a cache on disk and reuses t
 
 ## Implementation notes
 - **2026-10-20:** `crates/armor-jit/src/cache.rs` (`tech/jit.md`, "Translations cached on disk"). Two details differ from the decision above, both stricter or simpler: a record's validity is checked against the **exact guest bytes** at the block's address (stored in the record), with the address, the options and armor's build in the key, rather than against the file's identity (armor's address space does not keep which file a mapping came from); so every block is cached, not only those of file mappings, with at most four records per address and options. One file per program (named after armor's build, the program and its mode) instead of one per mapping; new records are appended rather than the file rewritten. The directory is limited to 1 GiB (the least recently used files go), a file to 256 MiB.
+- **2026-10-21:** the key also holds the CPUID features declared on request (`ARMOR_CPU_FEATURES`, ADR-0049), which change how `tzcnt`/`lzcnt` are translated; with none declared it is the same as before.
 
