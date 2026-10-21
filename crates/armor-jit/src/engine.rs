@@ -230,6 +230,9 @@ pub struct Jit {
     /// translated: code that runs only a few times (a program's startup)
     /// costs less interpreted than translated. 0 translates at once.
     warm_up: u32,
+    /// `Options::kind_register`: the memory is under host protection. The
+    /// routines are published for it (`publish_routines`).
+    kind_register: bool,
 }
 
 /// A translated block: `extern "C" fn(cpu, page_table, context)
@@ -266,6 +269,7 @@ impl Jit {
             features: HostFeatures::detect(),
             warm_up: 0,
             faults: Vec::new(),
+            kind_register: false,
         })
         .map(|mut jit| {
             jit.context.targets = jit.targets.as_ptr() as u64;
@@ -299,8 +303,10 @@ impl Jit {
                 panic!("armor: cannot allocate the JIT's code buffer after fork: {e}")
             });
         }
-        if cpu.mode != self.mode {
+        let kind_register = mem.host_protection().is_some();
+        if cpu.mode != self.mode || kind_register != self.kind_register {
             self.mode = cpu.mode;
+            self.kind_register = kind_register;
             self.flush();
         }
         if self.lockstep {
@@ -465,6 +471,7 @@ impl Jit {
             "armor bug: running code outside the JIT's buffer"
         );
         self.context.budget = budget;
+        self.context.page_table = mem.page_table() as u64;
         self.calls += 1;
         // For a fault in this thread's translated code (ADR-0046).
         FAULTS.with(|faults| faults.set(&self.faults));
@@ -522,9 +529,10 @@ impl Jit {
                 .publish(&words)
                 .expect("the routines fit in an empty buffer")
         };
-        let flags = publish(flags_routine().expect("the flags routine encodes"));
-        let enter = publish(enter_routine(compat).expect("the entry routine encodes"));
-        let leave = publish(leave_routine(compat).expect("the exit routine encodes"));
+        let kind = self.kind_register;
+        let flags = publish(flags_routine(kind).expect("the flags routine encodes"));
+        let enter = publish(enter_routine(compat, kind).expect("the entry routine encodes"));
+        let leave = publish(leave_routine(compat, kind).expect("the exit routine encodes"));
         self.context.flags_routine = flags as u64;
         self.context.leave = leave as u64;
         self.enter = enter;
@@ -549,6 +557,7 @@ impl Jit {
             compat: self.mode == Mode::Compat32,
             host_reads,
             page_table: true,
+            kind_register: self.kind_register,
             // What the exit that led here left pending (after a chain
             // exit; 0 otherwise).
             entry_kind: core::mem::take(&mut self.context.exit_kind),
@@ -660,6 +669,7 @@ impl Jit {
             options.host_reads.map_or(0, |b| b as u8),
             u8::from(options.page_table),
             u8::from(self.default_mxcsr),
+            u8::from(options.kind_register),
         ];
         cache::fnv1a(&bits)
     }

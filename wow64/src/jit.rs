@@ -170,9 +170,9 @@ impl Engine {
         self.faults.clear();
         self.used = 0;
         // The shared routines (compatibility mode: 32-bit code).
-        let flags = flags_routine().expect("the flags routine encodes");
-        let enter = enter_routine(true).expect("the entry routine encodes");
-        let leave = leave_routine(true).expect("the exit routine encodes");
+        let flags = flags_routine(false).expect("the flags routine encodes");
+        let enter = enter_routine(true, false).expect("the entry routine encodes");
+        let leave = leave_routine(true, false).expect("the exit routine encodes");
         let flags = self.publish(&flags).expect("fits in an empty buffer");
         self.enter = self.publish(&enter).expect("fits in an empty buffer");
         let leave = self.publish(&leave).expect("fits in an empty buffer");
@@ -335,6 +335,7 @@ impl Engine {
             // and the host's protections are the guest's.
             host_reads: Some(32),
             page_table: false,
+            kind_register: false,
             entry_kind: core::mem::take(&mut self.context.exit_kind),
         };
         let Ok(translation) = translate_block(&block, end, options) else {

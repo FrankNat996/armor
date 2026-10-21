@@ -99,7 +99,8 @@ pub struct Context {
     pub status: u64,
     /// Lazy flags across blocks: 0 when `FLAGS` is current, otherwise the
     /// pending operation (`Pending::code`) whose operands are in `FA`/`FB`
-    /// (in memory since 2026-10-20: its register holds r9).
+    /// (in memory since 2026-10-20: its register holds r9). In `KIND_REG`
+    /// instead with `Options::kind_register`.
     pub kind: u64,
     /// Address of the indirect-jump table: `TARGET_ENTRIES` pairs (guest
     /// address, executable address of that block's `CHAINED_ENTRY`),
@@ -111,6 +112,9 @@ pub struct Context {
     /// Executable address of `leave_routine`, where blocks go back to the
     /// engine. Kept by the engine.
     pub leave: u64,
+    /// The page table (`MemView::page_table`), for the rare paths that
+    /// read it with `Options::kind_register` (`PAGES` holds `KIND` then).
+    pub page_table: u64,
 }
 
 /// Entries of the indirect-jump table (`Context::targets`).
@@ -145,6 +149,11 @@ pub struct Options {
     /// Windows backend, ADR-0047) a misaligned write that crosses a page
     /// goes to the interpreter.
     pub page_table: bool,
+    /// `KIND` in `KIND_REG` rather than in `Context::kind`: with host
+    /// protection (`host_reads`), whose checks read the page table only out
+    /// of line. One instruction less where an exit publishes it and where a
+    /// block reads it.
+    pub kind_register: bool,
     /// `Context::kind` when the block was first reached: what the blocks
     /// before it usually leave pending. An instruction that needs only CF
     /// of those flags computes it inline when `KIND` still says so, and
@@ -237,11 +246,15 @@ enum Unaligned {
     },
 }
 
-// Host registers. Arguments: x0 = &mut Cpu, x1 = page table, x2 = &mut
+// Host registers. Arguments: x0 = &mut Cpu, x1 = page table (`KIND_REG`
+// with host protection), x2 = &mut
 // Context. Kept from block to block (chaining): the guest's rflags, the
 // budget, the lazy flags and the mapped guest registers (`GUEST`).
 const CPU: HostReg = HostReg::new(0);
 const PAGES: HostReg = HostReg::new(1);
+/// `KIND` with `Options::kind_register`: the page table's register, which
+/// translated code then needs only out of line (`Context::page_table`).
+const KIND_REG: HostReg = PAGES;
 const CONTEXT: HostReg = HostReg::new(2);
 const FLAGS: HostReg = HostReg::new(12);
 const BUDGET: HostReg = HostReg::new(13);
@@ -1217,10 +1230,10 @@ pub fn translate_block(
             t.a.logic_imm(Logic::Orr, Width::X, T1, T1, 1)?;
         }
         t.a.str(MemSize::B64, T1, CONTEXT, field(offset_of!(Context, site)))?;
-        t.a.ldr(MemSize::B64, T1, CONTEXT, field(offset_of!(Context, kind)))?;
+        let kind = t.kind(T1)?;
         t.a.str(
             MemSize::B64,
-            T1,
+            kind,
             CONTEXT,
             field(offset_of!(Context, exit_kind)),
         )?;
@@ -1243,8 +1256,19 @@ pub fn translate_block(
             t.a.b(slow);
             continue;
         }
-        t.a.shift_imm(Shift::Lsr, Width::X, T1, ADDR, 12)?;
-        t.a.load_store_reg(true, MemSize::B8, T1, PAGES, T1, false);
+        if t.options.kind_register {
+            t.a.ldr(
+                MemSize::B64,
+                T1,
+                CONTEXT,
+                field(offset_of!(Context, page_table)),
+            )?;
+            t.a.add(Width::X, T1, T1, ADDR, Shift::Lsr, 12)?;
+            t.a.ldr(MemSize::B8, T1, T1, 0)?;
+        } else {
+            t.a.shift_imm(Shift::Lsr, Width::X, T1, ADDR, 12)?;
+            t.a.load_store_reg(true, MemSize::B8, T1, PAGES, T1, false);
+        }
         t.a.tbz(false, T1, PAGE_WRITABLE_DATA_SPAN_BIT, slow);
         t.a.b(back);
     }
@@ -1338,8 +1362,8 @@ pub fn translate_block(
 /// block (its `CHAINED_ENTRY`), which leaves through `leave_routine`.
 /// Shared by every block of a code buffer (`compat`: compatibility mode,
 /// whose blocks keep r8–r15's host registers untouched).
-pub fn enter_routine(compat: bool) -> Result<Vec<u32>, EncodeError> {
-    let mut t = Translator::bare(routine_options(compat));
+pub fn enter_routine(compat: bool, kind_register: bool) -> Result<Vec<u32>, EncodeError> {
+    let mut t = Translator::bare(routine_options(compat, kind_register));
     // The block's address, before x3 takes a guest register.
     t.a.mov(Width::X, T1, HostReg::new(3));
     t.a.pair(
@@ -1370,6 +1394,8 @@ pub fn enter_routine(compat: bool) -> Result<Vec<u32>, EncodeError> {
         CONTEXT,
         field(offset_of!(Context, budget)),
     )?;
+    // Nothing pending, as `leave_routine` leaves it.
+    t.clear_kind()?;
     t.a.br(T1);
     t.a.finish()
 }
@@ -1378,8 +1404,8 @@ pub fn enter_routine(compat: bool) -> Result<Vec<u32>, EncodeError> {
 /// the exit's rip in `EXIT_RIP` and its status in `Context::status`: the
 /// flags pending into `rflags`, the guest's registers and the budget back
 /// into the `Cpu` and the `Context`, x19–x30 restored, the status returned.
-pub fn leave_routine(compat: bool) -> Result<Vec<u32>, EncodeError> {
-    let mut t = Translator::bare(routine_options(compat));
+pub fn leave_routine(compat: bool, kind_register: bool) -> Result<Vec<u32>, EncodeError> {
+    let mut t = Translator::bare(routine_options(compat, kind_register));
     t.lazy = Lazy::Dynamic;
     t.materialize()?;
     t.a.str(MemSize::B64, FLAGS, CPU, field(offset_of!(Cpu, rflags)))?;
@@ -1422,7 +1448,7 @@ pub fn leave_routine(compat: bool) -> Result<Vec<u32>, EncodeError> {
     t.a.finish()
 }
 
-fn routine_options(compat: bool) -> Options {
+fn routine_options(compat: bool, kind_register: bool) -> Options {
     Options {
         features: HostFeatures::BASELINE,
         chain: false,
@@ -1430,6 +1456,7 @@ fn routine_options(compat: bool) -> Options {
         compat,
         host_reads: None,
         page_table: true,
+        kind_register,
         entry_kind: 0,
     }
 }
@@ -1439,22 +1466,14 @@ fn routine_options(compat: bool) -> Options {
 /// `FLAGS` when the operation is not known at translation time: at the
 /// start of a block, whatever the block before left pending. Clears
 /// `KIND`; uses `R` and `T1`–`T3`.
-pub fn flags_routine() -> Result<Vec<u32>, EncodeError> {
-    let mut t = Translator::bare(Options {
-        features: HostFeatures::BASELINE,
-        chain: false,
-        concurrent: false,
-        compat: false,
-        host_reads: None,
-        page_table: true,
-        entry_kind: 0,
-    });
+pub fn flags_routine(kind_register: bool) -> Result<Vec<u32>, EncodeError> {
+    let mut t = Translator::bare(routine_options(false, kind_register));
     // A table of branches indexed by `KIND` (codes are below `KIND_CODES`): one
     // computed jump to the code for that operation.
     let table = t.a.new_label();
     let done = t.a.new_label();
-    t.a.ldr(MemSize::B64, T1, CONTEXT, field(offset_of!(Context, kind)))?;
-    t.a.logic_imm(Logic::And, Width::X, T1, T1, KIND_CODES as u64 - 1)?;
+    let kind = t.kind(T1)?;
+    t.a.logic_imm(Logic::And, Width::X, T1, kind, KIND_CODES as u64 - 1)?;
     t.a.adr(T2, table);
     t.a.add(Width::X, T2, T2, T1, Shift::Lsl, 2)?;
     t.a.br(T2);
@@ -5754,6 +5773,10 @@ impl Translator {
         self.a
             .logic_imm(Logic::Ands, Width::X, ZR, ADDR, !((1u64 << 47) - 1))?;
         self.a.b_cond(Cond::Ne, slow);
+        debug_assert!(
+            !self.options.kind_register,
+            "the page table's register holds KIND"
+        );
         self.a.shift_imm(Shift::Lsr, Width::X, T1, ADDR, 12)?;
         self.a
             .load_store_reg(true, MemSize::B8, T1, PAGES, T1, false);
@@ -5967,9 +5990,8 @@ impl Translator {
     fn carry_from_kind(&mut self, p: Pending) -> Emit {
         let code = p.code().expect("a plain operation");
         let (generic, back) = (self.a.new_label(), self.a.new_label());
-        self.a
-            .ldr(MemSize::B64, T1, CONTEXT, field(offset_of!(Context, kind)))?;
-        self.a.subs_imm(Width::X, ZR, T1, u32::from(code))?;
+        let kind = self.kind(T1)?;
+        self.a.subs_imm(Width::X, ZR, kind, u32::from(code))?;
         self.a.b_cond(Cond::Ne, generic);
         if p.mask & FLAG_CF != 0 {
             match p.kind {
@@ -6129,10 +6151,28 @@ impl Translator {
         Ok(())
     }
 
-    /// `Context::kind` = 0: nothing pending.
+    /// `KIND` = 0: nothing pending.
     fn clear_kind(&mut self) -> Emit {
+        if self.options.kind_register {
+            return self.a.movz(Width::X, KIND_REG, 0, 0);
+        }
         self.a
             .str(MemSize::B64, ZR, CONTEXT, field(offset_of!(Context, kind)))
+    }
+
+    /// The register holding `KIND`: `KIND_REG`, or `scratch` loaded from
+    /// `Context::kind`.
+    fn kind(&mut self, scratch: HostReg) -> Emit<HostReg> {
+        if self.options.kind_register {
+            return Ok(KIND_REG);
+        }
+        self.a.ldr(
+            MemSize::B64,
+            scratch,
+            CONTEXT,
+            field(offset_of!(Context, kind)),
+        )?;
+        Ok(scratch)
     }
 
     /// Before leaving the block: `KIND` says what is pending (the flags
@@ -6171,6 +6211,9 @@ impl Translator {
                 return self.publish_lazy();
             }
             Lazy::Static(p) => match p.code() {
+                Some(code) if self.options.kind_register => {
+                    self.a.movz(Width::X, KIND_REG, code, 0)?;
+                }
                 Some(code) => {
                     self.a.movz(Width::X, T1, code, 0)?;
                     self.a
@@ -6195,9 +6238,8 @@ impl Translator {
             Lazy::Static(p) => p,
             Lazy::Dynamic => {
                 let skip = self.a.new_label();
-                self.a
-                    .ldr(MemSize::B64, T1, CONTEXT, field(offset_of!(Context, kind)))?;
-                self.a.cbz(false, Width::X, T1, skip);
+                let kind = self.kind(T1)?;
+                self.a.cbz(false, Width::X, kind, skip);
                 self.a.ldr(
                     MemSize::B64,
                     T1,

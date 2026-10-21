@@ -1470,6 +1470,7 @@ fn region_tests_cover_nearby_accesses() {
                 compat: false,
                 host_reads: Some(38),
                 page_table: true,
+                kind_register: false,
                 entry_kind: 0,
             },
         )
@@ -1575,6 +1576,7 @@ fn concurrent_mode_emits_ordered_accesses() {
                 compat: false,
                 host_reads: None,
                 page_table: true,
+                kind_register: false,
                 entry_kind: 0,
             },
         )
@@ -1620,6 +1622,7 @@ fn dead_loads_need_no_order() {
                 compat: false,
                 host_reads: None,
                 page_table: true,
+                kind_register: false,
                 entry_kind: 0,
             },
         )
@@ -1660,6 +1663,7 @@ fn concurrent_mode_emits_lse_atomics() {
             compat: false,
             host_reads: None,
             page_table: true,
+            kind_register: false,
             entry_kind: 0,
         };
         translate(&block, end, options).unwrap()
@@ -1719,6 +1723,7 @@ fn dead_flags_are_not_computed() {
         compat: false,
         host_reads: None,
         page_table: true,
+        kind_register: false,
         entry_kind: 0,
     };
     let words = translate(&block, BlockEnd::Continue(0x1000 + at as u64), options).unwrap();
@@ -2519,6 +2524,7 @@ fn dump_translation() {
                 .ok()
                 .map(|b| b.parse().unwrap()),
             page_table: true,
+            kind_register: false,
             entry_kind: 0,
         },
     )

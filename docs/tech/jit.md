@@ -49,7 +49,7 @@ Summary of the current code (`crates/armor-jit`). The per-increment sections, fu
 
 | Register | Use |
 |---|---|
-| `x0`, `x1`, `x2` | `Cpu`, page table, `Context` |
+| `x0`, `x1`, `x2` | `Cpu`, page table (`KIND` with host protection, since 2026-10-22), `Context` |
 | `x22`–`x29` | rax, rcx, rdx, rbx, rsp, rbp, rsi, rdi |
 | `x8`, `x21` | r8, r9 (since 2026-10-20) |
 | `x18`, `x30` | r10, r11 (since 2026-10-15) |
@@ -711,6 +711,13 @@ Verification: the random tests and `conditions_after_deferred_and_partial_flags`
 ✅ Measured (Pi 5, 4K pages, `perf stat -e cycles:u` on the bench's 7-Zip workload, cache off, two runs each, other work on the machine): the dead load 39.2 → 37.6 billion cycles (10.05 → 9.35 s), adc and sbb 37.6 → 35.95 billion (9.24 s); the shifts' and multiplications' exits did not change 7-Zip's or `python-int`'s cycles measurably. The archive is byte for byte the native ARM64 7zz's.
 
 Verification: `dead_loads_need_no_order` (one LDR and one LDAPRB, and an LDAPR when the next instruction reads the register), `dead_loads_match_the_interpreter` (aligned and not, the next access in the data, in the guard page, in the read-only page, the first at armor's memory; plain, concurrent and with host protection); `carry_into_adc_and_sbb` (nine pending operations, seven adc/sbb forms, four kinds of reader and none, a memory destination); `conditions_after_deferred_and_partial_flags` covers shifts and multiplications read in the next block. Mutations caught: the next instruction's slow paths not going back to the relaxed load (a fault there showed the register without the load's value); the carry of a subtraction used for adc; the flags of adc/sbb skipped while live; shift and multiplication codes decoded as the wrong operation. That a relaxed load is needed only for `value_dead` loads is checked by the code test; a single-threaded test cannot tell the order apart. `difftest --lockstep` translates one instruction per block, so it never meets a relaxed load or a restart: `difftest --jit` and the tests above do.
+
+## `KIND` in a register (M11, 2026-10-22)
+With host protection (ADR-0046) translated code reads the page table only out of line (a write across two pages), so its register, `x1`, holds `KIND` instead of `Context::kind` (`Options::kind_register`, `KIND_REG`): an exit publishes the pending operation with one `mov x1, #code` instead of a `mov` and a store, and a block that needs the kind it was translated for compares `x1` without a load (`carry_from_kind`, the flag routine, the chain stubs). The out-of-line write edges load the table's address from `Context::page_table`, which the engine sets at each entry; the entry routine starts with `KIND` 0, as the exit routine leaves it. The engine publishes its shared routines for the mode the memory is in (a change empties the buffer), and the mode is part of the cache key. Without host protection (16K and 64K pages, the Windows backend) `KIND` stays in memory.
+
+✅ Measured (Pi 5, 4K pages, `perf stat`, cache off, `PYTHONHASHSEED=0`, other work on the machine): `python-int` with 10 million iterations 11.42 → 10.93 billion cycles (−4.3%; 3955 → 3728 instructions per iteration), with the bench's million 1.495 → 1.479 (translation included); `python-float` 1.359 → 1.343; 7-Zip 36.6 → 35.8 billion cycles. The hottest block of `python-int`'s dictionary lookup went from 402 to 320 words.
+
+Verification: the random programs with host protection (`random_code_matches_the_interpreter_with_host_protection`, plain and in concurrent mode) run in this mode, the others with `KIND` in memory; `difftest --jit` and `--lockstep` run in it on the Pi. Mutation caught: an exit that does not write `x1`.
 
 ## Translations cached on disk (ADR-0048, since 2026-10-20)
 A translated block depends only on its guest bytes, its address and the options: since the shared prologue and epilogue it does not depend on where it is published. `cache.rs` keeps the translations of a program in a file and the engine reuses them in later runs:
