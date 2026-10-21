@@ -210,6 +210,13 @@ impl Assembler {
         Label(self.labels.len() - 1)
     }
 
+    /// Makes the branches emitted so far to `from` go to `to` instead.
+    pub fn retarget(&mut self, from: Label, to: Label) {
+        for fixup in self.fixups.iter_mut().filter(|f| f.1 == from) {
+            fixup.1 = to;
+        }
+    }
+
     /// Where `label` is bound (in words), once it is.
     pub fn position(&self, label: Label) -> Option<usize> {
         self.labels[label.0]

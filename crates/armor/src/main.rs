@@ -612,8 +612,10 @@ fn run_thread(guest: &'static Guest, cpu: &mut Cpu, thread: &mut syscall::Thread
             let _turn = guest.always_serialize.then(|| guest.gil.lock());
             let budget = if guest.always_serialize {
                 turns.next()
-            } else {
+            } else if mem.is_concurrent() {
                 SIGNAL_CHECK_INTERVAL
+            } else {
+                ALONE_CHECK_INTERVAL
             };
             // One page-table lock for the whole block of instructions.
             let view = mem.view();
@@ -853,6 +855,13 @@ fn fatal_armor_error(message: std::fmt::Arguments) -> ! {
 /// Instructions between two checks for pending signals: short enough for
 /// a prompt delivery, long enough to cost nothing measurable.
 const SIGNAL_CHECK_INTERVAL: u64 = 10_000;
+
+/// The same with one guest thread (before concurrent mode): no other
+/// thread waits for the page-table lock it holds while it runs (`view`),
+/// and each return to the engine costs: `integer` under the JIT took 9%
+/// fewer cycles with this interval than with the shorter one
+/// (`tech/performance.md`).
+const ALONE_CHECK_INTERVAL: u64 = 100_000;
 
 /// The length of a thread's turns with the GIL (lockstep, `ARMOR_GIL`):
 /// between half and all of `SIGNAL_CHECK_INTERVAL` instructions, varied

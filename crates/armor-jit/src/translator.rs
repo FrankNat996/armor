@@ -731,6 +731,51 @@ fn shift_constant(count: ShiftCount, size: Size) -> Option<u32> {
     }
 }
 
+/// Whether `mov r1, r2` (registers mapped whole) can leave its copy to
+/// `next`, an in-place shift by a constant or ALU operation on r1 whose
+/// flags nothing observes (`live`, after it) and which reads r1 only as
+/// its first operand: `next` then reads r2 there (`Translator::first`),
+/// `lsr x1, x2, #n` instead of `mov x1, x2; lsr x1, x1, #n`. A 32-bit copy
+/// only into a 32-bit operation (the zero-extension is the operation's).
+fn copy_fuses(mov: &Instruction, next: &Instruction, live: u64) -> bool {
+    let Op::Mov {
+        dst: dst @ Operand::Reg(r1),
+        src: src @ Operand::Reg(_),
+    } = mov.op
+    else {
+        return false;
+    };
+    let (Some(h1), Some(h2)) = (whole_register(dst, mov.size), whole_register(src, mov.size))
+    else {
+        return false;
+    };
+    let may_write = flags_may_write(next);
+    let dead = may_write != 0 && may_write & live == 0 && flags_read(next) == 0;
+    if h1 == h2
+        || !dead
+        || whole_register(dst, next.size).is_none()
+        || (mov.size == Size::B32 && next.size != Size::B32)
+    {
+        return false;
+    }
+    match next.op {
+        Op::Shift {
+            op: ShiftOp::Shl | ShiftOp::Shr | ShiftOp::Sar,
+            dst: Operand::Reg(r),
+            count,
+        } => r == r1 && shift_constant(count, next.size).is_some_and(|n| n != 0),
+        Op::Alu {
+            op: AluOp::Add | AluOp::Sub | AluOp::And | AluOp::Or | AluOp::Xor,
+            dst: Operand::Reg(r),
+            src,
+        } => {
+            r == r1
+                && (matches!(src, Operand::Imm(_)) || matches!(src, Operand::Reg(r3) if r3 != r1))
+        }
+        _ => false,
+    }
+}
+
 /// The status flags `insn` writes, as the interpreter does, on every path
 /// that goes on inside the block: for the liveness of `live_flags`. An
 /// under-estimate is safe (flags then pass through as live). Shifts and
@@ -1667,6 +1712,11 @@ struct Translator {
     /// operation's flags from the previous one (`nzcv_valid`), which a
     /// jcc, setcc or cmov that reads registers only may use as they are.
     nzcv_now: bool,
+    /// Where the next in-place operation finds its first operand, when
+    /// the copy before it was left to it (`copy_fuses`).
+    first: Option<HostReg>,
+    /// The current instruction's copy is left to the next (`copy_fuses`).
+    fuse_copy: bool,
     /// The slow path of the read `check` just let the host check
     /// (`Options::host_reads`): the next guest load records it in
     /// `faults` (`mark_access`).
@@ -1723,8 +1773,8 @@ impl Translator {
     /// through.
     fn body(&mut self, block: &[GuestInstruction], live: &[u64], end: BlockEnd) -> Emit {
         let mut fell_through = true;
-        for (i, (g, &live)) in block.iter().zip(live).enumerate() {
-            self.live = live;
+        for (i, (g, &after)) in block.iter().zip(live).enumerate() {
+            self.live = after;
             self.last = i + 1 == block.len();
             debug_assert!(
                 supported(&g.insn),
@@ -1739,7 +1789,14 @@ impl Translator {
             if vector_access {
                 self.a.dmb(Barrier::Ish);
             }
+            self.fuse_copy = block
+                .get(i + 1)
+                .is_some_and(|n| copy_fuses(&g.insn, &n.insn, live[i + 1]));
             fell_through = self.instruction(g)?;
+            if !core::mem::take(&mut self.fuse_copy) {
+                debug_assert!(self.first.is_none(), "a copy left to {:?}", g.insn);
+                self.first = None;
+            }
             self.flush_misaligned();
             self.update_normal(&g.insn);
             // Checked addresses follow a base that moved by a constant;
@@ -1800,6 +1857,8 @@ impl Translator {
             kind_carries: Vec::new(),
             nzcv_valid: false,
             nzcv_now: false,
+            first: None,
+            fuse_copy: false,
             access_slow: None,
             simple_address: None,
             const_address: None,
@@ -1942,8 +2001,10 @@ impl Translator {
                 // immediate lands there, a register is one move.
                 Some(h) => {
                     let b = self.operand_in(h, src, size, at, &mut slow)?;
+                    if self.fuse_copy {
+                        self.first = Some(b);
                     // `mov r32, same r32` still clears the top half.
-                    if b != h || (size == Size::B32 && src == dst) {
+                    } else if b != h || (size == Size::B32 && src == dst) {
                         self.a.mov(w, h, b);
                     }
                 }
@@ -2335,6 +2396,37 @@ impl Translator {
                 self.a.data1(Data1::Rev, width(size), R, A);
                 self.store_reg(reg, size, R)?;
             }
+            Op::Imul { dst, src, factor } if whole_register(Operand::Reg(dst), size).is_some() => {
+                // Into the mapped destination; the factors go to `FA` and
+                // `FB`, sign-extended, only when the flags are wanted.
+                let h = whole_register(Operand::Reg(dst), size).expect("checked by the guard");
+                let b = self.operand_in(B, src, size, at, &mut slow)?;
+                let a = match factor {
+                    Some(imm) => {
+                        self.a.mov_imm64(A, imm as u64);
+                        A
+                    }
+                    None => h,
+                };
+                if self.skip_flags {
+                    self.a.madd(w, h, a, b, ZR);
+                } else {
+                    for (to, from) in [(FA, a), (FB, b)] {
+                        if size == Size::B64 {
+                            self.a.mov(Width::X, to, from);
+                        } else {
+                            self.a.bfm(true, Width::X, to, from, 0, 31)?;
+                        }
+                    }
+                    self.a.madd(w, h, FA, FB, ZR);
+                    self.flags_emitted |= STATUS_FLAGS;
+                    self.lazy = Lazy::Static(Pending::new(
+                        FlagKind::Mul { signed: true },
+                        size,
+                        STATUS_FLAGS,
+                    ));
+                }
+            }
             Op::Imul { dst, src, factor } => {
                 // Both factors sign-extended to 64 bits.
                 match src {
@@ -2506,13 +2598,25 @@ impl Translator {
             Op::Jcc { cond, rel } if !self.last => {
                 let taken = self.a.new_label();
                 self.branch_if(cond, taken)?;
-                self.side_exits
-                    .push((taken, target(next, rel, size), self.lazy, self.normal));
+                // Back to the block's start: straight into the loop's copy,
+                // rather than through a side exit that only branches there.
+                let to = target(next, rel, size);
+                match self.loop_head(to) {
+                    Some(head) => self.a.retarget(taken, head),
+                    None => self.side_exits.push((taken, to, self.lazy, self.normal)),
+                }
                 return Ok(true);
             }
             Op::Jcc { cond, rel } => {
                 let taken = self.a.new_label();
                 self.branch_if(cond, taken)?;
+                let to = target(next, rel, size);
+                if let Some(head) = self.loop_head(to) {
+                    // Straight into the loop's copy, as above.
+                    self.a.retarget(taken, head);
+                    self.exit_direct(next)?;
+                    return Ok(false);
+                }
                 // Each exit publishes the flags from the state at the
                 // jump: the first one's code may change `lazy` (it
                 // computes or copies them), on its own path only.
@@ -2520,7 +2624,7 @@ impl Translator {
                 self.exit_direct(next)?;
                 self.a.bind(taken);
                 self.lazy = lazy;
-                self.exit_direct(target(next, rel, size))?;
+                self.exit_direct(to)?;
                 return Ok(false);
             }
             Op::Call { rel } => {
@@ -2663,7 +2767,8 @@ impl Translator {
                 // The value zero-extended from `size`, before it changes.
                 self.a.mov(w, FA, h);
             }
-            self.a.shift_imm(shift, w, h, h, n)?;
+            let from = self.first.take().unwrap_or(h);
+            self.a.shift_imm(shift, w, h, from, n)?;
             let kind = FlagKind::Shift(op, Some(n as u8));
             if !self.skip_flags {
                 self.flags_emitted |= STATUS_FLAGS;
@@ -2914,45 +3019,67 @@ impl Translator {
             let rip = at.rip;
             self.slow_path(rip, slow)
         };
-        // B = divisor, extended to 64 bits as its signedness says.
-        match src {
-            Operand::Reg(reg) => self.read_reg(signed, B, reg, size)?,
+        // The divisor, extended to 64 bits as its signedness says: a
+        // mapped 64-bit register in place, else `B`.
+        let b = match src {
+            Operand::Reg(_) if size == Size::B64 && whole_register(src, size).is_some() => {
+                whole_register(src, size).expect("checked by the guard")
+            }
+            Operand::Reg(reg) => {
+                self.read_reg(signed, B, reg, size)?;
+                B
+            }
             Operand::Mem(m) => {
                 self.address(&m, at.next, true)?;
                 let mut slow = Some(slow);
                 self.check(Check::Read, bytes(size), at.rip, &mut slow)?;
                 self.guest_load(signed, size, B)?;
+                B
             }
             Operand::Imm(_) => unreachable!("checked by supported"),
-        }
-        self.a.cbz(false, Width::X, B, slow);
+        };
+        self.a.cbz(false, Width::X, b, slow);
         let (rax, rdx) = (Reg::Gpr(RAX as u8), Reg::Gpr(RDX as u8));
         if size == Size::B64 {
-            self.load_reg(A, rax, Size::B64)?;
-            self.load_reg(T1, rdx, Size::B64)?;
+            // rdx:rax where they are mapped, else in `A` and `T1`.
+            let (a, d) = match (register_host(RAX as u8), register_host(RDX as u8)) {
+                (Some(a), Some(d)) => (a, d),
+                _ => {
+                    self.load_reg(A, rax, Size::B64)?;
+                    self.load_reg(T1, rdx, Size::B64)?;
+                    (A, T1)
+                }
+            };
             if signed {
                 // rdx must be the sign of rax; MIN / -1 overflows.
-                self.a.shift_imm(Shift::Asr, Width::X, T2, A, 63)?;
-                self.a.subs(Width::X, ZR, T1, T2, Shift::Lsl, 0)?;
+                self.a.shift_imm(Shift::Asr, Width::X, T2, a, 63)?;
+                self.a.subs(Width::X, ZR, d, T2, Shift::Lsl, 0)?;
                 self.a.b_cond(Cond::Ne, slow);
                 let fine = self.a.new_label();
-                self.a.adds_imm(Width::X, ZR, B, 1)?;
+                self.a.adds_imm(Width::X, ZR, b, 1)?;
                 self.a.b_cond(Cond::Ne, fine);
                 self.a.mov_imm64(T2, 1 << 63);
-                self.a.subs(Width::X, ZR, A, T2, Shift::Lsl, 0)?;
+                self.a.subs(Width::X, ZR, a, T2, Shift::Lsl, 0)?;
                 self.a.b_cond(Cond::Eq, slow);
                 self.a.bind(fine);
             } else {
-                self.a.cbz(true, Width::X, T1, slow);
+                self.a.cbz(true, Width::X, d, slow);
             }
-            self.a.div(signed, Width::X, R, A, B);
+            self.a.div(signed, Width::X, R, a, b);
+            if a != A {
+                // The remainder straight into rdx (its sources are read
+                // first), then the quotient into rax.
+                self.a.msub(Width::X, d, R, b, a);
+                self.a.mov(Width::X, a, R);
+                return Ok(());
+            }
         } else {
             // The 64-bit dividend edx:eax.
             self.load_reg(A, rax, Size::B32)?;
             self.load_reg(T1, rdx, Size::B32)?;
             self.a
                 .logic(Logic::Orr, false, Width::X, A, A, T1, Shift::Lsl, 32)?;
-            self.a.div(signed, Width::X, R, A, B);
+            self.a.div(signed, Width::X, R, A, b);
             // The quotient must fit in 32 bits.
             if signed {
                 self.a.bfm(true, Width::X, T2, R, 0, 31)?;
@@ -2964,7 +3091,7 @@ impl Translator {
             }
         }
         // Remainder = dividend - quotient * divisor.
-        self.a.msub(Width::X, T1, R, B, A);
+        self.a.msub(Width::X, T1, R, b, A);
         if size == Size::B32 {
             self.a.mov(Width::W, R, R);
             self.a.mov(Width::W, T1, T1);
@@ -4128,21 +4255,9 @@ impl Translator {
         // the block translated from this state, which then loops in itself
         // (the budget checked at its head). One copy per block; a state
         // that does not imply the copy's leaves as any exit.
-        if Some(rip) == self.loop_start && matches!(self.lazy, Lazy::Static(_) | Lazy::Current) {
-            let (lazy, normal) = (self.lazy, self.normal);
-            let fits = |l: &Lazy, n: &[u32; 2]| {
-                *l == lazy && n[0] & !normal[0] == 0 && n[1] & !normal[1] == 0
-            };
-            if let Some(&(_, _, head, _)) = self.loops.iter().find(|(l, n, _, _)| fits(l, n)) {
-                self.a.b(head);
-                return Ok(());
-            }
-            if self.loops.is_empty() {
-                let head = self.a.new_label();
-                self.loops.push((lazy, normal, head, true));
-                self.a.b(head);
-                return Ok(());
-            }
+        if let Some(head) = self.loop_head(rip) {
+            self.a.b(head);
+            return Ok(());
         }
         // Before the `b`: once patched, it goes straight to the next block.
         self.publish_lazy()?;
@@ -4154,6 +4269,27 @@ impl Translator {
         self.a.b(stub);
         self.chain_stubs.push((site, stub, rip));
         Ok(())
+    }
+
+    /// The head of the block's copy for a jump to `rip` from the current
+    /// state, when `rip` is the block's start and the state implies the
+    /// copy's (the copy registered if there is none yet): `exit_direct`.
+    fn loop_head(&mut self, rip: u64) -> Option<Label> {
+        if Some(rip) != self.loop_start || !matches!(self.lazy, Lazy::Static(_) | Lazy::Current) {
+            return None;
+        }
+        let (lazy, normal) = (self.lazy, self.normal);
+        let fits =
+            |l: &Lazy, n: &[u32; 2]| *l == lazy && n[0] & !normal[0] == 0 && n[1] & !normal[1] == 0;
+        if let Some(&(_, _, head, _)) = self.loops.iter().find(|(l, n, _, _)| fits(l, n)) {
+            return Some(head);
+        }
+        if !self.loops.is_empty() {
+            return None;
+        }
+        let head = self.a.new_label();
+        self.loops.push((lazy, normal, head, true));
+        Some(head)
     }
 
     /// Leaves the block for the address in `target` (looked up in the
@@ -5089,6 +5225,10 @@ impl Translator {
             _ => None,
         };
         let defer = !self.skip_flags;
+        // The first operand, when a copy before was left to this
+        // operation (`copy_fuses`: then the flags are not wanted).
+        let from = self.first.take().unwrap_or(h);
+        debug_assert!(from == h || !defer);
         // A memory operand of an addition, subtraction or comparison goes
         // straight to `FB`, where the deferred flags keep it: the load is
         // the instruction's only access, and a load that faults leaves its
@@ -5146,12 +5286,12 @@ impl Translator {
             }
             let sub = op == AluOp::Sub;
             match (b, imm) {
-                (Some(b), _) if sub => self.a.sub(w, h, h, b, Shift::Lsl, 0)?,
-                (Some(b), _) => self.a.add(w, h, h, b, Shift::Lsl, 0)?,
+                (Some(b), _) if sub => self.a.sub(w, h, from, b, Shift::Lsl, 0)?,
+                (Some(b), _) => self.a.add(w, h, from, b, Shift::Lsl, 0)?,
                 (None, Some((negated, v))) if sub != negated => {
-                    self.a.sub_imm(w, h, h, v as u32)?
+                    self.a.sub_imm(w, h, from, v as u32)?
                 }
-                (None, Some((_, v))) => self.a.add_imm(w, h, h, v as u32)?,
+                (None, Some((_, v))) => self.a.add_imm(w, h, from, v as u32)?,
                 (None, None) => unreachable!("an immediate or a register"),
             }
             return Ok(());
@@ -5162,8 +5302,8 @@ impl Translator {
             _ => Logic::Eor,
         };
         match (b, imm) {
-            (Some(b), _) => self.a.logic(logic, false, w, h, h, b, Shift::Lsl, 0)?,
-            (None, Some((_, v))) => self.a.logic_imm(logic, w, h, h, v)?,
+            (Some(b), _) => self.a.logic(logic, false, w, h, from, b, Shift::Lsl, 0)?,
+            (None, Some((_, v))) => self.a.logic_imm(logic, w, h, from, v)?,
             (None, None) => unreachable!("an immediate or a register"),
         }
         if defer {

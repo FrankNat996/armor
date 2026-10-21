@@ -1910,7 +1910,8 @@ fn null_pointer_accesses_fault() {
 }
 
 /// Division edge cases: by zero, MIN / -1, quotients that do not fit,
-/// dividends wider than 64 bits; at 32 and 64 bits, signed and unsigned.
+/// dividends wider than 64 bits; at 32 and 64 bits, signed and unsigned,
+/// by rcx and by the dividend's own registers.
 #[test]
 fn division_edge_cases() {
     let guest = Guest::new();
@@ -1931,11 +1932,64 @@ fn division_edge_cases() {
             [0x48, 0xf7, 0xf1],   // div rcx
             [0x40, 0xf7, 0xf9],   // idiv ecx
             [0x40, 0xf7, 0xf1],   // div ecx
+            [0x48, 0xf7, 0xf8],   // idiv rax
+            [0x48, 0xf7, 0xf0],   // div rax
+            [0x48, 0xf7, 0xfa],   // idiv rdx
+            [0x48, 0xf7, 0xf2],   // div rdx
         ] {
             let mut cpu = guest.cpu(&mut rng);
             (cpu.regs[0], cpu.regs[1], cpu.regs[2]) = (rax, rcx, rdx);
             guest.compare(&code, &cpu, 1);
         }
+    }
+}
+
+/// `mov r1, r2` left to the operation after it (`copy_fuses`): shifts by
+/// a constant (0 included) and ALU operations on r1 by a register or an
+/// immediate, the copy and the operation at 32 or 64 bits each, with the
+/// operation's flags dead (`test` after it: fused) or live (not fused).
+#[test]
+fn copies_fused_with_the_next_operation() {
+    let guest = Guest::new();
+    let mut rng = Rng(47);
+    let rex = |w: u8, r: u8, b: u8| 0x40 | (w << 3) | ((r >> 3) << 2) | (b >> 3);
+    // rsp and rbx keep the stack and the data.
+    let regs = [0u8, 1, 2, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
+    for round in 0..4000 {
+        let (r1, r2, r3) = (rng.pick(&regs), rng.pick(&regs), rng.pick(&regs));
+        let (mov_w, op_w) = (rng.below(2) as u8, rng.below(2) as u8);
+        // mov r1, r2 (89 /r)
+        let mut code = vec![rex(mov_w, r2, r1), 0x89, 0xc0 | ((r2 & 7) << 3) | (r1 & 7)];
+        match rng.below(3) {
+            // shl, shr, sar r1, imm8 (c1 /4, /5, /7)
+            0 => {
+                let digit = rng.pick(&[4u8, 5, 7]);
+                let count = rng.pick(&[0u8, 1, 7, 31, 32, 63, 64]);
+                code.extend([
+                    rex(op_w, 0, r1),
+                    0xc1,
+                    0xc0 | (digit << 3) | (r1 & 7),
+                    count,
+                ]);
+            }
+            // add, sub, and, or, xor r1, r3 (01, 29, 21, 09, 31)
+            1 => {
+                let opcode = rng.pick(&[0x01u8, 0x29, 0x21, 0x09, 0x31]);
+                code.extend([rex(op_w, r3, r1), opcode, 0xc0 | ((r3 & 7) << 3) | (r1 & 7)]);
+            }
+            // add, or, and, sub, xor r1, imm32 (81 /0, /1, /4, /5, /6)
+            _ => {
+                let digit = rng.pick(&[0u8, 1, 4, 5, 6]);
+                let imm = rng.pick(&[1u32, 0xff, 0xfff, 0x1000, 0xffff_ff00, 0x8000_0000]);
+                code.extend([rex(op_w, 0, r1), 0x81, 0xc0 | (digit << 3) | (r1 & 7)]);
+                code.extend(imm.to_le_bytes());
+            }
+        }
+        if rng.below(2) == 0 {
+            code.extend([0x48, 0x85, 0xc0]); // test rax, rax
+        }
+        let cpu = guest.cpu(&mut rng);
+        guest.compare(&code, &cpu, round);
     }
 }
 
