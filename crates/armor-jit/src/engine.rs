@@ -649,9 +649,11 @@ impl Jit {
 
     /// What a translation depends on besides its bytes and address: the
     /// options (but the entry kind, a hint whose code is correct for any
-    /// kind) and MXCSR's default (which decides what is translated).
+    /// kind), MXCSR's default (which decides what is translated) and the
+    /// CPUID features declared on request (which decide how some
+    /// instructions run; none by default, which leaves the key as it was).
     fn cache_key(&self, options: &Options) -> u64 {
-        let bits = [
+        let mut bits = [
             u8::from(options.features.lse),
             u8::from(options.features.rcpc),
             u8::from(options.chain),
@@ -660,7 +662,16 @@ impl Jit {
             options.host_reads.map_or(0, |b| b as u8),
             u8::from(options.page_table),
             u8::from(self.default_mxcsr),
+            0,
+            0,
+            0,
+            0,
         ];
+        let declared = armor_cpu::cpuid::declared();
+        if declared == armor_cpu::cpuid::Features::NONE {
+            return cache::fnv1a(&bits[..8]);
+        }
+        bits[8..].copy_from_slice(&declared.bits().to_le_bytes());
         cache::fnv1a(&bits)
     }
 }

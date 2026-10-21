@@ -120,6 +120,39 @@ const QEMU_I386_CPU: &str = "qemu32,+sse3,+ssse3,+sse4.1,+sse4.2,+popcnt";
 /// implement, so that CPUID matches armor's (crates/armor-cpu/src/cpuid.rs).
 const QEMU_CPU: &str = "qemu64,-svm,+ssse3,+sse4.1,+sse4.2,+popcnt";
 
+/// armor's variable for the CPUID features it declares beyond its default
+/// model (docs/tech/avx.md). Set for xtask, it adds them to every run of
+/// `run` and `difftest`, in qemu's model as in armor's.
+const CPU_FEATURES_VARIABLE: &str = "ARMOR_CPU_FEATURES";
+
+/// The CPUID features of a run: `ARMOR_CPU_FEATURES` and `extra` (those a
+/// test case needs), as qemu names them: `+xsave,+...`, or empty.
+fn cpu_features(extra: &str) -> String {
+    let from_env = env::var(CPU_FEATURES_VARIABLE).unwrap_or_default();
+    let mut names: Vec<&str> = Vec::new();
+    for name in from_env.split(',').chain(extra.split(',')) {
+        let name = name.trim();
+        let name = name.strip_prefix('+').unwrap_or(name);
+        if !name.is_empty() && !names.contains(&name) {
+            names.push(name);
+        }
+    }
+    names
+        .iter()
+        .map(|n| format!("+{n}"))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// qemu's CPU `model` with `features` (`cpu_features`) added.
+fn with_features(model: &str, features: &str) -> String {
+    if features.is_empty() {
+        model.to_string()
+    } else {
+        format!("{model},{features}")
+    }
+}
+
 /// Assembly tests use no libc and a fixed load address (ELF type ET_EXEC).
 const GUEST_ASM_FLAGS: &[&str] = &["-nostdlib", "-static", "-no-pie"];
 
@@ -434,24 +467,25 @@ const RUN_TIME_LIMIT: &str = "120";
 pub const TIMED_OUT_STATUS: i32 = 124;
 
 impl Runner {
-    /// A command running `bin` with guest root `root`, under `timeout`.
-    fn command(self, paths: &Paths, bin: &Path, root: &Path) -> Command {
+    /// A command running `bin` with guest root `root`, under `timeout`,
+    /// with the CPUID features `features` (`cpu_features`) added to qemu's
+    /// model and to armor's.
+    fn command(self, paths: &Paths, bin: &Path, root: &Path, features: &str) -> Command {
         let mut cmd = Command::new("timeout");
         cmd.args(["--kill-after=5", RUN_TIME_LIMIT]);
         match self {
             Runner::Qemu if is_i386(bin) => {
-                cmd.arg(QEMU_I386)
-                    .args(["-cpu", QEMU_I386_CPU, "-L"])
-                    .arg(root);
-                cmd.env("QEMU_CPU", QEMU_I386_CPU)
-                    .env("QEMU_LD_PREFIX", root);
+                let model = with_features(QEMU_I386_CPU, features);
+                cmd.arg(QEMU_I386).args(["-cpu", &model, "-L"]).arg(root);
+                cmd.env("QEMU_CPU", &model).env("QEMU_LD_PREFIX", root);
             }
             Runner::Qemu => {
-                cmd.arg(QEMU).args(["-cpu", QEMU_CPU, "-L"]).arg(root);
+                let model = with_features(QEMU_CPU, features);
+                cmd.arg(QEMU).args(["-cpu", &model, "-L"]).arg(root);
                 // The same CPU and root for the x86_64 children the guest
                 // execs: binfmt_misc starts them under a new qemu, which
                 // reads these variables (ADR-0019).
-                cmd.env("QEMU_CPU", QEMU_CPU).env("QEMU_LD_PREFIX", root);
+                cmd.env("QEMU_CPU", &model).env("QEMU_LD_PREFIX", root);
             }
             Runner::Under(Engine::Box64) => {
                 cmd.arg(env::var_os("ARMOR_BOX64").unwrap_or_else(|| "box64".into()));
@@ -475,7 +509,9 @@ impl Runner {
                 cmd.env("FEX_ROOTFS", root);
             }
             Runner::Under(engine) => {
-                cmd.arg(&paths.armor).env("ARMOR_ROOT", root);
+                cmd.arg(&paths.armor)
+                    .env("ARMOR_ROOT", root)
+                    .env(CPU_FEATURES_VARIABLE, features);
                 // The JIT's cache (ADR-0048) of the test runs, never the
                 // user's: kept across runs, so that a second run finds it
                 // warm (unless ARMOR_JIT_CACHE_DIR says otherwise).
@@ -503,7 +539,12 @@ fn run(runner: Runner, name: &str, guest_args: &[String]) -> Result<(), String> 
     let bin = build_one(&paths, name)?;
     let output = exec(
         runner
-            .command(&paths, &bin, Path::new(guest_root(name)))
+            .command(
+                &paths,
+                &bin,
+                Path::new(guest_root(name)),
+                &cpu_features(difftest::case_features(name)),
+            )
             .args(guest_args),
     )?;
     print_outcome(&output);

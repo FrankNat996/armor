@@ -772,6 +772,13 @@ pub enum StateOp {
     Stmxcsr,
     /// clflush: no cache to flush here, but the byte must be readable.
     Clflush,
+    /// xsave (0F AE /4) and xrstor (/5), standard form: the state
+    /// components in edx:eax & XCR0 to or from a 64-byte aligned area
+    /// (Intel SDM vol. 1, 13.7 and 13.8). REX.W (xsave64, xrstor64) only
+    /// changes the format of the x87 instruction and data pointers,
+    /// which armor stores as 0.
+    Xsave,
+    Xrstor,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -936,6 +943,12 @@ pub enum Op {
     },
     Flag(FlagOp),
     Cpuid,
+    /// xgetbv (0F 01 D0): the extended control register ecx (XCR0 for 0)
+    /// in edx:eax.
+    Xgetbv,
+    /// xsetbv (0F 01 D1): privileged, #GP in user mode (with XSAVE
+    /// declared; #UD without, as xgetbv).
+    Xsetbv,
     /// rdtsc: the time-stamp counter in edx:eax.
     Rdtsc,
     /// An x87 FPU instruction (D8..DF, and fwait). `opcode` is the 11-bit
@@ -945,7 +958,8 @@ pub enum Op {
         op: X87Op,
         opcode: u16,
     },
-    /// fxsave, fxrstor, ldmxcsr, stmxcsr (0F AE /0../3, memory only).
+    /// fxsave, fxrstor, ldmxcsr, stmxcsr, xsave, xrstor (0F AE /0../5,
+    /// memory only), clflush (/7).
     State {
         op: StateOp,
         mem: Mem,

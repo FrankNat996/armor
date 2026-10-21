@@ -30,9 +30,20 @@ It is the constant `QEMU_CPU` in `xtask/src/main.rs`: `difftest` and `run` alway
 | 0x8000_0005 | 0x01ff01ff | 0x01ff01ff | 0x40020140 | 0x40020140 | L1 cache |
 | 0x8000_0006 | 0 | 0x42004200 | 0x02008140 | 0x00808140 | L2/L3 cache |
 | 0x8000_0008 | 0x00003028 | 0 | 0 | 0 | 48-bit virtual addresses, 40-bit physical |
-| all others | 0 | 0 | 0 | 0 | as qemu (AMD behaviour) |
+| 0xd | 0 | 0 | 0 | 0 | XSAVE: only with `+xsave` declared (below) |
+| others up to 0xd and 0x8000_000a | 0 | 0 | 0 | 0 | as qemu |
+| past 0xd or 0x8000_000a | leaf 0xd | | | | as qemu: the highest basic leaf, with the subleaf in ecx ✅ (qemu 10.0.13 with `+xsave`, `tech/avx.md`); zero while leaf 0xd is |
 
-Features **not** declared, and therefore never used by glibc: AVX/AVX2/AVX-512, BMI1/2, MOVBE, AES, PCLMULQDQ, OSXSAVE (so no `xgetbv`).
+Features **not** declared, and therefore never used by glibc: AVX/AVX2/AVX-512, BMI1/2, MOVBE, AES, PCLMULQDQ, XSAVE and OSXSAVE (so no `xgetbv`).
+
+## Features declared on request (`ARMOR_CPU_FEATURES`)
+Features on the way to x86-64-v3 that armor implements but does not declare by default (`tech/avx.md`): `ARMOR_CPU_FEATURES=+xsave` adds them, named as in qemu's `-cpu` (`cpuid::Features`). `cargo xtask difftest` and `run` add the variable's features to qemu's model too, and the cases that need some declare them in `CASE_FEATURES` (`xtask/src/difftest.rs`).
+
+| Feature | What changes | Measured against |
+|---|---|---|
+| `xsave` | leaf 1 ecx \|= XSAVE (bit 26), OSXSAVE (27): 0x8c982201; leaf 0xd subleaf 0 (3, 0x240, 0x240, 0), subleaf 1 (0, 0x240, 0, 0); XCR0 = 3 | ✅ `qemu64,...,+xsave` (`basic/cpuid`, `xsave/xsave`) |
+
+Without the feature its instructions raise #UD (`cpuid::reports`, `Extension::Xsave`).
 
 An instruction from an undeclared extension raises #UD (SIGILL), as on a CPU without it (ADR-0026, `cpuid::reports`, checked against these bits by a unit test).
 
@@ -51,7 +62,7 @@ The test `basic/cpuid` does not compare these leaves.
 - `tzcnt`/`lzcnt` (F3 0F BC/BD) are executed as `bsf`/`bsr`, as a CPU without BMI1/LZCNT does. The compiler emits them on purpose because they are compatible.
 
 ## When to change it
-When armor implements a new extension (for example SSE3, SSSE3, SSE4.1/4.2 in M4):
+When armor implements a new extension of x86-64-v3, it is first declared on request (`Features`, above); the default model changes only when the whole of v3 works (`tech/avx.md`). For the others (for example SSE3, SSSE3, SSE4.1/4.2 in M4):
 1. set the bit in `cpuid.rs`;
 2. remove the feature from the list of `-` in `QEMU_CPU`;
 3. measure again with the measurement program above and update this table;

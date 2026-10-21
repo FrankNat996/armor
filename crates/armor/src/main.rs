@@ -76,6 +76,12 @@ const JIT_STATS_VARIABLE: &str = "ARMOR_JIT_STATS";
 /// concurrent mode (the GIL of ADR-0018), to isolate a problem.
 const GIL_VARIABLE: &str = "ARMOR_GIL";
 
+/// Set in armor's environment: CPUID features to declare beyond the
+/// default model, for testing those on the way to x86-64-v3, named as in
+/// qemu's `-cpu` (`+xsave`; `armor_cpu::cpuid::Features`,
+/// docs/tech/avx.md).
+const CPU_FEATURES_VARIABLE: &str = "ARMOR_CPU_FEATURES";
+
 /// What the sandbox lets the guest reach (ADR-0027): `--allow` read-write
 /// (the current directory is added by `sandbox::enter`), and read-only the
 /// guest root, the program, armor and its libraries, and `--allow-ro`. A
@@ -233,6 +239,12 @@ fn main() -> ExitCode {
         && let Some(code) = apps::main(command, tail)
     {
         return code;
+    }
+    if let Some(list) = env::var_os(CPU_FEATURES_VARIABLE) {
+        match armor_cpu::cpuid::Features::parse(&list.to_string_lossy()) {
+            Ok(features) => armor_cpu::cpuid::declare(features),
+            Err(why) => return armor_error(format_args!("{CPU_FEATURES_VARIABLE}: {why}")),
+        }
     }
     let mut rest = &args[..];
     // Options given on the command line; a profile fills the others.

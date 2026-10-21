@@ -461,3 +461,93 @@ fn unmasked_sse_exceptions_follow_the_hardware() {
         }
     }
 }
+
+/// Declares XSAVE for the XSAVE tests. The declaration is process-wide and
+/// tests run in parallel, so tests only ever add XSAVE; none relies on its
+/// absence (the #UD without it is checked by `faults/xgetbv_undeclared`).
+fn declare_xsave() {
+    cpuid::declare(cpuid::Features::XSAVE);
+}
+
+#[test]
+fn xrstor_with_a_reserved_mxcsr_bit_is_a_general_protection_fault() {
+    // xrstor [0x400800] with edx:eax = SSE, MXCSR 0x11f80 in the area.
+    // qemu accepts it, as in ldmxcsr; the Intel SDM specifies #GP.
+    declare_xsave();
+    let mem = FlatMemory::with_code(&[0x0f, 0xae, 0x2c, 0x25, 0x00, 0x08, 0x40, 0x00]);
+    mem.write(BASE + 0x800 + 24, &0x1_1f80u32.to_le_bytes())
+        .unwrap();
+    mem.write(BASE + 0x800 + 512, &2u64.to_le_bytes()).unwrap();
+    let mut cpu = Cpu::new(BASE, STACK_TOP);
+    cpu.regs[RAX] = 2;
+    cpu.xmm[3] = 7;
+    assert!(matches!(
+        cpu.step(&mem),
+        Err(CpuError::Exception {
+            exception: Exception::GeneralProtection,
+            ..
+        })
+    ));
+    assert_eq!((cpu.mxcsr, cpu.xmm[3]), (0x1f80, 7));
+}
+
+#[test]
+fn xsave_leaves_the_bytes_of_other_components() {
+    // xsave [0x400800] with edx:eax = SSE: bytes 0..24 and 32..160 (x87)
+    // and 416..512 keep their contents; XSTATE_BV gains bit 1 only.
+    declare_xsave();
+    let mem = FlatMemory::with_code(&[0x0f, 0xae, 0x24, 0x25, 0x00, 0x08, 0x40, 0x00]);
+    mem.write(BASE + 0x800, &[0xa5; 576]).unwrap();
+    let mut cpu = Cpu::new(BASE, STACK_TOP);
+    cpu.regs[RAX] = 2;
+    cpu.xmm[1] = 0x1234;
+    cpu.step(&mem).unwrap();
+    let mut area = [0u8; 576];
+    mem.read(BASE + 0x800, &mut area).unwrap();
+    assert!(area[..24].iter().all(|&b| b == 0xa5));
+    assert!(area[32..160].iter().all(|&b| b == 0xa5));
+    assert!(area[416..512].iter().all(|&b| b == 0xa5));
+    assert_eq!(area[24..28], 0x1f80u32.to_le_bytes());
+    assert_eq!(area[176..192], 0x1234u128.to_le_bytes());
+    assert_eq!(area[512..520], 0xa5a5_a5a5_a5a5_a5a7u64.to_le_bytes());
+    assert!(area[520..].iter().all(|&b| b == 0xa5));
+}
+
+#[test]
+fn signal_xstate_round_trip_and_initial_components() {
+    declare_xsave();
+    let mut cpu = Cpu::new(BASE, STACK_TOP);
+    cpu.xmm[5] = 0x55;
+    cpu.mxcsr = 0x1fa0;
+    let image = cpu.xsave_image();
+    assert_eq!(image.len(), 576);
+    assert_eq!(
+        image[512..520],
+        3u64.to_le_bytes(),
+        "XSTATE_BV: x87 and SSE"
+    );
+    let mut other = Cpu::new(BASE, STACK_TOP);
+    other.restore_signal_xstate(&image, 3).unwrap();
+    assert_eq!((other.xmm, other.mxcsr), (cpu.xmm, cpu.mxcsr));
+    // A frame with only x87: SSE to its initial state, MXCSR unchanged.
+    other.restore_signal_xstate(&image, 1).unwrap();
+    assert_eq!((other.xmm[5], other.mxcsr), (0, 0x1fa0));
+    // A header xrstor refuses: nothing changes.
+    let mut bad = image.clone();
+    bad[512] = 7;
+    other.xmm[5] = 9;
+    assert!(other.restore_signal_xstate(&bad, 3).is_err());
+    assert_eq!(other.xmm[5], 9);
+}
+
+#[test]
+fn fxrstor_leaves_the_upper_ymm_halves() {
+    // fxrstor [0x400800] of an image of zeros but the x87 control word.
+    let mem = FlatMemory::with_code(&[0x0f, 0xae, 0x0c, 0x25, 0x00, 0x08, 0x40, 0x00]);
+    mem.write(BASE + 0x800, &0x37fu16.to_le_bytes()).unwrap();
+    let mut cpu = Cpu::new(BASE, STACK_TOP);
+    cpu.ymm_hi[2] = 0xabcd;
+    cpu.xmm[2] = 1;
+    cpu.step(&mem).unwrap();
+    assert_eq!((cpu.xmm[2], cpu.ymm_hi[2]), (0, 0xabcd));
+}

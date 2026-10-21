@@ -25,13 +25,14 @@ mod simd;
 mod sse;
 mod string;
 mod x87;
+pub mod xsave;
 
 use core::fmt;
 
 use armor_guest::{Access, GuestMemory, MemFault};
 use armor_x86::{
     AluOp, Base, BitTestOp, Cond, DecodeError, FlagOp, Instruction, LoopKind, MAX_INSTRUCTION_LEN,
-    Mem, Mode, Op, Operand, Reg, Segment, ShiftCount, Size, UnaryOp, decode_in,
+    Mem, Mode, Op, Operand, Reg, Segment, ShiftCount, Size, StateOp, UnaryOp, decode_in,
 };
 
 pub use alu::{
@@ -98,6 +99,11 @@ pub struct Cpu {
     /// Two 128-bit scratch registers (`Reg::Mm(8)`, `Reg::Mm(9)`) an MMX
     /// instruction runs its SSE equivalent on; zero between instructions.
     pub(crate) mm_scratch: [u128; 2],
+    /// Bits 255:128 of ymm0–ymm15, whose low halves are `xmm`. Legacy SSE
+    /// instructions leave them unchanged; fxsave and fxrstor do not save
+    /// or load them; xsave and xrstor do when XCR0 has the AVX component
+    /// (docs/tech/avx.md).
+    pub ymm_hi: [u128; 16],
     /// Decoded instructions; not architectural state.
     icache: icache::DecodeCache,
 }
@@ -279,6 +285,23 @@ impl From<MemFault> for Trap {
 
 type Exec<T> = Result<T, Trap>;
 
+/// Whether CPUID declares what `op` needs, for the instructions of the
+/// features declared only on request (`cpuid::Features`); without it they
+/// raise #UD. The decoder decodes them whatever CPUID says.
+fn declared(op: &Op) -> bool {
+    use cpuid::Features;
+    let needs = match op {
+        Op::Xgetbv
+        | Op::Xsetbv
+        | Op::State {
+            op: StateOp::Xsave | StateOp::Xrstor,
+            ..
+        } => Features::XSAVE,
+        _ => return true,
+    };
+    cpuid::declared().contains(needs)
+}
+
 impl Cpu {
     /// CPU state at process entry: every register zero except rsp.
     pub fn new(entry: u64, stack_pointer: u64) -> Cpu {
@@ -296,6 +319,7 @@ impl Cpu {
             mode: Mode::Long,
             segments: Segments::default(),
             mm_scratch: [0; 2],
+            ymm_hi: [0; 16],
             icache: icache::DecodeCache::new(),
         }
     }
@@ -357,11 +381,13 @@ impl Cpu {
     /// process): x87 as after FNINIT with zeroed registers, MXCSR at its
     /// default, xmm registers zeroed (✅ Xeon X5675: a handler sees xmm
     /// 0, MXCSR 0x1f80, control word 0x37f, every tag empty, whatever the
-    /// interrupted code had; the frame keeps that for sigreturn).
+    /// interrupted code had; the frame keeps that for sigreturn), and the
+    /// upper ymm halves zeroed, the initial state of the AVX component.
     pub fn reset_fpu(&mut self) {
         self.x87 = x87::X87::default();
         self.mxcsr = INITIAL_MXCSR;
         self.xmm = [0; 16];
+        self.ymm_hi = [0; 16];
     }
 
     /// Runs instructions until a `syscall` is reached.
@@ -408,7 +434,14 @@ impl Cpu {
         let mut window = [0u8; MAX_INSTRUCTION_LEN];
         let available = mem.fetch(self.rip, &mut window);
         match decode_in(&window[..available], self.mode) {
-            Ok(insn) => Ok(insn),
+            Ok(insn) if declared(&insn.op) => Ok(insn),
+            // An instruction of a feature declared only on request
+            // (`cpuid::Features`) and not declared: #UD.
+            Ok(_) => Err(CpuError::Decode {
+                rip: self.rip,
+                bytes: window[..available].to_vec(),
+                error: DecodeError::Invalid,
+            }),
             // An instruction of an extension armor's CPUID does not report
             // (AVX, AVX-512, AES-NI, …): #UD, as on such a CPU (ADR-0026).
             Err(DecodeError::Unsupported(_))
@@ -901,7 +934,19 @@ impl Cpu {
             // A full barrier, whatever the kind: lfence and sfence order
             // less on x86, and fences are rare (ADR-0023).
             Op::Fence => core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst),
-            Op::Privileged => return Err(Trap::Exception(Exception::GeneralProtection)),
+            Op::Privileged | Op::Xsetbv => {
+                return Err(Trap::Exception(Exception::GeneralProtection));
+            }
+            // XCR0 for ecx = 0; XCR1 (XINUSE) only with XGETBV_ECX_1,
+            // which armor does not declare: #GP for any other ecx.
+            Op::Xgetbv => {
+                if self.regs[RCX] as u32 != 0 {
+                    return Err(Trap::Exception(Exception::GeneralProtection));
+                }
+                let xcr0 = cpuid::xcr0(cpuid::declared());
+                self.regs[RAX] = xcr0 & 0xffff_ffff;
+                self.regs[RDX] = xcr0 >> 32;
+            }
             Op::Int3 => return Err(Trap::Exception(Exception::Breakpoint(insn.len as u8))),
             Op::Int1 => return Err(Trap::Exception(Exception::Debug)),
             Op::Sse { op, dst, src } => self.sse(op, dst, src, next, mem)?,

@@ -171,26 +171,47 @@ const HARDWARE_ONLY: [(&str, &str); 22] = [
     ),
 ];
 
-/// Why `name` runs with `--oracle` only, if it does. `*/stem` matches the
-/// C program `stem` in every variant; with `@i386` only the i386 ones.
+/// Why `name` runs with `--oracle` only, if it does.
 fn hardware_only(name: &str) -> Option<&'static str> {
-    HARDWARE_ONLY.iter().find_map(|&(pattern, why)| {
-        let matches = match pattern.strip_prefix("*/") {
-            None => pattern == name,
-            Some(rest) => {
-                let (stem, i386_only) = match rest.strip_suffix("@i386") {
-                    Some(stem) => (stem, true),
-                    None => (rest, false),
-                };
-                name.split_once('/').is_some_and(|(variant, program)| {
-                    program == stem
-                        && variant.starts_with('c')
-                        && (!i386_only || variant.starts_with("c32"))
-                })
-            }
-        };
-        matches.then_some(why)
-    })
+    HARDWARE_ONLY
+        .iter()
+        .find_map(|&(pattern, why)| matches_case(pattern, name).then_some(why))
+}
+
+/// Whether case `name` matches `pattern`: the name itself; `*/stem`, the C
+/// program `stem` in every variant (with `@i386` only the i386 ones); a
+/// name ending with `/`, every case under it.
+fn matches_case(pattern: &str, name: &str) -> bool {
+    if pattern.ends_with('/') {
+        return name.starts_with(pattern);
+    }
+    match pattern.strip_prefix("*/") {
+        None => pattern == name,
+        Some(rest) => {
+            let (stem, i386_only) = match rest.strip_suffix("@i386") {
+                Some(stem) => (stem, true),
+                None => (rest, false),
+            };
+            name.split_once('/').is_some_and(|(variant, program)| {
+                program == stem
+                    && variant.starts_with('c')
+                    && (!i386_only || variant.starts_with("c32"))
+            })
+        }
+    }
+}
+
+/// Cases that test instructions of CPUID features armor declares only on
+/// request (docs/tech/avx.md): qemu and armor run them with these features
+/// declared, so that they execute instead of raising #UD under both.
+const CASE_FEATURES: [(&str, &str); 1] = [("xsave/", "+xsave")];
+
+/// The CPUID features case `name` needs (`CASE_FEATURES`), or "".
+pub fn case_features(name: &str) -> &'static str {
+    CASE_FEATURES
+        .iter()
+        .find_map(|&(pattern, features)| matches_case(pattern, name).then_some(features))
+        .unwrap_or("")
 }
 
 /// C tests (stems of `tests/guest/c/`) whose reference is the same source
@@ -584,7 +605,8 @@ fn collect(paths: &Paths, filter: &[String]) -> Result<Vec<Run>, String> {
 }
 
 fn execute(runner: Runner, paths: &Paths, run: &Run) -> Result<Output, String> {
-    let mut cmd = runner.command(paths, &run.bin, &run.root);
+    let features = crate::cpu_features(case_features(&run.name));
+    let mut cmd = runner.command(paths, &run.bin, &run.root, &features);
     cmd.args(&run.args);
     if run.name.ends_with(CLOSED_STDOUT_SUFFIX) {
         let (reader, writer) = std::io::pipe().map_err(|e| format!("cannot create a pipe: {e}"))?;

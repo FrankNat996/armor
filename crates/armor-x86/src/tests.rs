@@ -419,6 +419,36 @@ fn errors() {
         decode(&[0x0f, 0xae, 0xc0]),
         Err(DecodeError::Unsupported(_))
     ));
+    // XSAVE: xgetbv, xsetbv, xsave [rsp+0x40] and xrstor64 [rdi] (objdump).
+    assert_eq!(decode(&[0x0f, 0x01, 0xd0]).unwrap().op, Op::Xgetbv);
+    assert_eq!(decode(&[0x0f, 0x01, 0xd1]).unwrap().op, Op::Xsetbv);
+    let xsave = decode(&[0x0f, 0xae, 0x64, 0x24, 0x40]).unwrap();
+    assert!(matches!(
+        xsave.op,
+        Op::State {
+            op: StateOp::Xsave,
+            mem: Mem { disp: 0x40, .. }
+        }
+    ));
+    assert_eq!(xsave.len, 5);
+    assert!(matches!(
+        decode(&[0x48, 0x0f, 0xae, 0x2f]).unwrap().op,
+        Op::State {
+            op: StateOp::Xrstor,
+            ..
+        }
+    ));
+    // xsaveopt, and clwb (66 0F AE /6), the rest of 0F 01: not executed.
+    for bytes in [
+        &[0x0f, 0xae, 0x37][..],
+        &[0x66, 0x0f, 0xae, 0x37],
+        &[0x0f, 0x01, 0xf9],
+    ] {
+        assert!(
+            matches!(decode(bytes), Err(DecodeError::Unsupported(_))),
+            "{bytes:02x?}"
+        );
+    }
     // Operand-size prefix on branches and stack operations: not supported.
     for bytes in [
         &[0x66, 0x74, 0x00][..],
@@ -902,7 +932,7 @@ fn fuzz_decoder() {
 #[test]
 fn length_only_decoder() {
     use crate::{Extension, length};
-    let cases: [(&[u8], Extension); 14] = [
+    let cases: [(&[u8], Extension); 18] = [
         // vpcmpeqb ymm1, ymm0, [rdi]
         (&[0xc5, 0xfd, 0x74, 0x0f], Extension::Vex),
         // vzeroupper: no ModRM.
@@ -929,6 +959,14 @@ fn length_only_decoder() {
         (&[0x8f, 0xe8, 0x78, 0xc2, 0xc1, 0x03], Extension::Xop),
         // xsha256 (VIA PadLock)
         (&[0xf3, 0x0f, 0xa6, 0xd0], Extension::Padlock),
+        // xgetbv
+        (&[0x0f, 0x01, 0xd0], Extension::Xsave),
+        // xsaveopt [rsp+0x40]
+        (&[0x0f, 0xae, 0x74, 0x24, 0x40], Extension::Xsave),
+        // xsavec [rsp+0x40]
+        (&[0x0f, 0xc7, 0x64, 0x24, 0x40], Extension::Xsave),
+        // rdrand eax (0F C7 /6, a register): not XSAVE.
+        (&[0x0f, 0xc7, 0xf0], Extension::Base),
         // mov rax, imm64
         (&[0x48, 0xb8, 1, 2, 3, 4, 5, 6, 7, 8], Extension::Base),
     ];

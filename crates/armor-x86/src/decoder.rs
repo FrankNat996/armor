@@ -712,6 +712,22 @@ impl Decoder<'_> {
                     Size::B8,
                 ))
             }
+            // xgetbv and xsetbv; the rest of the group is system
+            // instructions.
+            0x01 => match self.peek_modrm()? {
+                modrm @ (0xd0 | 0xd1) if self.sse_prefix() == 0 => {
+                    self.u8()?;
+                    let op = if modrm == 0xd0 {
+                        Op::Xgetbv
+                    } else {
+                        Op::Xsetbv
+                    };
+                    Ok((op, Size::B32))
+                }
+                _ => Err(DecodeError::Unsupported(
+                    "0F 01 group (system instructions)",
+                )),
+            },
             0xa2 => Ok((Op::Cpuid, Size::B64)),
             0xa3 | 0xab | 0xb3 | 0xbb => {
                 let op = match opcode {
@@ -775,6 +791,16 @@ impl Decoder<'_> {
                         ][usize::from(digit)];
                         Ok((Op::State { op, mem }, size))
                     }
+                    // xsave, xrstor (with 66, F2 or F3 other
+                    // instructions).
+                    (Rm::Mem(mem), digit @ (4 | 5)) if self.sse_prefix() == 0 => {
+                        let op = if digit == 4 {
+                            StateOp::Xsave
+                        } else {
+                            StateOp::Xrstor
+                        };
+                        Ok((Op::State { op, mem }, size))
+                    }
                     (Rm::Mem(mem), 7) => Ok((
                         Op::State {
                             op: StateOp::Clflush,
@@ -783,7 +809,7 @@ impl Decoder<'_> {
                         size,
                     )),
                     _ => Err(DecodeError::Unsupported(
-                        "0F AE group (fxsave, ldmxcsr, ...)",
+                        "0F AE group (xsaveopt, clwb, rdfsbase, ...)",
                     )),
                 }
             }
@@ -881,7 +907,7 @@ impl Decoder<'_> {
                     }
                     (1, Rm::Reg(_)) => Err(DecodeError::Invalid),
                     _ => Err(DecodeError::Unsupported(
-                        "0F C7 group (rdrand, rdseed, rdpid)",
+                        "0F C7 group (rdrand, rdseed, rdpid, xsavec, xsaves)",
                     )),
                 }
             }
