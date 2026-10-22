@@ -53,6 +53,20 @@ pub const CONTEXT_CONTROL: u32 = CONTEXT_AMD64 | 1;
 pub const CONTEXT_INTEGER: u32 = CONTEXT_AMD64 | 2;
 pub const CONTEXT_FLOATING_POINT: u32 = CONTEXT_AMD64 | 8;
 
+/// `MEM_EXTENDED_PARAMETER`: the type in the low 8 bits of the first
+/// word, the value in the second.
+#[repr(C)]
+pub struct MemExtendedParameter {
+    pub kind: u64,
+    pub value: u64,
+}
+
+/// `MemExtendedParameterAttributeFlags`.
+pub const MEM_EXTENDED_PARAMETER_ATTRIBUTE_FLAGS: u64 = 5;
+/// The pages hold ARM64EC code: marked in the PEB's EC code bitmap, so that
+/// the system runs them natively rather than as x86-64 code.
+pub const MEM_EXTENDED_PARAMETER_EC_CODE: u64 = 0x40;
+
 #[link(name = "ntdll")]
 unsafe extern "system" {
     pub fn NtAllocateVirtualMemory(
@@ -62,6 +76,15 @@ unsafe extern "system" {
         size: *mut usize,
         kind: u32,
         protect: u32,
+    ) -> NtStatus;
+    pub fn NtAllocateVirtualMemoryEx(
+        process: Handle,
+        base: *mut *mut c_void,
+        size: *mut usize,
+        kind: u32,
+        protect: u32,
+        parameters: *mut MemExtendedParameter,
+        count: u32,
     ) -> NtStatus;
     pub fn NtTerminateProcess(process: Handle, status: NtStatus) -> NtStatus;
     pub fn NtReadVirtualMemory(

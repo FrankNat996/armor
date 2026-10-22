@@ -148,6 +148,7 @@ impl Engine {
         let mut base: *mut c_void = core::ptr::null_mut();
         let mut size = BUFFER_SIZE;
         // SAFETY: a new region for generated code.
+        #[cfg(not(target_arch = "arm64ec"))]
         let status = unsafe {
             nt::NtAllocateVirtualMemory(
                 -1isize as nt::Handle,
@@ -156,6 +157,26 @@ impl Engine {
                 &mut size,
                 nt::MEM_RESERVE | nt::MEM_COMMIT,
                 nt::PAGE_EXECUTE_READWRITE,
+            )
+        };
+        // ARM64EC: marked as ARM64EC code (the PEB's bitmap). Otherwise the
+        // system takes the buffer for x86-64 code: `NtContinue` into a
+        // slow path, after a fault, would run the emulator there.
+        // SAFETY: as above.
+        #[cfg(target_arch = "arm64ec")]
+        let status = unsafe {
+            let mut ec = nt::MemExtendedParameter {
+                kind: nt::MEM_EXTENDED_PARAMETER_ATTRIBUTE_FLAGS,
+                value: nt::MEM_EXTENDED_PARAMETER_EC_CODE,
+            };
+            nt::NtAllocateVirtualMemoryEx(
+                -1isize as nt::Handle,
+                &mut base,
+                &mut size,
+                nt::MEM_RESERVE | nt::MEM_COMMIT,
+                nt::PAGE_EXECUTE_READWRITE,
+                &mut ec,
+                1,
             )
         };
         if status != nt::STATUS_SUCCESS {
