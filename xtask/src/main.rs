@@ -185,6 +185,7 @@ const I386_SHARED_C_TESTS: &[&str] = &[
     "scm_rights_truncated",
     "shared_memory",
     "signals_async",
+    "signals_write",
     "sockets",
     "strings",
     "sysv_semaphores",

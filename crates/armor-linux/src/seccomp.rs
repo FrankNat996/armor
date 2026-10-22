@@ -98,6 +98,15 @@ pub struct Shared {
     synced: Mutex<Option<Seccomp>>,
 }
 
+impl Shared {
+    /// A word that is nonzero once a filter was installed for every thread
+    /// of the process (TSYNC), for code that checks it without calling in
+    /// (the JIT's syscalls): read with acquire.
+    pub fn generation_word(&self) -> *const AtomicU64 {
+        &self.generation
+    }
+}
+
 /// What a syscall gets.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Verdict {

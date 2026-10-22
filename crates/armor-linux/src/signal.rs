@@ -130,6 +130,13 @@ thread_local! {
         const { [NO_INFO; NSIG as usize] };
 }
 
+/// The calling thread's word of recorded signals, for code that checks it
+/// without calling in (the JIT's syscalls, `Jit::set_fast_syscalls`):
+/// nonzero while a signal waits. Valid as long as the thread lives.
+pub fn pending_word() -> *const AtomicU64 {
+    PENDING.with(|p| p as *const AtomicU64)
+}
+
 fn pending_bits() -> u64 {
     PENDING.with(|p| p.load(Ordering::Acquire))
 }

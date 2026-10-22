@@ -36,8 +36,8 @@ use alloc::vec::Vec;
 use core::mem::offset_of;
 
 use armor_cpu::{
-    Cpu, FLAG_AF, FLAG_CF, FLAG_OF, FLAG_PF, FLAG_SF, FLAG_ZF, R11, RAX, RCX, RDX, RSP,
-    STATUS_FLAGS, mmx_layout,
+    Cpu, FLAG_AF, FLAG_CF, FLAG_OF, FLAG_PF, FLAG_SF, FLAG_ZF, R9, R10, R11, RAX, RCX, RDI, RDX,
+    RSI, RSP, STATUS_FLAGS, mmx_layout,
 };
 use armor_guest::{
     PAGE_READABLE_BIT, PAGE_READABLE_SPAN_BIT, PAGE_WRITABLE_DATA_BIT, PAGE_WRITABLE_DATA_SPAN_BIT,
@@ -68,6 +68,41 @@ pub const EXIT_CHAIN: u64 = 2;
 /// Exit status: a `syscall` (64-bit mode) ran, with `rcx` and `r11` set as
 /// it sets them and rip after it: the engine returns `Step::Syscall`.
 pub const EXIT_SYSCALL: u64 = 3;
+
+/// Exit status: a syscall made by translated code (`Options::fast_syscalls`)
+/// returned with a signal recorded meanwhile: back to the engine's caller,
+/// which delivers it, rip after the syscall.
+pub const EXIT_SIGNAL: u64 = 4;
+
+/// Exit status: as `EXIT_SIGNAL`, and the syscall (`rax`'s number on the
+/// way in, saved in `Context::interrupted`) returned EINTR: the caller may
+/// restart it, as for one it made itself.
+pub const EXIT_INTERRUPTED: u64 = 5;
+
+/// The syscalls translated code makes itself (`Options::fast_syscalls`), by
+/// x86-64 number: the AArch64 number, 0 for the others. Each has the same
+/// arguments and result on both, takes integers only or reads guest memory
+/// only (`write`, whose buffer is checked to lie in the guest's region),
+/// and is what armor's own handler does (`host`, or a copy for `write`).
+pub static FAST_SYSCALLS: [u8; FAST_SYSCALL_LIMIT] = {
+    let mut table = [0u8; FAST_SYSCALL_LIMIT];
+    table[1] = 64; // write
+    table[8] = 62; // lseek
+    table[24] = 124; // sched_yield
+    table[39] = 172; // getpid
+    table[102] = 174; // getuid
+    table[104] = 176; // getgid
+    table[107] = 175; // geteuid
+    table[108] = 177; // getegid
+    table[110] = 173; // getppid
+    table[186] = 178; // gettid
+    table
+};
+/// x86-64 syscall numbers below this can be in `FAST_SYSCALLS`.
+pub const FAST_SYSCALL_LIMIT: usize = 256;
+/// x86-64 `write`, whose buffer translated code checks first.
+const X86_WRITE: u32 = 1;
+const EINTR: u32 = 4;
 
 /// The most guest instructions in one block.
 pub const MAX_BLOCK_INSTRUCTIONS: usize = 64;
@@ -115,6 +150,17 @@ pub struct Context {
     /// The page table (`MemView::page_table`), for the rare paths that
     /// read it with `Options::kind_register` (`PAGES` holds `KIND` then).
     pub page_table: u64,
+    /// `Options::fast_syscalls`: the address of the thread's word of
+    /// recorded signals (nonzero: one is waiting), 0 when translated code
+    /// must leave every syscall to the engine. Kept by the engine's caller.
+    pub signals: u64,
+    /// The address of a word that is nonzero once the process has a seccomp
+    /// filter (read with acquire), when `signals` is not 0.
+    pub seccomp: u64,
+    /// `FAST_SYSCALLS`.
+    pub fast_syscalls: u64,
+    /// After `EXIT_INTERRUPTED`: the syscall's number.
+    pub interrupted: u64,
 }
 
 /// Entries of the indirect-jump table (`Context::targets`).
@@ -154,6 +200,11 @@ pub struct Options {
     /// of line. One instruction less where an exit publishes it and where a
     /// block reads it.
     pub kind_register: bool,
+    /// The syscalls of `FAST_SYSCALLS` made by translated code itself when
+    /// `Context::signals` allows them: 64-bit mode, host protection (the
+    /// host's protections are the guest's, so the kernel faults where x86
+    /// would) and `KIND` in its register. Not in lockstep.
+    pub fast_syscalls: bool,
     /// `Context::kind` when the block was first reached: what the blocks
     /// before it usually leave pending. An instruction that needs only CF
     /// of those flags computes it inline when `KIND` still says so, and
@@ -255,6 +306,8 @@ const PAGES: HostReg = HostReg::new(1);
 /// `KIND` with `Options::kind_register`: the page table's register, which
 /// translated code then needs only out of line (`Context::page_table`).
 const KIND_REG: HostReg = PAGES;
+/// `svc #0`.
+const SVC_0: u32 = 0xD400_0001;
 const CONTEXT: HostReg = HostReg::new(2);
 const FLAGS: HostReg = HostReg::new(12);
 const BUDGET: HostReg = HostReg::new(13);
@@ -1459,6 +1512,7 @@ fn routine_options(compat: bool, kind_register: bool) -> Options {
         host_reads: None,
         page_table: true,
         kind_register,
+        fast_syscalls: false,
         entry_kind: 0,
     }
 }
@@ -2194,6 +2248,9 @@ impl Translator {
                 self.a.mov_imm64(B, next);
                 self.store_reg(Reg::Gpr(RCX as u8), Size::B64, B)?;
                 self.store_reg(Reg::Gpr(R11 as u8), Size::B64, FLAGS)?;
+                if self.options.fast_syscalls {
+                    self.fast_syscall(next)?;
+                }
                 self.exit(next, EXIT_SYSCALL)?;
                 return Ok(false);
             }
@@ -6177,6 +6234,106 @@ impl Translator {
             field(offset_of!(Context, kind)),
         )?;
         Ok(scratch)
+    }
+
+    /// A syscall of `FAST_SYSCALLS` made here, when `Context::signals`
+    /// allows it, no signal waits (it is delivered first, by the engine's
+    /// caller), the process has no seccomp filter, and a `write`'s buffer
+    /// lies in the guest's region; otherwise this falls through to the exit
+    /// to the engine. The flags are current, `rcx` and `r11` set. After it,
+    /// a signal recorded meanwhile goes back to the engine's caller (with
+    /// EINTR, as an interrupted syscall). The kernel keeps every register
+    /// but x0 across `svc`.
+    fn fast_syscall(&mut self, next: u64) -> Emit {
+        let engine = self.a.new_label();
+        let rax = register_host(RAX as u8).expect("rax is mapped");
+        let reg = |n: usize| register_host(n as u8).expect("the argument registers are mapped");
+        let ctx = |f: usize| field(f);
+        self.a
+            .ldr(MemSize::B64, T1, CONTEXT, ctx(offset_of!(Context, signals)))?;
+        self.a.cbz(false, Width::X, T1, engine);
+        self.a.ldr(MemSize::B64, T1, T1, 0)?;
+        self.a.cbz(true, Width::X, T1, engine);
+        self.a
+            .ldr(MemSize::B64, T1, CONTEXT, ctx(offset_of!(Context, seccomp)))?;
+        self.a.ldar(MemSize::B64, T1, T1);
+        self.a.cbz(true, Width::X, T1, engine);
+        self.a
+            .subs_imm(Width::X, ZR, rax, FAST_SYSCALL_LIMIT as u32)?;
+        self.a.b_cond(Cond::Hs, engine);
+        self.a.ldr(
+            MemSize::B64,
+            T1,
+            CONTEXT,
+            ctx(offset_of!(Context, fast_syscalls)),
+        )?;
+        self.a.load_store_reg(true, MemSize::B8, B, T1, rax, false);
+        self.a.cbz(false, Width::X, B, engine);
+        // write: the buffer [rsi, rsi + rdx) in the region (else the kernel
+        // could read armor's memory; the engine's copy faults as x86 does).
+        let checked = self.a.new_label();
+        self.a.subs_imm(Width::X, ZR, rax, X86_WRITE)?;
+        self.a.b_cond(Cond::Ne, checked);
+        let bits = self
+            .options
+            .host_reads
+            .expect("fast syscalls need host protection");
+        self.a
+            .adds(Width::X, A, reg(RSI), reg(RDX), Shift::Lsl, 0)?;
+        self.a.b_cond(Cond::Hs, engine);
+        self.a.mov_imm64(T1, 1u64 << bits);
+        self.a.subs(Width::X, ZR, A, T1, Shift::Lsl, 0)?;
+        self.a.b_cond(Cond::Hi, engine);
+        self.a.bind(checked);
+        // The number for the exit's EINTR, before rax takes the result.
+        self.a.str(
+            MemSize::B64,
+            rax,
+            CONTEXT,
+            ctx(offset_of!(Context, interrupted)),
+        )?;
+        // x0, x2, x3 and x8 hold the `Cpu`, the `Context`, r12 and r8; x1 is
+        // `KIND` (0 here: the flags are current).
+        let x = HostReg::new;
+        self.a.mov(Width::X, T1, x(0));
+        self.a.mov(Width::X, T2, x(2));
+        self.a.mov(Width::X, T3, x(3));
+        self.a.mov(Width::X, T4, x(8));
+        self.a.mov(Width::X, x(8), B);
+        self.a.mov(Width::X, x(4), T4);
+        self.a.mov(Width::X, x(5), reg(R9));
+        self.a.mov(Width::X, x(0), reg(RDI));
+        self.a.mov(Width::X, x(1), reg(RSI));
+        self.a.mov(Width::X, x(2), reg(RDX));
+        self.a.mov(Width::X, x(3), reg(R10));
+        self.a.raw(SVC_0);
+        self.a.mov(Width::X, rax, x(0));
+        self.a.mov(Width::X, x(0), T1);
+        self.a.mov(Width::X, x(2), T2);
+        self.a.mov(Width::X, x(3), T3);
+        self.a.mov(Width::X, x(8), T4);
+        self.clear_kind()?;
+        // A signal recorded during the syscall: delivered before the next
+        // instruction, as Linux delivers it on the way back.
+        let signal = self.a.new_label();
+        self.a
+            .ldr(MemSize::B64, T1, CONTEXT, ctx(offset_of!(Context, signals)))?;
+        self.a.ldr(MemSize::B64, T1, T1, 0)?;
+        self.a.cbz(true, Width::X, T1, signal);
+        self.lazy = Lazy::Current;
+        self.exit_direct(next)?;
+        self.a.bind(signal);
+        let interrupted = self.a.new_label();
+        self.a.adds_imm(Width::X, ZR, rax, EINTR)?;
+        self.a.b_cond(Cond::Eq, interrupted);
+        self.lazy = Lazy::Current;
+        self.exit(next, EXIT_SIGNAL)?;
+        self.a.bind(interrupted);
+        self.lazy = Lazy::Current;
+        self.exit(next, EXIT_INTERRUPTED)?;
+        self.a.bind(engine);
+        self.lazy = Lazy::Current;
+        Ok(())
     }
 
     /// Before leaving the block: `KIND` says what is pending (the flags

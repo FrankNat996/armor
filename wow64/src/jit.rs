@@ -401,6 +401,7 @@ impl Engine {
             host_reads: Some(if self.compat { 32 } else { 47 }),
             page_table: false,
             kind_register: false,
+            fast_syscalls: false,
             entry_kind: core::mem::take(&mut self.context.exit_kind),
         };
         let Ok(translation) = translate_block(&block, end, options) else {

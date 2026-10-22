@@ -29,10 +29,10 @@ use crate::buffer::CodeBuffer;
 use crate::cache;
 use crate::encoder::branch_word;
 use crate::translator::{
-    BlockEnd, CHAINED_ENTRY, Context, EXIT_CHAIN, EXIT_INTERPRET, EXIT_SYSCALL, FLAG_TABLE,
-    GuestInstruction, HostFeatures, MAX_BLOCK_INSTRUCTIONS, Options, TARGET_ENTRIES,
-    UNCHECKED_ENTRY, ends_block, supported, supported_concurrent, target_slot, translate_block,
-    uses_mxcsr_control,
+    BlockEnd, CHAINED_ENTRY, Context, EXIT_CHAIN, EXIT_INTERPRET, EXIT_INTERRUPTED, EXIT_SIGNAL,
+    EXIT_SYSCALL, FAST_SYSCALLS, FLAG_TABLE, GuestInstruction, HostFeatures,
+    MAX_BLOCK_INSTRUCTIONS, Options, TARGET_ENTRIES, UNCHECKED_ENTRY, ends_block, supported,
+    supported_concurrent, target_slot, translate_block, uses_mxcsr_control,
 };
 use crate::translator::{enter_routine, flags_routine, leave_routine};
 
@@ -233,6 +233,9 @@ pub struct Jit {
     /// `Options::kind_register`: the memory is under host protection. The
     /// routines are published for it (`publish_routines`).
     kind_register: bool,
+    /// After `run`: the syscall translated code made that returned EINTR
+    /// (`EXIT_INTERRUPTED`), for `take_interrupted`.
+    interrupted: Option<u64>,
 }
 
 /// A translated block: `extern "C" fn(cpu, page_table, context)
@@ -270,10 +273,12 @@ impl Jit {
             warm_up: 0,
             faults: Vec::new(),
             kind_register: false,
+            interrupted: None,
         })
         .map(|mut jit| {
             jit.context.targets = jit.targets.as_ptr() as u64;
             jit.context.flag_table = FLAG_TABLE.as_ptr() as u64;
+            jit.context.fast_syscalls = FAST_SYSCALLS.as_ptr() as u64;
             jit.publish_routines();
             jit
         })
@@ -284,6 +289,25 @@ impl Jit {
     pub fn set_features(&mut self, features: HostFeatures) {
         self.features = features;
         self.flush();
+    }
+
+    /// Lets translated code make the syscalls of `FAST_SYSCALLS` itself
+    /// (`Options::fast_syscalls`) while `signals`, the thread's word of
+    /// recorded signals, is 0 and `seccomp`, a word that becomes nonzero
+    /// when the process gets a seccomp filter, is 0; `None` leaves every
+    /// syscall to the caller. The caller keeps both words alive while it
+    /// runs this JIT.
+    pub fn set_fast_syscalls(&mut self, words: Option<(*const AtomicU64, *const AtomicU64)>) {
+        let (signals, seccomp) = words.map_or((0, 0), |(a, b)| (a as u64, b as u64));
+        self.context.signals = signals;
+        self.context.seccomp = seccomp;
+    }
+
+    /// The number of a syscall translated code made that returned EINTR
+    /// with a signal recorded, in the last `run` (`EXIT_INTERRUPTED`): the
+    /// caller decides about restarting it, as for its own.
+    pub fn take_interrupted(&mut self) -> Option<u64> {
+        self.interrupted.take()
     }
 
     /// Blocks are translated after the interpreter has run them `runs`
@@ -345,6 +369,13 @@ impl Jit {
                     self.context.exit_kind = 0;
                     if status == EXIT_SYSCALL {
                         return Ok(Step::Syscall);
+                    }
+                    // A syscall translated code made returned with a signal
+                    // recorded: the caller delivers it.
+                    if status == EXIT_SIGNAL || status == EXIT_INTERRUPTED {
+                        self.interrupted =
+                            (status == EXIT_INTERRUPTED).then_some(self.context.interrupted);
+                        return Ok(Step::Continue);
                     }
                     status == EXIT_INTERPRET
                 }
@@ -558,6 +589,7 @@ impl Jit {
             host_reads,
             page_table: true,
             kind_register: self.kind_register,
+            fast_syscalls: self.kind_register && !self.lockstep && self.mode == Mode::Long,
             // What the exit that led here left pending (after a chain
             // exit; 0 otherwise).
             entry_kind: core::mem::take(&mut self.context.exit_kind),
@@ -670,6 +702,7 @@ impl Jit {
             u8::from(options.page_table),
             u8::from(self.default_mxcsr),
             u8::from(options.kind_register),
+            u8::from(options.fast_syscalls),
         ];
         cache::fnv1a(&bits)
     }

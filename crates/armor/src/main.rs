@@ -620,7 +620,21 @@ fn run_thread(guest: &'static Guest, cpu: &mut Cpu, thread: &mut syscall::Thread
             // One page-table lock for the whole block of instructions.
             let view = mem.view();
             match &mut jit {
-                Some(jit) => jit.run(cpu, &view, budget),
+                Some(jit) => {
+                    // Translated code may make simple syscalls itself, while
+                    // no signal waits and no filter applies; not with the
+                    // GIL, which a blocking `write` would keep.
+                    let fast = !guest.always_serialize && !thread.seccomp.active();
+                    jit.set_fast_syscalls(fast.then(|| {
+                        (
+                            armor_linux::signal::pending_word(),
+                            process.seccomp.generation_word(),
+                        )
+                    }));
+                    let step = jit.run(cpu, &view, budget);
+                    interrupted = jit.take_interrupted();
+                    step
+                }
                 None => cpu.run(&view, budget),
             }
         };

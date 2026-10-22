@@ -140,6 +140,11 @@ pub mod nr {
     pub const GETCWD: u64 = 183;
     pub const UGETRLIMIT: u64 = 191;
     pub const MMAP2: u64 = 192;
+    /// The 16-bit ids of the first i386 ABI (`low_ids`).
+    pub const GETUID: u64 = 24;
+    pub const GETGID: u64 = 47;
+    pub const GETEUID: u64 = 49;
+    pub const GETEGID: u64 = 50;
     pub const GETUID32: u64 = 199;
     pub const GETGID32: u64 = 200;
     pub const GETEUID32: u64 = 201;
@@ -337,6 +342,10 @@ pub fn is_implemented(number: u64) -> bool {
             | GETCWD
             | UGETRLIMIT
             | MMAP2
+            | GETUID
+            | GETGID
+            | GETEUID
+            | GETEGID
             | GETUID32
             | GETGID32
             | GETEUID32
@@ -571,6 +580,10 @@ pub fn dispatch(
         nr::GETPID => host(libc::SYS_getpid, &[]),
         nr::GETPPID => host(libc::SYS_getppid, &[]),
         nr::GETTID => host(libc::SYS_gettid, &[]),
+        nr::GETUID => host(libc::SYS_getuid, &[]).map(low_id),
+        nr::GETGID => host(libc::SYS_getgid, &[]).map(low_id),
+        nr::GETEUID => host(libc::SYS_geteuid, &[]).map(low_id),
+        nr::GETEGID => host(libc::SYS_getegid, &[]).map(low_id),
         nr::GETUID32 => host(libc::SYS_getuid, &[]),
         nr::GETGID32 => host(libc::SYS_getgid, &[]),
         nr::GETEUID32 => host(libc::SYS_geteuid, &[]),
@@ -1526,6 +1539,13 @@ fn get_thread_area(cpu: &Cpu, mem: &AddressSpace, desc: u64) -> SysResult {
     }
     copy_out(mem, desc, &out)?;
     Ok(0)
+}
+
+/// A user or group id as the 16-bit getuid, getgid, geteuid and getegid
+/// return it: an id that does not fit is the overflow id (65534, the
+/// kernel's default `overflowuid` and `overflowgid`), as `high2lowuid`.
+fn low_id(id: i64) -> i64 {
+    if id > 0xffff { 65534 } else { id }
 }
 
 #[cfg(test)]
