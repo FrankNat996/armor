@@ -183,10 +183,7 @@ fn decode_with(d: &mut Decoder, prefix: u8, opcode: u8) -> Result<Decoded, Decod
         (0 | 0x66, 0xc2) => {
             let (reg, rm) = d.modrm()?;
             let src = xmm_rm(rm);
-            let predicate = d.u8()?;
-            if predicate > 7 {
-                return Err(DecodeError::Unsupported("AVX compare predicates"));
-            }
+            let predicate = compare_predicate(d)?;
             (
                 SseOp::PackedCmpMask {
                     double: prefix == 0x66,
@@ -398,10 +395,7 @@ fn decode_with(d: &mut Decoder, prefix: u8, opcode: u8) -> Result<Decoded, Decod
         (0xf3 | 0xf2, 0xc2) => {
             let (reg, rm) = d.modrm()?;
             let src = xmm_rm(rm);
-            let predicate = d.u8()?;
-            if predicate > 7 {
-                return Err(DecodeError::Unsupported("AVX compare predicates"));
-            }
+            let predicate = compare_predicate(d)?;
             (
                 SseOp::FloatCmpMask {
                     double: prefix == 0xf2,
@@ -692,6 +686,19 @@ fn float_op(opcode: u8) -> FloatOp {
         0x5d => FloatOp::Min,
         0x5e => FloatOp::Div,
         _ => FloatOp::Max,
+    }
+}
+
+/// The predicate of cmpps, cmppd, cmpss, cmpsd: 0–7 (bits 2:0 of the
+/// immediate), 0–31 in the VEX forms (bits 4:0).
+fn compare_predicate(d: &mut Decoder) -> Result<u8, DecodeError> {
+    let imm = d.u8()?;
+    if d.is_vex() {
+        Ok(imm & 0x1f)
+    } else if imm > 7 {
+        Err(DecodeError::Unsupported("AVX compare predicates"))
+    } else {
+        Ok(imm)
     }
 }
 

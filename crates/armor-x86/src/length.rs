@@ -26,6 +26,11 @@ pub enum Extension {
     Sse41,
     Sse42,
     Popcnt,
+    /// XSAVE: xgetbv, xsetbv, xsave, xrstor, xsaveopt, xsavec, xsaves,
+    /// xrstors.
+    Xsave,
+    /// movbe.
+    Movbe,
     Aes,
     Pclmul,
     Sha,
@@ -55,6 +60,8 @@ impl Extension {
                 | Extension::Sse41
                 | Extension::Sse42
                 | Extension::Popcnt
+                | Extension::Xsave
+                | Extension::Movbe
         )
     }
 }
@@ -71,6 +78,8 @@ impl fmt::Display for Extension {
             Extension::Sse41 => "SSE4.1",
             Extension::Sse42 => "SSE4.2",
             Extension::Popcnt => "POPCNT",
+            Extension::Xsave => "XSAVE",
+            Extension::Movbe => "MOVBE",
             Extension::Aes => "AES-NI",
             Extension::Pclmul => "PCLMULQDQ",
             Extension::Sha => "SHA",
@@ -429,6 +438,32 @@ impl Reader<'_> {
                 Extension::Base
             }
             0x77 => Extension::Mmx,
+            // xgetbv, xsetbv; the rest of the group is system
+            // instructions.
+            0x01 => {
+                let modrm = self.peek()?;
+                self.modrm()?;
+                if prefix == 0 && matches!(modrm, 0xd0 | 0xd1) {
+                    Extension::Xsave
+                } else {
+                    Extension::Base
+                }
+            }
+            // xsave, xrstor, xsaveopt (no mandatory prefix, memory); 0F
+            // C7: xrstors, xsavec, xsaves.
+            0xae | 0xc7 => {
+                let modrm = self.peek()?;
+                let reg = self.modrm()?;
+                let xsave = match opcode {
+                    0xae => prefix == 0 && matches!(reg, 4..=6),
+                    _ => matches!(reg, 3..=5),
+                };
+                if modrm >> 6 != 3 && xsave {
+                    Extension::Xsave
+                } else {
+                    sse_class(prefix, opcode)
+                }
+            }
             // jcc rel32 (66 does not shorten it in 64-bit mode on Intel).
             0x80..=0x8f => {
                 self.skip(if rel16 { 2 } else { 4 })?;
@@ -464,6 +499,7 @@ impl Reader<'_> {
             (0x66, 0x10 | 0x14 | 0x15 | 0x17 | 0x20..=0x25 | 0x28..=0x2b | 0x30..=0x35)
             | (0x66, 0x38..=0x41) => Extension::Sse41,
             (0x66, 0x37) | (0xf2, 0xf0 | 0xf1) => Extension::Sse42,
+            (0 | 0x66, 0xf0 | 0xf1) => Extension::Movbe,
             (0x66, 0xdb..=0xdf) => Extension::Aes,
             (0, 0xc8..=0xcd) => Extension::Sha,
             _ => Extension::Base,

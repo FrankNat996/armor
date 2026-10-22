@@ -17,6 +17,9 @@ use alloc::vec::Vec;
 extern crate alloc;
 
 mod alu;
+mod avx;
+mod avx_ops;
+mod bmi;
 pub mod cpuid;
 mod f80;
 mod float;
@@ -25,13 +28,15 @@ mod simd;
 mod sse;
 mod string;
 mod x87;
+pub mod xsave;
 
 use core::fmt;
 
 use armor_guest::{Access, GuestMemory, MemFault};
 use armor_x86::{
-    AluOp, Base, BitTestOp, Cond, DecodeError, FlagOp, Instruction, LoopKind, MAX_INSTRUCTION_LEN,
-    Mem, Mode, Op, Operand, Reg, Segment, ShiftCount, Size, UnaryOp, decode_in,
+    AluOp, Base, BitTestOp, BmiOp, Cond, DecodeError, FlagOp, Instruction, LoopKind,
+    MAX_INSTRUCTION_LEN, Mem, Mode, Op, Operand, Reg, Segment, ShiftCount, Size, StateOp, UnaryOp,
+    decode_in,
 };
 
 pub use alu::{
@@ -98,6 +103,14 @@ pub struct Cpu {
     /// Two 128-bit scratch registers (`Reg::Mm(8)`, `Reg::Mm(9)`) an MMX
     /// instruction runs its SSE equivalent on; zero between instructions.
     pub(crate) mm_scratch: [u128; 2],
+    /// Bits 255:128 of ymm0–ymm15, whose low halves are `xmm`. Legacy SSE
+    /// instructions leave them unchanged; fxsave and fxrstor do not save
+    /// or load them; xsave and xrstor do when XCR0 has the AVX component
+    /// (docs/tech/avx.md).
+    pub ymm_hi: [u128; 16],
+    /// Set while a VEX instruction runs (`avx.rs`): its memory operands
+    /// need no alignment. False between instructions.
+    pub(crate) vex_unaligned: bool,
     /// Decoded instructions; not architectural state.
     icache: icache::DecodeCache,
 }
@@ -279,6 +292,51 @@ impl From<MemFault> for Trap {
 
 type Exec<T> = Result<T, Trap>;
 
+/// Whether CPUID declares what `op` needs, for the instructions of the
+/// features declared only on request (`cpuid::Features`); without it they
+/// raise #UD. The decoder decodes them whatever CPUID says.
+fn declared(op: &Op) -> bool {
+    use cpuid::Features;
+    let needs = match op {
+        Op::Xgetbv
+        | Op::Xsetbv
+        | Op::State {
+            op: StateOp::Xsave | StateOp::Xrstor,
+            ..
+        } => Features::XSAVE,
+        Op::Movbe { .. } => Features::MOVBE,
+        Op::Avx {
+            op: armor_x86::AvxOp::Fma { .. },
+            ..
+        } => Features::FMA,
+        Op::Avx {
+            op: armor_x86::AvxOp::Ph2Ps | armor_x86::AvxOp::Ps2Ph(_),
+            ..
+        } => Features::F16C,
+        Op::Vex { avx2: true, .. } | Op::Avx { avx2: true, .. } => Features::AVX2,
+        Op::Vex { .. } | Op::Avx { .. } | Op::Vzero { .. } | Op::VexMxcsr { .. } => Features::AVX,
+        Op::Bmi { op, .. } => match op {
+            BmiOp::Andn | BmiOp::Bextr | BmiOp::Blsi | BmiOp::Blsmsk | BmiOp::Blsr => {
+                Features::BMI1
+            }
+            _ => Features::BMI2,
+        },
+        _ => return true,
+    };
+    cpuid::declared().contains(needs)
+}
+
+/// Whether tzcnt (`reverse` false) or lzcnt counts zeros: CPUID declares
+/// BMI1 or LZCNT. Otherwise F3 0F BC and BD run as bsf and bsr.
+pub fn counts_zeros(reverse: bool) -> bool {
+    let feature = if reverse {
+        cpuid::Features::LZCNT
+    } else {
+        cpuid::Features::BMI1
+    };
+    cpuid::declared().contains(feature)
+}
+
 impl Cpu {
     /// CPU state at process entry: every register zero except rsp.
     pub fn new(entry: u64, stack_pointer: u64) -> Cpu {
@@ -296,6 +354,8 @@ impl Cpu {
             mode: Mode::Long,
             segments: Segments::default(),
             mm_scratch: [0; 2],
+            ymm_hi: [0; 16],
+            vex_unaligned: false,
             icache: icache::DecodeCache::new(),
         }
     }
@@ -357,11 +417,13 @@ impl Cpu {
     /// process): x87 as after FNINIT with zeroed registers, MXCSR at its
     /// default, xmm registers zeroed (✅ Xeon X5675: a handler sees xmm
     /// 0, MXCSR 0x1f80, control word 0x37f, every tag empty, whatever the
-    /// interrupted code had; the frame keeps that for sigreturn).
+    /// interrupted code had; the frame keeps that for sigreturn), and the
+    /// upper ymm halves zeroed, the initial state of the AVX component.
     pub fn reset_fpu(&mut self) {
         self.x87 = x87::X87::default();
         self.mxcsr = INITIAL_MXCSR;
         self.xmm = [0; 16];
+        self.ymm_hi = [0; 16];
     }
 
     /// Runs instructions until a `syscall` is reached.
@@ -408,7 +470,14 @@ impl Cpu {
         let mut window = [0u8; MAX_INSTRUCTION_LEN];
         let available = mem.fetch(self.rip, &mut window);
         match decode_in(&window[..available], self.mode) {
-            Ok(insn) => Ok(insn),
+            Ok(insn) if declared(&insn.op) => Ok(insn),
+            // An instruction of a feature declared only on request
+            // (`cpuid::Features`) and not declared: #UD.
+            Ok(_) => Err(CpuError::Decode {
+                rip: self.rip,
+                bytes: window[..available].to_vec(),
+                error: DecodeError::Invalid,
+            }),
             // An instruction of an extension armor's CPUID does not report
             // (AVX, AVX-512, AES-NI, …): #UD, as on such a CPU (ADR-0026).
             Err(DecodeError::Unsupported(_))
@@ -720,7 +789,20 @@ impl Cpu {
                 let crc = simd::crc32c(crc, data, src_size.bytes());
                 self.write_reg(dst, size, u64::from(crc));
             }
-            Op::BitScan { reverse, dst, src } => {
+            Op::BitScan {
+                reverse,
+                dst,
+                src,
+                counts_zeros: true,
+            } if counts_zeros(reverse) => {
+                let value = self.read(src, size, next, mem)?;
+                let (count, flags) = bmi::count_zeros(reverse, size, value);
+                self.write_reg(dst, size, count);
+                self.rflags = (self.rflags & !(FLAG_CF | FLAG_ZF)) | flags;
+            }
+            Op::BitScan {
+                reverse, dst, src, ..
+            } => {
                 let value = self.read(src, size, next, mem)? & size.mask();
                 if value == 0 {
                     // The destination is left unchanged (undefined per Intel).
@@ -733,6 +815,37 @@ impl Cpu {
                     };
                     self.write_reg(dst, size, u64::from(index));
                     self.rflags &= !FLAG_ZF;
+                }
+            }
+            Op::Movbe { dst, src } => {
+                let value = self.read(src, size, next, mem)?;
+                let swapped = match size {
+                    Size::B16 => u64::from((value as u16).swap_bytes()),
+                    Size::B32 => u64::from((value as u32).swap_bytes()),
+                    _ => value.swap_bytes(),
+                };
+                self.write(dst, size, swapped, next, mem)?;
+            }
+            Op::Bmi {
+                op: BmiOp::Mulx,
+                dst,
+                src,
+                vvvv,
+            } => {
+                let factor = self.read(src, size, next, mem)?;
+                let rdx = self.read_reg(Reg::Gpr(RDX as u8), size);
+                let product = u128::from(rdx) * u128::from(factor);
+                // The low half first: with the same register for both,
+                // the high half is what stays (SDM).
+                self.write_reg(vvvv, size, product as u64 & size.mask());
+                self.write_reg(dst, size, (product >> size.bits()) as u64);
+            }
+            Op::Bmi { op, dst, src, vvvv } => {
+                let value = self.read(src, size, next, mem)?;
+                let (result, flags) = bmi::bmi(op, size, value, self.read_reg(vvvv, size));
+                self.write_reg(dst, size, result);
+                if let Some(flags) = flags {
+                    self.set_status(flags);
                 }
             }
             Op::Bswap(reg) => {
@@ -901,10 +1014,33 @@ impl Cpu {
             // A full barrier, whatever the kind: lfence and sfence order
             // less on x86, and fences are rare (ADR-0023).
             Op::Fence => core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst),
-            Op::Privileged => return Err(Trap::Exception(Exception::GeneralProtection)),
+            Op::Privileged | Op::Xsetbv => {
+                return Err(Trap::Exception(Exception::GeneralProtection));
+            }
+            // XCR0 for ecx = 0; XCR1 (XINUSE) only with XGETBV_ECX_1,
+            // which armor does not declare: #GP for any other ecx.
+            Op::Xgetbv => {
+                if self.regs[RCX] as u32 != 0 {
+                    return Err(Trap::Exception(Exception::GeneralProtection));
+                }
+                let xcr0 = cpuid::xcr0(cpuid::declared());
+                self.regs[RAX] = xcr0 & 0xffff_ffff;
+                self.regs[RDX] = xcr0 >> 32;
+            }
             Op::Int3 => return Err(Trap::Exception(Exception::Breakpoint(insn.len as u8))),
             Op::Int1 => return Err(Trap::Exception(Exception::Debug)),
             Op::Sse { op, dst, src } => self.sse(op, dst, src, next, mem)?,
+            Op::Vex { .. } => self.vex(&insn.op, next, mem)?,
+            Op::Avx { .. } => self.avx(&insn.op, next, mem)?,
+            Op::Vzero { all } => self.vzero(all),
+            Op::VexMxcsr { store, mem: m } => {
+                let op = if store {
+                    StateOp::Stmxcsr
+                } else {
+                    StateOp::Ldmxcsr
+                };
+                self.state(op, m, next, mem)?;
+            }
             Op::State { op, mem: m } => self.state(op, m, next, mem)?,
             Op::X87 { op, opcode } => self.x87(op, opcode, next, mem)?,
         }

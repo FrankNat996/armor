@@ -15,6 +15,7 @@ mod maps;
 
 pub use length::{Extension, Length, length, length_in};
 mod sse;
+mod vex;
 mod x87;
 
 use core::fmt;
@@ -762,6 +763,143 @@ pub enum X87Constant {
     LnTwo,
 }
 
+/// The BMI1 and BMI2 operations of `Op::Bmi`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BmiOp {
+    /// andn (BMI1): `dst = !vvvv & src`.
+    Andn,
+    /// bextr (BMI1): `dst` = the bits of `src` from bit `vvvv[7:0]`, at most
+    /// `vvvv[15:8]` of them.
+    Bextr,
+    /// blsi (BMI1): `dst` (VEX.vvvv) = the lowest set bit of `src`.
+    Blsi,
+    /// blsmsk (BMI1): `dst` (VEX.vvvv) = the bits up to the lowest set bit of
+    /// `src`.
+    Blsmsk,
+    /// blsr (BMI1): `dst` (VEX.vvvv) = `src` without its lowest set bit.
+    Blsr,
+    /// bzhi (BMI2): `dst = src` with the bits from `vvvv[7:0]` up cleared.
+    Bzhi,
+    /// mulx (BMI2): `dst:vvvv` = rdx (edx) times `src`, unsigned; the high
+    /// half in `dst`, the low half in `vvvv`; no flags.
+    Mulx,
+    /// pdep (BMI2): the low bits of `vvvv` deposited at the bits set in
+    /// `src`.
+    Pdep,
+    /// pext (BMI2): the bits of `vvvv` at the bits set in `src`, packed.
+    Pext,
+    /// rorx (BMI2): `dst = src` rotated right by the immediate; no flags.
+    Rorx(u8),
+    /// sarx, shlx, shrx (BMI2): `dst = src` shifted by `vvvv` (masked to the
+    /// operand size); no flags.
+    Sarx,
+    Shlx,
+    Shrx,
+}
+
+/// The instructions AVX and AVX2 add (`Op::Avx`), with no legacy SSE
+/// form.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AvxOp {
+    /// vbroadcastss, vbroadcastsd, vpbroadcastb/w/d/q: the low element of
+    /// `src` (a register or memory of the element's size) in every lane.
+    Broadcast(Size),
+    /// vbroadcastf128, vbroadcasti128: m128 into both halves.
+    Broadcast128,
+    /// vinsertf128, vinserti128: `src` (xmm or m128) into the half of
+    /// `src1` that bit 0 selects.
+    Insert128(u8),
+    /// vextractf128, vextracti128: the half of `src` (ymm) that bit 0
+    /// selects into `dst` (xmm or m128).
+    Extract128(u8),
+    /// vperm2f128, vperm2i128: each half of the result one of the four
+    /// halves of `src1` and `src` (bits 1:0, 5:4), or zero (bits 3, 7).
+    Perm2x128(u8),
+    /// vpermq, vpermpd: the 64-bit lanes of `src` chosen by the
+    /// immediate, two bits each.
+    Permq(u8),
+    /// vpermd, vpermps: the 32-bit lanes of `src` chosen by the low three
+    /// bits of each lane of `src1`.
+    Permd,
+    /// vpermilps, vpermilpd: lanes within each 128-bit half, chosen by
+    /// the immediate (`Some`, applied to `src`) or by the lanes of `src`
+    /// (applied to `src1`).
+    Permil { double: bool, imm: Option<u8> },
+    /// vblendvps, vblendvpd, vpblendvb: each lane from `src` where the
+    /// top bit of the lane of xmm/ymm register `mask` is set, otherwise
+    /// from `src1`.
+    BlendV { lane: Size, mask: u8 },
+    /// vpblendd: dword i from `src` if bit i of the immediate is set,
+    /// otherwise from `src1`.
+    Blendd(u8),
+    /// vpsllvd/q, vpsrlvd/q, vpsravd: each lane of `src1` shifted by the
+    /// same lane of `src`.
+    ShiftVar { kind: ShiftKind, lane: Size },
+    /// vmaskmovps/pd, vpmaskmovd/q: the lanes whose top bit is set in the
+    /// mask (`src1`) loaded from `src` (memory; the others zeroed), or
+    /// stored from `src` into `dst` (memory; the others left). Masked-off
+    /// lanes are not accessed.
+    MaskMov { lane: Size, store: bool },
+    /// vtestps, vtestpd: ZF if the sign bits of `dst & src` are all 0, CF
+    /// if those of `!dst & src` are; the other status flags cleared.
+    Test { double: bool },
+    /// vpgatherdd/dq/qd/qq, vgatherdps/dpd/qps/qpd (AVX2): `element`-sized
+    /// lanes of `dst` loaded from `src`'s base and displacement plus each
+    /// `index`-sized lane of vector register `index_reg` times the scale
+    /// (the index field of `src` is unused), where the top bit of the
+    /// lane of the mask `src1` is set; the mask is cleared as each lane
+    /// completes, so a fault leaves the instruction to be restarted.
+    Gather {
+        element: Size,
+        index: Size,
+        index_reg: u8,
+    },
+    /// vcvtph2ps (F16C): half-precision lanes of `src` (64 or 128 bits) to
+    /// singles.
+    Ph2Ps,
+    /// vcvtps2ph (F16C): the singles of `src` to half precision in `dst`
+    /// (a register or 64 or 128 bits of memory), rounded by imm8[1:0], or
+    /// by MXCSR with bit 2.
+    Ps2Ph(u8),
+    /// The fused multiply-adds (FMA3): `±(a * b) ± c` rounded once, on
+    /// every lane, or on the low one (`scalar`, the rest of `dst` kept).
+    Fma {
+        order: FmaOrder,
+        kind: FmaKind,
+        double: bool,
+        scalar: bool,
+    },
+}
+
+/// Which operands of an FMA instruction are multiplied (`a * b + c`):
+/// `dst`, `src1` (VEX.vvvv) and `src`, by the digits of the mnemonic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FmaOrder {
+    /// vfmadd132: `dst * src + src1`.
+    O132,
+    /// vfmadd213: `src1 * dst + src`.
+    O213,
+    /// vfmadd231: `src1 * src + dst`.
+    O231,
+}
+
+/// The signs of an FMA instruction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FmaKind {
+    /// vfmadd: `a * b + c`.
+    Add,
+    /// vfmsub: `a * b - c`.
+    Sub,
+    /// vfnmadd: `-(a * b) + c`.
+    NegAdd,
+    /// vfnmsub: `-(a * b) - c`.
+    NegSub,
+    /// vfmaddsub: `a * b - c` on the even lanes, `+ c` on the odd ones.
+    AddSub,
+    /// vfmsubadd: `a * b + c` on the even lanes, `- c` on the odd ones.
+    SubAdd,
+}
+
 /// SSE/x87 state instructions of the 0F AE group.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StateOp {
@@ -772,6 +910,13 @@ pub enum StateOp {
     Stmxcsr,
     /// clflush: no cache to flush here, but the byte must be readable.
     Clflush,
+    /// xsave (0F AE /4) and xrstor (/5), standard form: the state
+    /// components in edx:eax & XCR0 to or from a 64-byte aligned area
+    /// (Intel SDM vol. 1, 13.7 and 13.8). REX.W (xsave64, xrstor64) only
+    /// changes the format of the x87 instruction and data pointers,
+    /// which armor stores as 0.
+    Xsave,
+    Xrstor,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -879,11 +1024,31 @@ pub enum Op {
         src: Operand,
         src_size: Size,
     },
-    /// bsf (forward) / bsr (reverse).
+    /// bsf (forward) / bsr (reverse). With F3 (`counts_zeros`) the
+    /// encoding is tzcnt / lzcnt, which count the zeros when CPUID declares
+    /// BMI1 (tzcnt) or LZCNT (lzcnt), and run as bsf / bsr on a CPU
+    /// without them.
     BitScan {
         reverse: bool,
         dst: Reg,
         src: Operand,
+        counts_zeros: bool,
+    },
+    /// movbe (0F 38 F0, F1): a load or store with the bytes reversed; one
+    /// operand is memory.
+    Movbe {
+        dst: Operand,
+        src: Operand,
+    },
+    /// BMI1 and BMI2 (VEX-encoded, general registers): `dst` the ModRM.reg
+    /// register (VEX.vvvv for blsi, blsmsk, blsr), `src` the ModRM.rm
+    /// operand, `vvvv` the register VEX.vvvv names, whose role depends on
+    /// the operation (`BmiOp`).
+    Bmi {
+        op: BmiOp,
+        dst: Reg,
+        src: Operand,
+        vvvv: Reg,
     },
     Bswap(Reg),
     Push(Operand),
@@ -936,6 +1101,12 @@ pub enum Op {
     },
     Flag(FlagOp),
     Cpuid,
+    /// xgetbv (0F 01 D0): the extended control register ecx (XCR0 for 0)
+    /// in edx:eax.
+    Xgetbv,
+    /// xsetbv (0F 01 D1): privileged, #GP in user mode (with XSAVE
+    /// declared; #UD without, as xgetbv).
+    Xsetbv,
     /// rdtsc: the time-stamp counter in edx:eax.
     Rdtsc,
     /// An x87 FPU instruction (D8..DF, and fwait). `opcode` is the 11-bit
@@ -945,7 +1116,8 @@ pub enum Op {
         op: X87Op,
         opcode: u16,
     },
-    /// fxsave, fxrstor, ldmxcsr, stmxcsr (0F AE /0../3, memory only).
+    /// fxsave, fxrstor, ldmxcsr, stmxcsr, xsave, xrstor (0F AE /0../5,
+    /// memory only), clflush (/7).
     State {
         op: StateOp,
         mem: Mem,
@@ -979,6 +1151,43 @@ pub enum Op {
         op: SseOp,
         dst: Operand,
         src: Operand,
+    },
+    /// The VEX-encoded form of an SSE operation (AVX): `dst = op(src1,
+    /// src)`, `src1` the xmm register VEX.vvvv names, or `None` when the
+    /// instruction has no such operand (then `op` works on `dst` and `src`
+    /// as its legacy form does). On 128 bits, the bits 255:128 of a
+    /// destination register zeroed, or with `wide` on both halves of the
+    /// ymm registers (VEX.L). `avx2`: a 256-bit integer form, which AVX2
+    /// adds.
+    Vex {
+        op: SseOp,
+        dst: Operand,
+        src1: Option<u8>,
+        src: Operand,
+        wide: bool,
+        avx2: bool,
+    },
+    /// An instruction AVX or AVX2 adds (`AvxOp`): `dst = op(src1, src)` on
+    /// 128 bits (bits 255:128 of a destination register zeroed) or 256
+    /// (`wide`); `avx2`: an AVX2 instruction.
+    Avx {
+        op: AvxOp,
+        dst: Operand,
+        src1: Option<u8>,
+        src: Operand,
+        wide: bool,
+        avx2: bool,
+    },
+    /// vldmxcsr (`store` false) and vstmxcsr (VEX 0F AE /2, /3): ldmxcsr
+    /// and stmxcsr, as AVX instructions.
+    VexMxcsr {
+        store: bool,
+        mem: Mem,
+    },
+    /// vzeroupper (bits 255:128 of every ymm register zeroed) and
+    /// vzeroall (`all`: the whole registers).
+    Vzero {
+        all: bool,
     },
 }
 

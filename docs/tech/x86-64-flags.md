@@ -26,6 +26,10 @@ armor must still put a value in the flags that the architecture leaves undefined
 | `div`/`idiv` | none | unchanged |
 | `bsf`/`bsr` | ZF; destination only if the source ≠ 0 | other flags unchanged; with source 0 the destination stays unchanged |
 | `bt*` | CF | ZF unchanged (as Intel says), others unchanged |
+| `tzcnt`/`lzcnt` counting zeros (BMI1/LZCNT declared, `tech/avx.md`) | CF, ZF | others unchanged |
+| `andn`, `blsi`, `blsmsk`, `blsr`, `bzhi` | SF, ZF, CF, OF | PF from the result, AF = 0 |
+| `bextr` | ZF, CF, OF | SF, PF from the result, AF = 0 |
+| `mulx`, `pdep`, `pext`, `rorx`, `sarx`, `shlx`, `shrx` | none changed | — |
 
 ⚠️ The exact behaviour of Intel/AMD hardware on undefined flags has not been measured (no x86 hardware available).
 

@@ -32,7 +32,8 @@ const FXSAVE_XMM: usize = 160;
 const FXSAVE_WRITTEN: usize = 416;
 
 impl Cpu {
-    /// fxsave, fxrstor, ldmxcsr, stmxcsr, with the x87 state of `x87.rs`.
+    /// fxsave, fxrstor, ldmxcsr, stmxcsr, with the x87 state of `x87.rs`;
+    /// xsave and xrstor (`xsave.rs`).
     pub(crate) fn state(
         &mut self,
         op: StateOp,
@@ -65,6 +66,8 @@ impl Cpu {
             StateOp::Stmxcsr => mem.write(addr, &self.mxcsr.to_le_bytes())?,
             // Faults like a one-byte load (SDM, CLFLUSH); no cache to flush.
             StateOp::Clflush => mem.read(addr, &mut [0u8; 1])?,
+            StateOp::Xsave => self.xsave(addr, mem)?,
+            StateOp::Xrstor => self.xrstor(addr, mem)?,
         }
         Ok(())
     }
@@ -72,6 +75,14 @@ impl Cpu {
     /// Writes the defined fields of the FXSAVE image into `area`; reserved
     /// bytes keep their contents.
     fn save_fx_state(&self, area: &mut [u8; FXSAVE_WRITTEN]) {
+        self.save_x87_state(area);
+        self.save_mxcsr(area);
+        self.save_xmm(area);
+    }
+
+    /// The x87 part of an FXSAVE image (also XSAVE's x87 component):
+    /// bytes 0..24 and 32..160.
+    pub(crate) fn save_x87_state(&self, area: &mut [u8]) {
         // FCW, FSW, abridged FTW; FOP, FIP and FDP are 0: armor does not
         // track the last x87 instruction. FOP is written as the SDM says,
         // though qemu leaves it unchanged.
@@ -88,8 +99,17 @@ impl Cpu {
             // unchanged, docs/testing.md).
             area[at + X87_REGISTER_BYTES..at + 16].fill(0);
         }
+    }
+
+    /// MXCSR and MXCSR_MASK (bytes 24..32), which XSAVE saves with the SSE
+    /// or the AVX component.
+    pub(crate) fn save_mxcsr(&self, area: &mut [u8]) {
         area[FXSAVE_MXCSR..FXSAVE_MXCSR + 4].copy_from_slice(&self.mxcsr.to_le_bytes());
         area[FXSAVE_MXCSR_MASK..FXSAVE_MXCSR_MASK + 4].copy_from_slice(&MXCSR_MASK.to_le_bytes());
+    }
+
+    /// xmm0–xmm15 (bytes 160..416).
+    pub(crate) fn save_xmm(&self, area: &mut [u8]) {
         for (i, xmm) in self.xmm.iter().enumerate() {
             let at = FXSAVE_XMM + 16 * i;
             area[at..at + 16].copy_from_slice(&xmm.to_le_bytes());
@@ -97,22 +117,12 @@ impl Cpu {
     }
 
     fn restore_fx_state(&mut self, area: &[u8; FXSAVE_WRITTEN]) -> Exec<()> {
-        let mxcsr = u32::from_le_bytes(
-            area[FXSAVE_MXCSR..FXSAVE_MXCSR + 4]
-                .try_into()
-                .expect("4 bytes"),
-        );
-        self.set_mxcsr(mxcsr)?;
-        let word = |at: usize| u16::from_le_bytes([area[at], area[at + 1]]);
-        let stack = core::array::from_fn(|i| {
-            let at = FXSAVE_ST + 16 * i;
-            F80::from_bytes(area[at..at + 10].try_into().expect("10 bytes"))
-        });
-        self.x87.restore(word(0), word(2), area[4], stack)?;
-        for (i, xmm) in self.xmm.iter_mut().enumerate() {
-            let at = FXSAVE_XMM + 16 * i;
-            *xmm = u128::from_le_bytes(area[at..at + 16].try_into().expect("16 bytes"));
-        }
+        let mxcsr = saved_mxcsr(area)?;
+        let mut x87 = self.x87;
+        restore_x87_state(&mut x87, area)?;
+        self.mxcsr = mxcsr;
+        self.x87 = x87;
+        self.xmm = saved_xmm(area);
         Ok(())
     }
 
@@ -138,7 +148,7 @@ impl Cpu {
     }
 
     /// The MXCSR control bits the floating-point operations follow.
-    fn float_env(&self) -> float::Env {
+    pub(crate) fn float_env(&self) -> float::Env {
         float::Env::from_mxcsr(self.mxcsr)
     }
 
@@ -160,7 +170,7 @@ impl Cpu {
     /// are the only ones set; otherwise all of them are, OE, UE and PE
     /// included. Old flags that are set and unmasked do not raise #XM:
     /// only the instruction's own do.
-    fn raise(&mut self, flags: u16) -> Exec<()> {
+    pub(crate) fn raise(&mut self, flags: u16) -> Exec<()> {
         const BEFORE: u32 = 0x07;
         let flags = u32::from(flags);
         let unmasked = !(self.mxcsr >> 7) & 0x3f;
@@ -327,7 +337,7 @@ impl Cpu {
         Ok(())
     }
 
-    fn sse_ops(
+    pub(crate) fn sse_ops(
         &mut self,
         op: SseOp,
         dst: Operand,
@@ -1046,7 +1056,7 @@ impl Cpu {
             Operand::Reg(Reg::Mm(n)) => Ok(self.mm(n)),
             Operand::Mem(m) => {
                 let addr = self.address(&m, next);
-                check_alignment(addr, aligned)?;
+                check_alignment(addr, aligned && !self.vex_unaligned)?;
                 let mut bytes = [0u8; 16];
                 mem.read(addr, &mut bytes)?;
                 Ok(u128::from_le_bytes(bytes))
@@ -1067,13 +1077,41 @@ impl Cpu {
             Operand::Reg(Reg::Xmm(n)) => self.xmm[usize::from(n)] = value,
             Operand::Mem(m) => {
                 let addr = self.address(&m, next);
-                check_alignment(addr, aligned)?;
+                check_alignment(addr, aligned && !self.vex_unaligned)?;
                 mem.write(addr, &value.to_le_bytes())?;
             }
             _ => unreachable!("128-bit operands are xmm registers or memory"),
         }
         Ok(())
     }
+}
+
+/// MXCSR from an FXSAVE or XSAVE image; #GP if it sets reserved bits.
+pub(crate) fn saved_mxcsr(area: &[u8]) -> Exec<u32> {
+    let at = FXSAVE_MXCSR;
+    let mxcsr = u32::from_le_bytes(area[at..at + 4].try_into().expect("4 bytes"));
+    if mxcsr & !MXCSR_MASK != 0 {
+        return Err(Trap::Exception(Exception::GeneralProtection));
+    }
+    Ok(mxcsr)
+}
+
+/// Loads the x87 part of an FXSAVE or XSAVE image into `x87`.
+pub(crate) fn restore_x87_state(x87: &mut crate::x87::X87, area: &[u8]) -> Exec<()> {
+    let word = |at: usize| u16::from_le_bytes([area[at], area[at + 1]]);
+    let stack = core::array::from_fn(|i| {
+        let at = FXSAVE_ST + 16 * i;
+        F80::from_bytes(area[at..at + 10].try_into().expect("10 bytes"))
+    });
+    x87.restore(word(0), word(2), area[4], stack)
+}
+
+/// xmm0–xmm15 from an FXSAVE or XSAVE image.
+pub(crate) fn saved_xmm(area: &[u8]) -> [u128; 16] {
+    core::array::from_fn(|i| {
+        let at = FXSAVE_XMM + 16 * i;
+        u128::from_le_bytes(area[at..at + 16].try_into().expect("16 bytes"))
+    })
 }
 
 fn check_alignment(addr: u64, aligned: bool) -> Exec<()> {

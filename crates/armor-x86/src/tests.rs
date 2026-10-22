@@ -419,6 +419,36 @@ fn errors() {
         decode(&[0x0f, 0xae, 0xc0]),
         Err(DecodeError::Unsupported(_))
     ));
+    // XSAVE: xgetbv, xsetbv, xsave [rsp+0x40] and xrstor64 [rdi] (objdump).
+    assert_eq!(decode(&[0x0f, 0x01, 0xd0]).unwrap().op, Op::Xgetbv);
+    assert_eq!(decode(&[0x0f, 0x01, 0xd1]).unwrap().op, Op::Xsetbv);
+    let xsave = decode(&[0x0f, 0xae, 0x64, 0x24, 0x40]).unwrap();
+    assert!(matches!(
+        xsave.op,
+        Op::State {
+            op: StateOp::Xsave,
+            mem: Mem { disp: 0x40, .. }
+        }
+    ));
+    assert_eq!(xsave.len, 5);
+    assert!(matches!(
+        decode(&[0x48, 0x0f, 0xae, 0x2f]).unwrap().op,
+        Op::State {
+            op: StateOp::Xrstor,
+            ..
+        }
+    ));
+    // xsaveopt, and clwb (66 0F AE /6), the rest of 0F 01: not executed.
+    for bytes in [
+        &[0x0f, 0xae, 0x37][..],
+        &[0x66, 0x0f, 0xae, 0x37],
+        &[0x0f, 0x01, 0xf9],
+    ] {
+        assert!(
+            matches!(decode(bytes), Err(DecodeError::Unsupported(_))),
+            "{bytes:02x?}"
+        );
+    }
     // Operand-size prefix on branches and stack operations: not supported.
     for bytes in [
         &[0x66, 0x74, 0x00][..],
@@ -480,15 +510,528 @@ fn address_size_prefix_marks_32_bit_addressing() {
 
 #[test]
 fn tzcnt_encoding_runs_as_bsf() {
-    // tzcnt rdx, rcx (F3 0F BC) without BMI1 is bsf.
+    // tzcnt rdx, rcx (F3 0F BC): bsf without BMI1 (`counts_zeros`).
     assert_eq!(
         ok(&[0xf3, 0x48, 0x0f, 0xbc, 0xd1]).op,
         Op::BitScan {
             reverse: false,
             dst: Reg::Gpr(RDX),
-            src: gpr(RCX)
+            src: gpr(RCX),
+            counts_zeros: true,
         }
     );
+    // bsr rax, rcx: no F3.
+    assert!(matches!(
+        ok(&[0x48, 0x0f, 0xbd, 0xc1]).op,
+        Op::BitScan {
+            reverse: true,
+            counts_zeros: false,
+            ..
+        }
+    ));
+}
+
+/// The VEX forms of SSE instructions (AVX), bytes from the GNU assembler
+/// and objdump.
+#[test]
+fn vex_sse_forms() {
+    let xmm = |n| Operand::Reg(Reg::Xmm(n));
+    let vex = |bytes: &[u8], op, dst, src1, src, wide| {
+        let insn = ok(bytes);
+        assert_eq!(
+            (insn.op, insn.len),
+            (
+                Op::Vex {
+                    op,
+                    dst,
+                    src1,
+                    src,
+                    wide,
+                    avx2: false,
+                },
+                bytes.len()
+            ),
+            "{bytes:02x?}"
+        );
+    };
+    let add = SseOp::PackedArith {
+        op: FloatOp::Add,
+        double: false,
+    };
+    // vaddps xmm1, xmm2, xmm3; vaddps ymm1, ymm2, ymm3
+    vex(
+        &[0xc5, 0xe8, 0x58, 0xcb],
+        add,
+        xmm(1),
+        Some(2),
+        xmm(3),
+        false,
+    );
+    vex(
+        &[0xc5, 0xec, 0x58, 0xcb],
+        add,
+        xmm(1),
+        Some(2),
+        xmm(3),
+        true,
+    );
+    // vaddss xmm9, xmm10, [rax]
+    let adds = SseOp::FloatArith {
+        op: FloatOp::Add,
+        double: false,
+    };
+    vex(
+        &[0xc5, 0x2a, 0x58, 0x08],
+        adds,
+        xmm(9),
+        Some(10),
+        mem(Base::Gpr(RAX), None, 1, 0),
+        false,
+    );
+    // vpsllw xmm5, xmm6, 3: VEX.vvvv is the destination.
+    let shift = SseOp::ShiftImm {
+        kind: ShiftKind::Left,
+        lane: Size::B16,
+        count: 3,
+    };
+    vex(
+        &[0xc5, 0xd1, 0x71, 0xf6, 0x03],
+        shift,
+        xmm(5),
+        Some(6),
+        Operand::Imm(3),
+        false,
+    );
+    // vmovdqu xmm0, [rdi]; vpshufd xmm1, xmm2, 0x1b: no VEX.vvvv.
+    let movdqu = SseOp::Mov128 { aligned: false };
+    vex(
+        &[0xc5, 0xfa, 0x6f, 0x07],
+        movdqu,
+        xmm(0),
+        None,
+        mem(Base::Gpr(RDI), None, 1, 0),
+        false,
+    );
+    vex(
+        &[0xc5, 0xf9, 0x70, 0xca, 0x1b],
+        SseOp::Pshufd(0x1b),
+        xmm(1),
+        None,
+        xmm(2),
+        false,
+    );
+    // vcmpps xmm1, xmm2, xmm3, 17 (lt_oq): VEX predicates up to 31.
+    let cmp = SseOp::PackedCmpMask {
+        double: false,
+        predicate: 17,
+    };
+    vex(
+        &[0xc5, 0xe8, 0xc2, 0xcb, 0x11],
+        cmp,
+        xmm(1),
+        Some(2),
+        xmm(3),
+        false,
+    );
+    // vmovss xmm1, xmm2, xmm3
+    let movss = SseOp::MovScalar { double: false };
+    vex(
+        &[0xc5, 0xea, 0x10, 0xcb],
+        movss,
+        xmm(1),
+        Some(2),
+        xmm(3),
+        false,
+    );
+    // vpinsrq xmm1, xmm2, rax, 1
+    let insert = SseOp::Insert {
+        lane: Size::B64,
+        index: 1,
+    };
+    vex(
+        &[0xc4, 0xe3, 0xe9, 0x22, 0xc8, 0x01],
+        insert,
+        xmm(1),
+        Some(2),
+        gpr(RAX),
+        false,
+    );
+    // vstmxcsr [rsp] (glibc's libm)
+    assert!(matches!(
+        ok(&[0xc5, 0xf8, 0xae, 0x1c, 0x24]).op,
+        Op::VexMxcsr { store: true, .. }
+    ));
+    // vpinsrq with VEX.L = 1: no 256-bit form.
+    assert_eq!(
+        decode(&[0xc4, 0xe3, 0xed, 0x22, 0xc8, 0x01]),
+        Err(DecodeError::Invalid)
+    );
+    // vzeroupper, vzeroall
+    assert_eq!(ok(&[0xc5, 0xf8, 0x77]).op, Op::Vzero { all: false });
+    assert_eq!(ok(&[0xc5, 0xfc, 0x77]).op, Op::Vzero { all: true });
+    // vmovdqu with VEX.vvvv in use, an MMX form (VEX.pp none on 0F FE) and
+    // the legacy pblendvb opcode: #UD.
+    for bytes in [
+        &[0xc5, 0xea, 0x6f, 0x07][..],
+        &[0xc5, 0xe8, 0xfe, 0xcb],
+        &[0xc4, 0xe2, 0x69, 0x10, 0xcb],
+    ] {
+        assert_eq!(decode(bytes), Err(DecodeError::Invalid), "{bytes:02x?}");
+    }
+    // Legacy cmpps still refuses predicates above 7.
+    assert!(matches!(
+        decode(&[0x0f, 0xc2, 0xcb, 0x11]),
+        Err(DecodeError::Unsupported(_))
+    ));
+}
+
+/// The instructions AVX and AVX2 add, bytes from the GNU assembler and
+/// objdump.
+#[test]
+fn avx_new_instructions() {
+    let xmm = |n| Operand::Reg(Reg::Xmm(n));
+    let avx = |bytes: &[u8], op, dst, src1, src, avx2| {
+        let insn = ok(bytes);
+        assert_eq!(
+            (insn.op, insn.len),
+            (
+                Op::Avx {
+                    op,
+                    dst,
+                    src1,
+                    src,
+                    wide: true,
+                    avx2,
+                },
+                bytes.len()
+            ),
+            "{bytes:02x?}"
+        );
+    };
+    // vpbroadcastb ymm1, xmm2
+    avx(
+        &[0xc4, 0xe2, 0x7d, 0x78, 0xca],
+        AvxOp::Broadcast(Size::B8),
+        xmm(1),
+        None,
+        xmm(2),
+        true,
+    );
+    // vinserti128 ymm1, ymm2, xmm3, 1
+    avx(
+        &[0xc4, 0xe3, 0x6d, 0x38, 0xcb, 0x01],
+        AvxOp::Insert128(1),
+        xmm(1),
+        Some(2),
+        xmm(3),
+        true,
+    );
+    // vextractf128 [rax], ymm4, 1
+    let at_rax = mem(Base::Gpr(RAX), None, 1, 0);
+    avx(
+        &[0xc4, 0xe3, 0x7d, 0x19, 0x20, 0x01],
+        AvxOp::Extract128(1),
+        at_rax,
+        None,
+        xmm(4),
+        false,
+    );
+    // vpermq ymm1, ymm2, 0x1b (VEX.W1)
+    avx(
+        &[0xc4, 0xe3, 0xfd, 0x00, 0xca, 0x1b],
+        AvxOp::Permq(0x1b),
+        xmm(1),
+        None,
+        xmm(2),
+        true,
+    );
+    // vblendvps ymm1, ymm2, ymm3, ymm4: the fourth register in imm8[7:4].
+    let blend = AvxOp::BlendV {
+        lane: Size::B32,
+        mask: 4,
+    };
+    avx(
+        &[0xc4, 0xe3, 0x6d, 0x4a, 0xcb, 0x40],
+        blend,
+        xmm(1),
+        Some(2),
+        xmm(3),
+        false,
+    );
+    // vpmaskmovq [rdi], ymm2, ymm3: a store, the mask in VEX.vvvv.
+    let store = AvxOp::MaskMov {
+        lane: Size::B64,
+        store: true,
+    };
+    let at_rdi = mem(Base::Gpr(RDI), None, 1, 0);
+    avx(
+        &[0xc4, 0xe2, 0xed, 0x8e, 0x1f],
+        store,
+        at_rdi,
+        Some(2),
+        xmm(3),
+        true,
+    );
+    // vcvtph2ps ymm0, [rdi]; vcvtps2ph xmm1, ymm2, 4 (F16C).
+    let at_rdi = mem(Base::Gpr(RDI), None, 1, 0);
+    avx(
+        &[0xc4, 0xe2, 0x7d, 0x13, 0x07],
+        AvxOp::Ph2Ps,
+        xmm(0),
+        None,
+        at_rdi,
+        false,
+    );
+    avx(
+        &[0xc4, 0xe3, 0x7d, 0x1d, 0xd1, 0x04],
+        AvxOp::Ps2Ph(4),
+        xmm(1),
+        None,
+        xmm(2),
+        false,
+    );
+    // vfnmsub231sd xmm3, xmm4, [rax] (FMA, scalar: VEX.L ignored).
+    let fma = ok(&[0xc4, 0xe2, 0xd9, 0xbf, 0x18]).op;
+    assert_eq!(
+        fma,
+        Op::Avx {
+            op: AvxOp::Fma {
+                order: FmaOrder::O231,
+                kind: FmaKind::NegSub,
+                double: true,
+                scalar: true,
+            },
+            dst: xmm(3),
+            src1: Some(4),
+            src: mem(Base::Gpr(RAX), None, 1, 0),
+            wide: false,
+            avx2: false,
+        }
+    );
+    // vpermq with VEX.W0, and with VEX.L0: #UD.
+    for bytes in [
+        &[0xc4, 0xe3, 0x7d, 0x00, 0xca, 0x1b][..],
+        &[0xc4, 0xe3, 0xf9, 0x00, 0xca, 0x1b],
+    ] {
+        assert_eq!(decode(bytes), Err(DecodeError::Invalid), "{bytes:02x?}");
+    }
+}
+
+/// BMI1, BMI2 (VEX) and MOVBE, bytes from the GNU assembler and objdump.
+#[test]
+fn bmi_and_movbe() {
+    let bmi = |bytes: &[u8], op, dst, src, vvvv, size| {
+        let insn = ok(bytes);
+        assert_eq!(
+            (insn.op, insn.size, insn.len),
+            (
+                Op::Bmi {
+                    op,
+                    dst: Reg::Gpr(dst),
+                    src,
+                    vvvv: Reg::Gpr(vvvv),
+                },
+                size,
+                bytes.len()
+            ),
+            "{bytes:02x?}"
+        );
+    };
+    let at = |base, disp| mem(Base::Gpr(base), None, 1, disp);
+    // andn rax, rbx, rcx; andn r9d, r10d, [r11+8]
+    bmi(
+        &[0xc4, 0xe2, 0xe0, 0xf2, 0xc1],
+        BmiOp::Andn,
+        RAX,
+        gpr(RCX),
+        RBX,
+        Size::B64,
+    );
+    bmi(
+        &[0xc4, 0x42, 0x28, 0xf2, 0x4b, 0x08],
+        BmiOp::Andn,
+        R9,
+        at(11, 8),
+        R10,
+        Size::B32,
+    );
+    // bextr eax, [rsi], edx
+    bmi(
+        &[0xc4, 0xe2, 0x68, 0xf7, 0x06],
+        BmiOp::Bextr,
+        RAX,
+        at(RSI, 0),
+        RDX,
+        Size::B32,
+    );
+    // blsi r12, rax; blsmsk eax, ecx; blsr rbx, [rdi]: the destination
+    // is VEX.vvvv.
+    bmi(
+        &[0xc4, 0xe2, 0x98, 0xf3, 0xd8],
+        BmiOp::Blsi,
+        R12,
+        gpr(RAX),
+        R12,
+        Size::B64,
+    );
+    bmi(
+        &[0xc4, 0xe2, 0x78, 0xf3, 0xd1],
+        BmiOp::Blsmsk,
+        RAX,
+        gpr(RCX),
+        RAX,
+        Size::B32,
+    );
+    bmi(
+        &[0xc4, 0xe2, 0xe0, 0xf3, 0x0f],
+        BmiOp::Blsr,
+        RBX,
+        at(RDI, 0),
+        RBX,
+        Size::B64,
+    );
+    // bzhi rax, rbx, rcx; pdep eax, ebx, ecx; pext r8, r9, [rsp]
+    bmi(
+        &[0xc4, 0xe2, 0xf0, 0xf5, 0xc3],
+        BmiOp::Bzhi,
+        RAX,
+        gpr(RBX),
+        RCX,
+        Size::B64,
+    );
+    bmi(
+        &[0xc4, 0xe2, 0x63, 0xf5, 0xc1],
+        BmiOp::Pdep,
+        RAX,
+        gpr(RCX),
+        RBX,
+        Size::B32,
+    );
+    bmi(
+        &[0xc4, 0x62, 0xb2, 0xf5, 0x04, 0x24],
+        BmiOp::Pext,
+        R8,
+        at(RSP, 0),
+        R9,
+        Size::B64,
+    );
+    // mulx r10, r11, rax: high half r10, low half r11.
+    bmi(
+        &[0xc4, 0x62, 0xa3, 0xf6, 0xd0],
+        BmiOp::Mulx,
+        R10,
+        gpr(RAX),
+        11,
+        Size::B64,
+    );
+    // rorx eax, ebx, 7
+    bmi(
+        &[0xc4, 0xe3, 0x7b, 0xf0, 0xc3, 0x07],
+        BmiOp::Rorx(7),
+        RAX,
+        gpr(RBX),
+        0,
+        Size::B32,
+    );
+    // sarx eax, ebx, ecx; shlx r15, [rax], r14; shrx rax, rbx, rcx
+    bmi(
+        &[0xc4, 0xe2, 0x72, 0xf7, 0xc3],
+        BmiOp::Sarx,
+        RAX,
+        gpr(RBX),
+        RCX,
+        Size::B32,
+    );
+    bmi(
+        &[0xc4, 0x62, 0x89, 0xf7, 0x38],
+        BmiOp::Shlx,
+        R15,
+        at(RAX, 0),
+        14,
+        Size::B64,
+    );
+    bmi(
+        &[0xc4, 0xe2, 0xf3, 0xf7, 0xc3],
+        BmiOp::Shrx,
+        RAX,
+        gpr(RBX),
+        RCX,
+        Size::B64,
+    );
+    // VEX.L = 1, rorx with VEX.vvvv in use, group 17 /0, and a REX or 66
+    // before VEX: #UD.
+    for bytes in [
+        &[0xc4, 0xe2, 0xe4, 0xf2, 0xc1][..],
+        &[0xc4, 0xe3, 0x73, 0xf0, 0xc3, 0x07],
+        &[0xc4, 0xe2, 0x78, 0xf3, 0xc1],
+        &[0x48, 0xc4, 0xe2, 0xe0, 0xf2, 0xc1],
+        &[0x66, 0xc4, 0xe2, 0xe0, 0xf2, 0xc1],
+    ] {
+        assert_eq!(decode(bytes), Err(DecodeError::Invalid), "{bytes:02x?}");
+    }
+    // vgatherqps xmm3, [rax + ymm12 * 8 + 16], xmm4: VSIB, VEX.X extends
+    // the vector index.
+    let gather = ok(&[0xc4, 0xa2, 0x5d, 0x93, 0x5c, 0xe0, 0x10]);
+    assert_eq!(gather.len, 7);
+    assert!(matches!(
+        gather.op,
+        Op::Avx {
+            op: AvxOp::Gather {
+                element: Size::B32,
+                index: Size::B64,
+                index_reg: 12,
+            },
+            src1: Some(4),
+            wide: true,
+            src: Operand::Mem(Mem {
+                index: None,
+                scale: 8,
+                disp: 16,
+                ..
+            }),
+            ..
+        }
+    ));
+    // The mask equal to the destination, and no SIB: #UD.
+    for bytes in [
+        &[0xc4, 0xe2, 0x79, 0x90, 0x04, 0x88][..],
+        &[0xc4, 0xe2, 0x71, 0x90, 0x00],
+    ] {
+        assert_eq!(decode(bytes), Err(DecodeError::Invalid), "{bytes:02x?}");
+    }
+    // In compatibility mode: andn eax, ebx, ecx (VEX.W ignored).
+    assert!(matches!(
+        decode_in(&[0xc4, 0xe2, 0xe0, 0xf2, 0xc1], Mode::Compat32).unwrap(),
+        Instruction {
+            op: Op::Bmi {
+                op: BmiOp::Andn,
+                ..
+            },
+            size: Size::B32,
+            ..
+        }
+    ));
+
+    // movbe eax, [rcx]; movbe [rdx], r8; movbe ax, [rcx]
+    let movbe = |bytes: &[u8], dst, src, size| {
+        let insn = ok(bytes);
+        assert_eq!((insn.op, insn.size), (Op::Movbe { dst, src }, size));
+    };
+    movbe(&[0x0f, 0x38, 0xf0, 0x01], gpr(RAX), at(RCX, 0), Size::B32);
+    movbe(
+        &[0x4c, 0x0f, 0x38, 0xf1, 0x02],
+        at(RDX, 0),
+        gpr(R8),
+        Size::B64,
+    );
+    movbe(
+        &[0x66, 0x0f, 0x38, 0xf0, 0x01],
+        gpr(RAX),
+        at(RCX, 0),
+        Size::B16,
+    );
+    // A register operand is #UD.
+    assert_eq!(decode(&[0x0f, 0x38, 0xf0, 0xc1]), Err(DecodeError::Invalid));
 }
 
 #[test]
@@ -902,7 +1445,7 @@ fn fuzz_decoder() {
 #[test]
 fn length_only_decoder() {
     use crate::{Extension, length};
-    let cases: [(&[u8], Extension); 14] = [
+    let cases: [(&[u8], Extension); 19] = [
         // vpcmpeqb ymm1, ymm0, [rdi]
         (&[0xc5, 0xfd, 0x74, 0x0f], Extension::Vex),
         // vzeroupper: no ModRM.
@@ -929,6 +1472,16 @@ fn length_only_decoder() {
         (&[0x8f, 0xe8, 0x78, 0xc2, 0xc1, 0x03], Extension::Xop),
         // xsha256 (VIA PadLock)
         (&[0xf3, 0x0f, 0xa6, 0xd0], Extension::Padlock),
+        // xgetbv
+        (&[0x0f, 0x01, 0xd0], Extension::Xsave),
+        // xsaveopt [rsp+0x40]
+        (&[0x0f, 0xae, 0x74, 0x24, 0x40], Extension::Xsave),
+        // xsavec [rsp+0x40]
+        (&[0x0f, 0xc7, 0x64, 0x24, 0x40], Extension::Xsave),
+        // movbe eax, [rcx]
+        (&[0x0f, 0x38, 0xf0, 0x01], Extension::Movbe),
+        // rdrand eax (0F C7 /6, a register): not XSAVE.
+        (&[0x0f, 0xc7, 0xf0], Extension::Base),
         // mov rax, imm64
         (&[0x48, 0xb8, 1, 2, 3, 4, 5, 6, 7, 8], Extension::Base),
     ];
