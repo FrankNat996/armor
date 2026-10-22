@@ -90,19 +90,25 @@ impl CodeBuffer {
     /// their executable address. The words must be position-independent or
     /// already relocated for that address (`next_address`).
     pub fn publish(&mut self, words: &[u32]) -> Result<*const u8, Full> {
-        let bytes = words.len() * 4;
+        // SAFETY: u32s are plain bytes, and the slice covers them exactly.
+        let bytes =
+            unsafe { std::slice::from_raw_parts(words.as_ptr().cast::<u8>(), words.len() * 4) };
+        self.publish_bytes(bytes)
+    }
+
+    /// `publish`, for code given as its bytes (little-endian words, as the
+    /// cache holds them: `cache::Hit::words`).
+    pub fn publish_bytes(&mut self, code: &[u8]) -> Result<*const u8, Full> {
+        debug_assert!(code.len().is_multiple_of(4), "whole instructions");
+        let bytes = code.len();
         if self.size - self.used < bytes {
             return Err(Full);
         }
         let offset = self.used;
         // SAFETY: [offset, offset + bytes) is inside the writable mapping
-        // (checked above), and the words are plain data.
+        // (checked above), and the code is plain data.
         unsafe {
-            std::ptr::copy_nonoverlapping(
-                words.as_ptr().cast::<u8>(),
-                self.write.as_ptr().add(offset),
-                bytes,
-            );
+            std::ptr::copy_nonoverlapping(code.as_ptr(), self.write.as_ptr().add(offset), bytes);
         }
         self.used += bytes;
         // SAFETY: both ranges are inside this buffer's mappings.

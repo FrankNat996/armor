@@ -238,6 +238,36 @@ pub struct Jit {
     interrupted: Option<u64>,
 }
 
+/// How far past a block's start a `jmp` it follows may go (`closes_loop`),
+/// so that the bytes the cache records for it stay few.
+const FOLLOW_REACH: u64 = 4096;
+
+/// Whether the code at `from` comes back to `start` within 32 instructions
+/// of its straight line (conditional jumps not taken): a jump there, the
+/// end of a loop that starts at `start`.
+fn closes_loop(mem: &MemView, mode: Mode, from: u64, start: u64) -> bool {
+    let mut at = from;
+    for _ in 0..32 {
+        let mut window = [0u8; MAX_INSTRUCTION_LEN];
+        let available = mem.fetch(at, &mut window);
+        let Ok(insn) = decode_in(&window[..available], mode) else {
+            return false;
+        };
+        let next = at.wrapping_add(insn.len as u64);
+        match insn.op {
+            armor_x86::Op::Jcc { rel, .. } | armor_x86::Op::Jmp { rel }
+                if crate::translator::target(next, rel, insn.size) == start =>
+            {
+                return true;
+            }
+            _ if ends_block(&insn) => return false,
+            _ => {}
+        }
+        at = next;
+    }
+    false
+}
+
 /// A translated block: `extern "C" fn(cpu, page_table, context)
 /// -> status`.
 /// `enter_routine`: `enter(cpu, page_table, context, block)`.
@@ -524,6 +554,12 @@ impl Jit {
         (status, self.context.budget)
     }
 
+    /// Whether a block starts at `rip` (tests).
+    #[cfg(test)]
+    pub(crate) fn has_block(&self, rip: u64) -> bool {
+        self.blocks.contains_key(&rip)
+    }
+
     /// Checks that every entry of the indirect-jump table points at the
     /// current translation of its address (tests).
     #[cfg(test)]
@@ -571,7 +607,6 @@ impl Jit {
 
     /// Decodes and translates the block at `rip`.
     fn translate(&mut self, rip: u64, mem: &MemView) -> Entry {
-        let start = Instant::now();
         // In concurrent mode (ADR-0023: other threads or processes write the
         // same memory) accesses are ordered and atomic instructions use LSE
         // atomics; those without one go to the interpreter, which makes
@@ -598,14 +633,18 @@ impl Jit {
         // with the same options, from an earlier run (not in lockstep).
         let key = self.cache_key(&options);
         let cached = !self.lockstep && cache::enabled();
-        if cached && let Some(hit) = cache::lookup(rip, key, |at, buf| mem.fetch(at, buf)) {
-            return self.publish_translation(
+        if cached
+            && let Some(entry) = cache::lookup(
                 rip,
-                &hit.words,
-                &hit.faults,
-                hit.instructions as usize,
-            );
+                key,
+                |at, buf| mem.fetch(at, buf),
+                |hit| self.publish_cached(rip, hit),
+            )
+        {
+            return entry;
         }
+        // Timed from here: a block from the cache is not translated.
+        let start = Instant::now();
         let mut block = Vec::with_capacity(MAX_BLOCK_INSTRUCTIONS);
         let mut at = rip;
         let limit = if self.lockstep {
@@ -629,6 +668,20 @@ impl Jit {
                 {
                     block.push(GuestInstruction { rip: at, insn });
                     at = at.wrapping_add(insn.len as u64);
+                    // A jmp forward into the rest of a loop that comes back
+                    // to this block's start: the block goes on there, so the
+                    // loop runs in one block (and its copy) without exits.
+                    if let armor_x86::Op::Jmp { rel } = insn.op {
+                        let to = crate::translator::target(at, rel, insn.size);
+                        if to > at
+                            && to - rip < FOLLOW_REACH
+                            && !block.iter().any(|g| g.rip == to)
+                            && closes_loop(mem, self.mode, to, rip)
+                        {
+                            at = to;
+                            continue;
+                        }
+                    }
                     if ends_block(&insn) {
                         // Unused: the block ends with its own exits.
                         break BlockEnd::Continue(at);
@@ -645,8 +698,10 @@ impl Jit {
             .unwrap_or_else(|e| panic!("armor bug: cannot encode the block at {rip:#x}: {e}"));
         crate::stats::record(block.len(), translation.words.len(), start.elapsed());
         if cached {
-            let last = block.last().expect("a block has an instruction");
-            let len = last.rip.wrapping_sub(rip) as usize + last.insn.len;
+            // From the start to the end of the last instruction: a followed
+            // jmp's target is forward, so this covers every instruction.
+            let last = block.iter().map(|g| g.rip + g.insn.len as u64).max();
+            let len = last.expect("a block has an instruction").wrapping_sub(rip) as usize;
             let mut bytes = vec![0; len];
             if mem.fetch(rip, &mut bytes) == len {
                 cache::insert(
@@ -688,13 +743,34 @@ impl Jit {
         Entry::Code(code)
     }
 
+    /// Publishes a translation the cache holds (`cache::lookup`), from its
+    /// record's bytes.
+    fn publish_cached(&mut self, rip: u64, hit: cache::Hit<'_>) -> Entry {
+        let words = hit.words();
+        let code = match self.buffer.publish_bytes(words) {
+            Ok(code) => code,
+            Err(_) => {
+                self.flush();
+                self.buffer
+                    .publish_bytes(words)
+                    .expect("one block fits in an empty buffer")
+            }
+        };
+        let at = |offset: u32| code as u64 + 4 * u64::from(offset);
+        self.faults
+            .extend(hit.faults().map(|(load, slow)| (at(load), at(slow))));
+        crate::stats::perf_map(code, words.len(), rip, hit.instructions() as usize);
+        Entry::Code(code)
+    }
+
     /// What a translation depends on besides its bytes and address: the
     /// options (but the entry kind, a hint whose code is correct for any
     /// kind), MXCSR's default (which decides what is translated) and the
     /// CPUID features declared on request (which decide how some
     /// instructions run; none by default, which leaves the key as it was).
     fn cache_key(&self, options: &Options) -> u64 {
-        let mut bits = vec![
+        let mut bits = [0u8; 18];
+        let fixed = [
             u8::from(options.features.lse),
             u8::from(options.features.rcpc),
             u8::from(options.chain),
@@ -706,10 +782,13 @@ impl Jit {
             u8::from(options.kind_register),
             u8::from(options.fast_syscalls),
         ];
+        bits[..fixed.len()].copy_from_slice(&fixed);
         let declared = armor_cpu::cpuid::declared();
-        if declared != armor_cpu::cpuid::Features::NONE {
-            bits.extend_from_slice(&declared.bits().to_le_bytes());
+        if declared == armor_cpu::cpuid::Features::NONE {
+            return cache::fnv1a(&bits[..fixed.len()]);
         }
-        cache::fnv1a(&bits)
+        let features = declared.bits().to_le_bytes();
+        bits[fixed.len()..fixed.len() + features.len()].copy_from_slice(&features);
+        cache::fnv1a(&bits[..fixed.len() + features.len()])
     }
 }

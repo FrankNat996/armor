@@ -50,11 +50,39 @@ const HEADER: usize = 12;
 /// of guest bytes, of words and of faults (u32 each).
 const FIXED: usize = 32;
 
-/// A translation found in the cache.
-pub struct Hit {
-    pub words: Vec<u32>,
-    pub faults: Vec<(u32, u32)>,
-    pub instructions: u32,
+/// A translation found in the cache, as its record holds it (`lookup`).
+pub struct Hit<'a> {
+    body: &'a [u8],
+}
+
+impl Hit<'_> {
+    /// The translation's words, little-endian, 4 bytes each.
+    pub fn words(&self) -> &[u8] {
+        let (nb, nw) = (
+            u32_at(self.body, 20) as usize,
+            u32_at(self.body, 24) as usize,
+        );
+        &self.body[FIXED + nb..FIXED + nb + 4 * nw]
+    }
+
+    /// Its fault table, as (load, slow path) offsets in words.
+    pub fn faults(&self) -> impl Iterator<Item = (u32, u32)> + '_ {
+        let (nb, nw, nf) = (
+            u32_at(self.body, 20) as usize,
+            u32_at(self.body, 24) as usize,
+            u32_at(self.body, 28) as usize,
+        );
+        let at = FIXED + nb + 4 * nw;
+        (0..nf).map(move |i| {
+            let f = at + 8 * i;
+            (u32_at(self.body, f), u32_at(self.body, f + 4))
+        })
+    }
+
+    /// The guest instructions it translates.
+    pub fn instructions(&self) -> u32 {
+        u32_at(self.body, 16)
+    }
 }
 
 /// Where a record is: in the file read at the first lookup, or added in
@@ -84,7 +112,43 @@ impl Hasher for KeyHasher {
     }
 }
 
-type Index = HashMap<(u64, u64), Vec<Place>, BuildHasherDefault<KeyHasher>>;
+type Index = HashMap<(u64, u64), Places, BuildHasherDefault<KeyHasher>>;
+
+/// The records kept for one address and key, oldest first: at most
+/// `PER_ADDRESS`, in place (an allocation for each was a tenth of the
+/// index's time in a warm Python startup).
+#[derive(Clone, Copy)]
+struct Places {
+    items: [Place; PER_ADDRESS],
+    len: usize,
+}
+
+impl Default for Places {
+    fn default() -> Places {
+        Places {
+            items: [Place::New(0); PER_ADDRESS],
+            len: 0,
+        }
+    }
+}
+
+impl Places {
+    fn as_slice(&self) -> &[Place] {
+        &self.items[..self.len]
+    }
+
+    /// Keeps the file's records only (`State::own`).
+    fn keep_file_records(&mut self) {
+        let mut kept = 0;
+        for i in 0..self.len {
+            if matches!(self.items[i], Place::File(_)) {
+                self.items[kept] = self.items[i];
+                kept += 1;
+            }
+        }
+        self.len = kept;
+    }
+}
 
 struct State {
     path: PathBuf,
@@ -109,7 +173,7 @@ impl State {
         if FORKED.swap(false, Ordering::Relaxed) {
             self.new.clear();
             for places in self.index.values_mut() {
-                places.retain(|p| matches!(p, Place::File(_)));
+                places.keep_file_records();
             }
         }
     }
@@ -158,8 +222,14 @@ pub fn counts() -> (u64, u64) {
 }
 
 /// The translation of the block at `rip` for `key`, if the cache has one
-/// whose guest bytes are those `fetch` reads now.
-pub fn lookup(rip: u64, key: u64, fetch: impl Fn(u64, &mut [u8]) -> usize) -> Option<Hit> {
+/// whose guest bytes are those `fetch` reads now: given to `then` as it is
+/// in the record, which no copy is made of (with the cache's lock held).
+pub fn lookup<R>(
+    rip: u64,
+    key: u64,
+    fetch: impl Fn(u64, &mut [u8]) -> usize,
+    then: impl FnOnce(Hit<'_>) -> R,
+) -> Option<R> {
     let mut guard = STATE.lock().expect("cache lock");
     let state = guard.as_mut()?;
     state.own();
@@ -179,9 +249,9 @@ pub fn lookup(rip: u64, key: u64, fetch: impl Fn(u64, &mut [u8]) -> usize) -> Op
             state.tail = Some(end);
         }
     }
-    let places = state.index.get(&(rip, key))?.clone();
-    let mut now = Vec::new();
-    for place in places.into_iter().rev() {
+    let places = *state.index.get(&(rip, key))?;
+    let mut found = None;
+    for &place in places.as_slice().iter().rev() {
         let record: &[u8] = match place {
             Place::File(at) => {
                 if state.damaged.contains(&at) {
@@ -197,14 +267,33 @@ pub fn lookup(rip: u64, key: u64, fetch: impl Fn(u64, &mut [u8]) -> usize) -> Op
             Place::New(at) => record_at(&state.new, at),
         };
         let body = &record[HEADER..];
-        let bytes = guest_bytes(body);
-        now.resize(bytes.len(), 0);
-        if fetch(rip, &mut now) == now.len() && now[..] == *bytes {
-            HITS.fetch_add(1, Ordering::Relaxed);
-            return Some(hit(body));
+        if same_bytes(guest_bytes(body), rip, &fetch) {
+            found = Some(place);
+            break;
         }
     }
-    None
+    let record = match found? {
+        Place::File(at) => record_at(&state.data, at),
+        Place::New(at) => record_at(&state.new, at),
+    };
+    HITS.fetch_add(1, Ordering::Relaxed);
+    Some(then(Hit {
+        body: &record[HEADER..],
+    }))
+}
+
+/// Whether the guest bytes at `rip` are `bytes`, read a piece at a time.
+fn same_bytes(bytes: &[u8], rip: u64, fetch: &impl Fn(u64, &mut [u8]) -> usize) -> bool {
+    let mut now = [0u8; 256];
+    let mut done = 0;
+    while done < bytes.len() {
+        let n = (bytes.len() - done).min(now.len());
+        if fetch(rip + done as u64, &mut now[..n]) != n || now[..n] != bytes[done..done + n] {
+            return false;
+        }
+        done += n;
+    }
+    true
 }
 
 /// Records a new translation of the block at `rip` (guest `bytes`, `n`
@@ -228,10 +317,12 @@ pub fn insert(rip: u64, key: u64, bytes: &[u8], words: &[u32], faults: &[(u32, u
 /// `PER_ADDRESS` (lookups try the newest first).
 fn push(index: &mut Index, rip: u64, key: u64, place: Place) {
     let places = index.entry((rip, key)).or_default();
-    if places.len() == PER_ADDRESS {
-        places.remove(0);
+    if places.len == PER_ADDRESS {
+        places.items.copy_within(1.., 0);
+        places.len -= 1;
     }
-    places.push(place);
+    places.items[places.len] = place;
+    places.len += 1;
 }
 
 /// Appends the records added in this process to the file. Errors leave it
@@ -284,7 +375,7 @@ pub fn save() {
     // The records just written are in the file now, not to be written
     // again (nor found by a later lookup of this process).
     for places in state.index.values_mut() {
-        places.retain(|p| matches!(p, Place::File(_)));
+        places.keep_file_records();
     }
 }
 
@@ -405,27 +496,6 @@ fn guest_bytes(body: &[u8]) -> &[u8] {
     &body[FIXED..FIXED + nb]
 }
 
-fn hit(body: &[u8]) -> Hit {
-    let (nb, nw, nf) = (
-        u32_at(body, 20) as usize,
-        u32_at(body, 24) as usize,
-        u32_at(body, 28) as usize,
-    );
-    let (words, _) = body[FIXED + nb..FIXED + nb + 4 * nw].as_chunks::<4>();
-    let words = words.iter().map(|w| u32::from_le_bytes(*w)).collect();
-    let faults = (0..nf)
-        .map(|i| {
-            let f = FIXED + nb + 4 * nw + 8 * i;
-            (u32_at(body, f), u32_at(body, f + 4))
-        })
-        .collect();
-    Hit {
-        words,
-        faults,
-        instructions: u32_at(body, 16),
-    }
-}
-
 /// A checksum of `data`, 32 bytes at a time in four independent lanes
 /// (one chain of multiplications was a fifth of a warm Python startup's
 /// lookups); accidental damage, not an adversary: ADR-0048.
@@ -502,9 +572,16 @@ mod tests {
         assert!(intact(record));
         let body = &record[HEADER..];
         assert_eq!(guest_bytes(body), &[0x90, 0xc3]);
-        let h = hit(body);
+        let h = Hit { body };
+        let words: Vec<u32> = h
+            .words()
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|w| u32::from_le_bytes(*w))
+            .collect();
         assert_eq!(
-            (h.words, h.faults, h.instructions),
+            (words, h.faults().collect::<Vec<_>>(), h.instructions()),
             (vec![1, 2, 3], vec![(1, 2)], 3)
         );
         // A flipped byte in the second record's words: found damaged.
@@ -552,6 +629,14 @@ mod tests {
         for i in 0..10 {
             push(&mut index, 1, 2, Place::New(i));
         }
-        assert_eq!(index[&(1, 2)].len(), PER_ADDRESS);
+        let kept: Vec<usize> = index[&(1, 2)]
+            .as_slice()
+            .iter()
+            .map(|p| match p {
+                Place::New(i) | Place::File(i) => *i,
+            })
+            .collect();
+        // The newest, oldest first.
+        assert_eq!(kept, (10 - PER_ADDRESS..10).collect::<Vec<_>>());
     }
 }

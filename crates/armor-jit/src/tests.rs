@@ -1910,6 +1910,45 @@ fn indirect_jumps_keep_flags_and_budget() {
     assert!(returns >= 80, "only {returns} returns to the engine");
 }
 
+/// A loop whose then-branch jumps forward to the loop's tail (`if/else`
+/// in a loop): the block follows the jmp (`closes_loop`), so the loop runs
+/// in one block and its copy, and gives what the interpreter gives.
+#[test]
+fn loops_through_a_followed_jmp() {
+    let guest = Guest::new();
+    #[rustfmt::skip]
+    let code = [
+        0xb9, 0x64, 0x00, 0x00, 0x00, // mov ecx, 100
+        0x01, 0xc8,                   // loop: add eax, ecx
+        0xf7, 0xc1, 0x01, 0x00, 0x00, 0x00, // test ecx, 1
+        0x74, 0x05,                   // jz even
+        0x83, 0xc3, 0x03,             // add ebx, 3
+        0xeb, 0x03,                   // jmp tail
+        0x83, 0xeb, 0x01,             // even: sub ebx, 1
+        0xff, 0xc9,                   // tail: dec ecx
+        0x75, 0xea,                   // jnz loop
+    ];
+    let mut rng = Rng(61);
+    for round in 0..8 {
+        let cpu = guest.cpu(&mut rng);
+        guest.compare(&code, &cpu, round);
+    }
+    let mut looped = code.to_vec();
+    looped.extend([0x0f, 0x05]);
+    guest.mem.write_privileged(guest.code, &looped).unwrap();
+    let mut cpu = guest.cpu(&mut rng);
+    let mut jit = Jit::new().unwrap();
+    assert_eq!(
+        jit.run(&mut cpu, &guest.mem.view(), 1_000_000),
+        Ok(Step::Syscall)
+    );
+    // Followed, the loop's tail is never a block of its own.
+    assert!(
+        !jit.has_block(guest.code + 0x17),
+        "the jmp was not followed"
+    );
+}
+
 #[test]
 fn chained_code_returns_when_the_budget_runs_out() {
     let guest = Guest::new();

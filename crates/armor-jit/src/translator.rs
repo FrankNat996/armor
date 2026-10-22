@@ -1048,13 +1048,26 @@ fn live_flags(block: &[GuestInstruction]) -> Vec<u64> {
     for (i, g) in block.iter().enumerate().rev() {
         after[i] = live;
         let insn = &g.insn;
-        live = if stays_in_block(insn) {
+        live = if followed(g, block.get(i + 1)) {
+            // A jmp the block goes on through: the flags pass.
+            live
+        } else if stays_in_block(insn) {
             live & !flags_written(insn) | flags_read(insn)
         } else {
             STATUS_FLAGS
         };
     }
     after
+}
+
+/// Whether `g` is a `jmp` to `next`, the block's next instruction: the
+/// engine followed it (`closes_loop`).
+fn followed(g: &GuestInstruction, next: Option<&GuestInstruction>) -> bool {
+    let Op::Jmp { rel } = g.insn.op else {
+        return false;
+    };
+    let after = g.rip.wrapping_add(g.insn.len as u64);
+    next.is_some_and(|n| n.rip == target(after, rel, g.insn.size))
 }
 
 /// The host condition that, after redoing the pending operation `p`,
@@ -1205,7 +1218,7 @@ fn xmm_or_mem(operand: &Operand) -> bool {
 
 /// The target of a relative branch: `size` is the stack width, and with
 /// 32 bits (compatibility mode) eip wraps at 4 GiB.
-fn target(next: u64, rel: i64, size: Size) -> u64 {
+pub(crate) fn target(next: u64, rel: i64, size: Size) -> u64 {
     let target = next.wrapping_add(rel as u64);
     if size == Size::B32 {
         target & 0xffff_ffff
@@ -1945,6 +1958,9 @@ struct Translator {
     /// The current instruction's load needs no order (`value_dead`): a
     /// plain load even in concurrent mode.
     relaxed: bool,
+    /// The address of the block's next instruction (a `jmp` there was
+    /// followed, `followed`).
+    next_rip: Option<u64>,
     /// adc or sbb takes its carry from the pending operation, redone into
     /// the host NZCV just before it (`carry_in_host`), not from `FLAGS`.
     carry_redo: Option<Pending>,
@@ -2026,6 +2042,7 @@ impl Translator {
             self.fuse_copy = block
                 .get(i + 1)
                 .is_some_and(|n| copy_fuses(&g.insn, &n.insn));
+            self.next_rip = block.get(i + 1).map(|n| n.rip);
             // Not a load that is itself the next one of a relaxed load: its
             // slow paths go back to that one.
             let relaxed = self.options.concurrent
@@ -2107,6 +2124,7 @@ impl Translator {
             first: None,
             fuse_copy: false,
             relaxed: false,
+            next_rip: None,
             restart: None,
             carry_redo: None,
             access_slow: None,
@@ -2896,6 +2914,9 @@ impl Translator {
                     self.store_reg(reg, size, B)?;
                 }
             }
+            // A jmp followed when the block was decoded: nothing to do, the
+            // target is next.
+            Op::Jmp { rel } if self.next_rip == Some(target(next, rel, size)) => {}
             Op::Jmp { rel } => {
                 self.exit_direct(target(next, rel, size))?;
                 return Ok(false);

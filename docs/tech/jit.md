@@ -727,6 +727,20 @@ gcc compiles `a == b` on doubles as `ucomisd; jp; je` (and `!=` as `jp; jne`). Z
 
 ✅ `python-float` 3.900 → 3.875 billion instructions (perf stat, `PYTHONHASHSEED=0`, 2026-10-22). Verification: `float_comparison_flags_wait` runs every condition after `jp`, after `ja` (whose fall-through still includes unordered) and at the exit, for every pair of special values; mutations caught: `e` as `eq` without the ordering known, and the ordering assumed after any jump.
 
+## A `jmp` that closes a loop, followed (M11, 2026-10-22)
+A loop with an `if/else` inside is laid out as its head, the then-branch ending in a `jmp` over the else-branch, and the tail with the jump back: two blocks, and an exit between them at every iteration. When a block meets a `jmp` forward (within 4 KiB of its start) whose target, read along its straight line for at most 32 instructions, jumps back to the block's start (`closes_loop`), the block goes on at the target: the loop is one block, and its copy (above) runs it without exits. The translator emits nothing for the followed `jmp` (`followed`, `Translator::next_rip`), and the flags pass through it. The cache records the bytes from the block's start to the end of its last instruction, which contain every instruction since the target is forward.
+
+✅ Measured (Pi 5, 2026-10-22, the machine quiet, cache off, medians of 5): 7-Zip 8972 → 8862 ms (its match finder's loop, `3d3e0`–`3d44b`, went through two blocks); `python-int` 540 → 538 ms, python's startup unchanged. 7-Zip's instructions −1.4% (75.35 → 74.27 billion; −2.4% with the rule's first form, without the bound and with targets behind). Following every `jmp` had given 7-Zip −4.8% instructions but Python +1.4% and its cold startup +34% (code duplicated and translated).
+
+Verification: `loops_through_a_followed_jmp` (a loop with an `if/else`, against the interpreter; the loop's tail must not become a block of its own); mutation caught: no jmp followed.
+
+## Cached translations published from their records (M11, 2026-10-22)
+A warm start takes most blocks from the cache (ADR-0048). The lookup gave each one as new vectors (its words, its fault table, the list of records for the address, the guest bytes to compare), which the engine then copied into the code buffer: five allocations a block, and a key built in a vector of its own. Now `cache::lookup` hands the record itself to the engine (`Hit`, under the cache's lock), which copies its words into the buffer (`CodeBuffer::publish_bytes`) and its faults into the table; the guest bytes are compared a piece at a time on the stack; the records of an address are kept in place (`Places`, at most `PER_ADDRESS`); the key is an array; and the translation time is measured only when a block is translated.
+
+✅ Measured (Pi 5, 2026-10-22, the machine quiet, `perf stat -r 15`): Python's warm startup 99.7 → 95.4 ms of CPU, 165 → 140 million user instructions; 104 → 100 ms of elapsed time (medians of 11; box64 104).
+
+Verification: `translations_come_back_from_the_cache` and the cache's unit tests (`records_round_trip_and_damage_is_found` now reads the words and faults through `Hit`, `a_few_records_per_address` checks that the newest are kept, in order).
+
 ## Translations cached on disk (ADR-0048, since 2026-10-20)
 A translated block depends only on its guest bytes, its address and the options: since the shared prologue and epilogue it does not depend on where it is published. `cache.rs` keeps the translations of a program in a file and the engine reuses them in later runs:
 - **Lookup** (`Jit::translate`, before decoding): the records for the block's address and options key (`cache_key`: the `Options` but the entry kind, which is a hint, and MXCSR's default); one is used only if the guest bytes now at the address are exactly its recorded bytes, and if its checksum holds (checked the first time it is needed). A hit is published like a fresh translation (its exits unchained), with its fault table. Not in lockstep.
