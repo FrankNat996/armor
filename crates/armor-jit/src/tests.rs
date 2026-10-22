@@ -2347,6 +2347,35 @@ fn float_comparison_flags_wait() {
                     }
                 }
             }
+            // Past a jp not taken the comparison is ordered: then e, ne
+            // and the others (`FlagKind::FloatCompare::ordered`), and the
+            // flags at the exit.
+            for cc in 0..16u8 {
+                #[rustfmt::skip]
+                let readers: [&[u8]; 4] = [
+                    // ja over lea; jcc over lea (unordered falls through ja)
+                    &[0x77, 0x04, 0x48, 0x8d, 0x52, 0x01, 0x70 | cc, 0x04, 0x48, 0x8d, 0x52, 0x01],
+                    // jp over lea; jcc over lea
+                    &[0x7a, 0x04, 0x48, 0x8d, 0x52, 0x01, 0x70 | cc, 0x04, 0x48, 0x8d, 0x52, 0x01],
+                    // jp over lea; setcc dl
+                    &[0x7a, 0x04, 0x48, 0x8d, 0x52, 0x01, 0x0f, 0x90 | cc, 0xc2],
+                    // jp over lea; nothing more (the exit)
+                    &[0x7a, 0x04, 0x48, 0x8d, 0x52, 0x01],
+                ];
+                for reader in readers {
+                    let code = [compare.as_slice(), reader].concat();
+                    for &a in &values {
+                        let mut cpu = guest.cpu(&mut rng);
+                        with(&mut cpu, 0, a);
+                        with(&mut cpu, 1, rng.pick(&values));
+                        round += 1;
+                        guest.compare(&code, &cpu, round);
+                        with(&mut cpu, 1, a);
+                        round += 1;
+                        guest.compare(&code, &cpu, round);
+                    }
+                }
+            }
             // The flags read only at the exit.
             for &a in &values {
                 for &b in &values {

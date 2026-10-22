@@ -3,8 +3,9 @@
  * SIGALRM without SA_RESTART (write returns EINTR) and with it (write
  * restarts, and succeeds once the handler made room). Also the simple
  * syscalls armor's translated code makes itself (getpid, getppid,
- * gettid, the ids, lseek, sched_yield, write), checked against what they
- * mean rather than their values, and a write whose buffer is not mapped.
+ * gettid, the ids, lseek, sched_yield, write, clock_gettime,
+ * gettimeofday), checked against what they mean rather than their values,
+ * and writes and time structures in memory the call may not use.
  */
 #define _GNU_SOURCE
 #include <errno.h>
@@ -16,6 +17,7 @@
 #include <sys/mman.h>
 #include <sys/syscall.h>
 #include <sys/time.h>
+#include <time.h>
 #include <unistd.h>
 
 static volatile sig_atomic_t alarms;
@@ -118,6 +120,42 @@ int main(void) {
     char sink[64];
     while (n > 0)
         n -= read(pipe_fds[0], sink, n < 64 ? n : 64);
+
+    /* The clocks: monotonic does not go back; a read-only page, or a
+       structure running into an inaccessible page, is EFAULT. */
+    long rc;
+    struct timespec t1, t2;
+    int r1 = clock_gettime(CLOCK_MONOTONIC, &t1);
+    int r2 = clock_gettime(CLOCK_MONOTONIC, &t2);
+    printf("clock_gettime: %d %d %s\n", r1, r2,
+           t2.tv_sec > t1.tv_sec || (t2.tv_sec == t1.tv_sec && t2.tv_nsec >= t1.tv_nsec)
+               ? "monotonic"
+               : "back");
+    struct timeval tv;
+    int rt = gettimeofday(&tv, NULL);
+    printf("gettimeofday: %d %s\n", rt, tv.tv_sec > 1000000000 ? "now" : "?");
+    /* A page of code that has run (armor translated it): x86 writes there. */
+    unsigned char *rwx =
+        mmap(NULL, 4096, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    rwx[0] = 0xc3; /* ret */
+    ((void (*)(void))rwx)();
+    rc = syscall(SYS_clock_gettime, CLOCK_MONOTONIC, rwx + 64);
+    ((void (*)(void))rwx)();
+    printf("clock_gettime into code: %ld\n", rc);
+    char *ro = mmap(NULL, 8192, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    mprotect(ro, 4096, PROT_READ);
+    mprotect(ro + 4096, 4096, PROT_NONE);
+    errno = 0;
+    rc = syscall(SYS_clock_gettime, CLOCK_REALTIME, ro);
+    printf("clock_gettime read-only: %ld %s\n", rc, errno == EFAULT ? "EFAULT" : "?");
+    errno = 0;
+    rc = syscall(SYS_gettimeofday, ro, NULL);
+    printf("gettimeofday read-only: %ld %s\n", rc, errno == EFAULT ? "EFAULT" : "?");
+    char *edge = mmap(NULL, 8192, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    mprotect(edge + 4096, 4096, PROT_NONE);
+    errno = 0;
+    rc = syscall(SYS_clock_gettime, CLOCK_REALTIME, edge + 4088);
+    printf("clock_gettime across: %ld %s\n", rc, errno == EFAULT ? "EFAULT" : "?");
 
     /* A full pipe: the write blocks until the timer's signal. */
     long filled = fill_pipe();

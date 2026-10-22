@@ -81,9 +81,11 @@ pub const EXIT_INTERRUPTED: u64 = 5;
 
 /// The syscalls translated code makes itself (`Options::fast_syscalls`), by
 /// x86-64 number: the AArch64 number, 0 for the others. Each has the same
-/// arguments and result on both, takes integers only or reads guest memory
-/// only (`write`, whose buffer is checked to lie in the guest's region),
-/// and is what armor's own handler does (`host`, or a copy for `write`).
+/// arguments and result on both, takes integers only, reads guest memory
+/// only (`write`, whose buffer is checked to lie in the guest's region) or
+/// writes a structure of the same layout on both into data pages
+/// (`clock_gettime`, `gettimeofday`, checked writable and not executable),
+/// and is what armor's own handler does (`host`, or a copy).
 pub static FAST_SYSCALLS: [u8; FAST_SYSCALL_LIMIT] = {
     let mut table = [0u8; FAST_SYSCALL_LIMIT];
     table[1] = 64; // write
@@ -96,8 +98,14 @@ pub static FAST_SYSCALLS: [u8; FAST_SYSCALL_LIMIT] = {
     table[108] = 177; // getegid
     table[110] = 173; // getppid
     table[186] = 178; // gettid
+    table[96] = 169; // gettimeofday
+    table[228] = 113; // clock_gettime
     table
 };
+/// x86-64 `gettimeofday` and `clock_gettime`, whose results translated code
+/// checks it may write first.
+const X86_GETTIMEOFDAY: u32 = 96;
+const X86_CLOCK_GETTIME: u32 = 228;
 /// x86-64 syscall numbers below this can be in `FAST_SYSCALLS`.
 pub const FAST_SYSCALL_LIMIT: usize = 256;
 /// x86-64 `write`, whose buffer translated code checks first.
@@ -1055,9 +1063,11 @@ fn live_flags(block: &[GuestInstruction]) -> Vec<u64> {
 /// addition).
 fn host_condition(p: Pending, cond: X86Cond) -> Option<Cond> {
     use X86Cond as C;
-    if let FlagKind::FloatCompare { .. } = p.kind {
+    if let FlagKind::FloatCompare { ordered, .. } = p.kind {
         // FCMP's NZCV: unordered 0011, less 1000, equal 0110, greater
-        // 0010; x86's ZF PF CF: 111, 001, 100, 000.
+        // 0010; x86's ZF PF CF: 111, 001, 100, 000. ZF is set for equal
+        // and unordered: the host's Z alone once the comparison is known
+        // ordered (`ordered`, after a jp not taken).
         return match cond {
             C::A => Some(Cond::Gt),
             C::Ae => Some(Cond::Ge),
@@ -1065,6 +1075,8 @@ fn host_condition(p: Pending, cond: X86Cond) -> Option<Cond> {
             C::Be => Some(Cond::Le),
             C::P => Some(Cond::Vs),
             C::Np => Some(Cond::Vc),
+            C::E if ordered => Some(Cond::Eq),
+            C::Ne if ordered => Some(Cond::Ne),
             _ => None,
         };
     }
@@ -1709,7 +1721,7 @@ enum FlagKind {
     /// comisd, comiss, ucomisd, ucomiss of the bits in `FA` and `FB`: ZF,
     /// PF and CF from the comparison, OF, SF and AF cleared. Inside the
     /// block only.
-    FloatCompare { double: bool },
+    FloatCompare { double: bool, ordered: bool },
 }
 
 type Emit<T = ()> = Result<T, EncodeError>;
@@ -2902,6 +2914,24 @@ impl Translator {
                         .side_exits
                         .push((taken, to, self.lazy, self.normal, self.at_rip)),
                 }
+                // Past a jp not taken, a pending floating-point comparison
+                // is ordered.
+                if cond == X86Cond::P
+                    && let Lazy::Static(
+                        p @ Pending {
+                            kind: FlagKind::FloatCompare { double, .. },
+                            ..
+                        },
+                    ) = self.lazy
+                {
+                    self.lazy = Lazy::Static(Pending {
+                        kind: FlagKind::FloatCompare {
+                            double,
+                            ordered: true,
+                        },
+                        ..p
+                    });
+                }
                 return Ok(true);
             }
             Op::Jcc { cond, rel } => {
@@ -3913,7 +3943,10 @@ impl Translator {
                 self.a.fmov_to_gpr(double, FB, b);
                 self.flags_emitted |= STATUS_FLAGS;
                 self.lazy = Lazy::Static(Pending::new(
-                    FlagKind::FloatCompare { double },
+                    FlagKind::FloatCompare {
+                        double,
+                        ordered: false,
+                    },
                     Size::B64,
                     STATUS_FLAGS,
                 ));
@@ -6298,7 +6331,27 @@ impl Translator {
         self.a.mov_imm64(T1, 1u64 << bits);
         self.a.subs(Width::X, ZR, A, T1, Shift::Lsl, 0)?;
         self.a.b_cond(Cond::Hi, engine);
+        // clock_gettime's timespec at rsi; gettimeofday's timeval at rdi and
+        // timezone at rsi, either of them null: the pages of each (16 bytes
+        // at most, so this page and the next) writable data for the guest
+        // (the kernel's write must not reach code, whose translations it
+        // would not drop, nor a page the guest may not write).
         self.a.bind(checked);
+        let timed = self.a.new_label();
+        self.a.subs_imm(Width::X, ZR, rax, X86_CLOCK_GETTIME)?;
+        self.a.b_cond(Cond::Ne, timed);
+        self.writable_struct(reg(RSI), bits, engine)?;
+        self.a.bind(timed);
+        let done = self.a.new_label();
+        self.a.subs_imm(Width::X, ZR, rax, X86_GETTIMEOFDAY)?;
+        self.a.b_cond(Cond::Ne, done);
+        let no_tv = self.a.new_label();
+        self.a.cbz(false, Width::X, reg(RDI), no_tv);
+        self.writable_struct(reg(RDI), bits, engine)?;
+        self.a.bind(no_tv);
+        self.a.cbz(false, Width::X, reg(RSI), done);
+        self.writable_struct(reg(RSI), bits, engine)?;
+        self.a.bind(done);
         // The number for the exit's EINTR, before rax takes the result.
         self.a.str(
             MemSize::B64,
@@ -6347,6 +6400,24 @@ impl Translator {
         self.exit(next, EXIT_INTERRUPTED)?;
         self.a.bind(engine);
         self.lazy = Lazy::Current;
+        Ok(())
+    }
+
+    /// To `engine` unless the guest may write a structure of at most a page
+    /// at `at`, below 2^`bits`, in data pages (`fast_syscall`): the page
+    /// table's span bit, for this page and the next. Uses `T1`.
+    fn writable_struct(&mut self, at: HostReg, bits: u32, engine: Label) -> Emit {
+        self.a.shift_imm(Shift::Lsr, Width::X, T1, at, bits)?;
+        self.a.cbz(true, Width::X, T1, engine);
+        self.a.ldr(
+            MemSize::B64,
+            T1,
+            CONTEXT,
+            field(offset_of!(Context, page_table)),
+        )?;
+        self.a.add(Width::X, T1, T1, at, Shift::Lsr, 12)?;
+        self.a.ldr(MemSize::B8, T1, T1, 0)?;
+        self.a.tbz(false, T1, PAGE_WRITABLE_DATA_SPAN_BIT, engine);
         Ok(())
     }
 
@@ -6442,7 +6513,7 @@ impl Translator {
             }
             FlagKind::Shift(op, count) => return self.shift_flags(op, p.size, count),
             FlagKind::Mul { signed } => return self.mul_flags(signed, p.size),
-            FlagKind::FloatCompare { double } => {
+            FlagKind::FloatCompare { double, .. } => {
                 self.float_compare_nzcv(double);
                 self.a.cset(Width::X, T1, Cond::Lt);
                 self.a.cset(Width::X, T2, Cond::Vs);
@@ -6593,7 +6664,7 @@ impl Translator {
     /// The host NZCV of the pending operation `p`, redone from its operands
     /// wherever they are. Uses `R`, `T3`, `T4`.
     fn redo(&mut self, p: Pending) -> Emit {
-        if let FlagKind::FloatCompare { double } = p.kind {
+        if let FlagKind::FloatCompare { double, .. } = p.kind {
             self.float_compare_nzcv(double);
             return Ok(());
         }
