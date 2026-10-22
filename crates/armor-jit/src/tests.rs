@@ -1910,6 +1910,134 @@ fn indirect_jumps_keep_flags_and_budget() {
     assert!(returns >= 80, "only {returns} returns to the engine");
 }
 
+/// Scalar results written with `fmov` when the lanes above are known 0
+/// (`upper_bits`): sequences of loads that zero them, scalar operations of
+/// both widths that keep them, copies and conversions, on xmm0 and xmm1;
+/// every lane compared with the interpreter.
+#[test]
+fn scalar_results_keep_the_upper_lanes() {
+    let guest = Guest::new();
+    let mut rng = Rng(67);
+    // Each with xmm0 as destination; `swap` makes xmm1 the destination
+    // and xmm0 the source (the ModRM's reg and rm fields exchanged).
+    #[rustfmt::skip]
+    let ops: [(&[u8], bool); 17] = [
+        (&[0xf3, 0x0f, 0x10, 0x03], false), // movss xmm0, [rbx]
+        (&[0xf2, 0x0f, 0x10, 0x03], false), // movsd xmm0, [rbx]
+        (&[0xf3, 0x0f, 0x7e, 0x03], false), // movq xmm0, [rbx]
+        (&[0x66, 0x0f, 0x6e, 0xc0], false), // movd xmm0, eax
+        (&[0x66, 0x0f, 0xef, 0xc0], false), // pxor xmm0, xmm0
+        (&[0xf2, 0x0f, 0x58, 0xc1], true),  // addsd xmm0, xmm1
+        (&[0xf3, 0x0f, 0x58, 0xc1], true),  // addss xmm0, xmm1
+        (&[0xf3, 0x0f, 0x5a, 0xc1], true),  // cvtss2sd xmm0, xmm1
+        (&[0xf2, 0x0f, 0x5a, 0xc1], true),  // cvtsd2ss xmm0, xmm1
+        (&[0xf2, 0x0f, 0x2a, 0xc0], false), // cvtsi2sd xmm0, eax
+        (&[0xf3, 0x0f, 0x2a, 0xc0], false), // cvtsi2ss xmm0, eax
+        (&[0xf3, 0x0f, 0x51, 0xc1], true),  // sqrtss xmm0, xmm1
+        (&[0xf3, 0x0f, 0x10, 0xc1], true),  // movss xmm0, xmm1
+        (&[0xf2, 0x0f, 0x10, 0xc1], true),  // movsd xmm0, xmm1
+        (&[0x66, 0x0f, 0x28, 0xc1], true),  // movapd xmm0, xmm1
+        (&[0xf2, 0x0f, 0xc2, 0xc1, 0x01], true), // cmpltsd xmm0, xmm1
+        (&[0x66, 0x0f, 0xd6, 0xc8], true),  // movq xmm0, xmm1
+    ];
+    for round in 0..3000u64 {
+        let mut code = Vec::new();
+        for _ in 0..4 {
+            let (bytes, swappable) = rng.pick(&ops);
+            let mut bytes = bytes.to_vec();
+            if swappable && rng.below(2) == 1 {
+                // The ModRM byte: reg and rm exchanged (xmm1 <-> xmm0).
+                let m = bytes[3];
+                bytes[3] = 0xc0 | (m & 7) << 3 | (m >> 3) & 7;
+            }
+            code.extend(bytes);
+        }
+        let mut cpu = guest.cpu(&mut rng);
+        cpu.regs[3] = guest.data + 8 * rng.below(64);
+        guest.compare(&code, &cpu, round);
+    }
+    // A scalar loaded from memory (the lanes above known 0), then an
+    // operation straight into its register: with special values, whose
+    // slow paths (NaN, underflow) must find the register as it was.
+    let doubles: [u64; 9] = [
+        0,
+        0x8000_0000_0000_0000,
+        0x3ff0_0000_0000_0000,
+        0x7ff0_0000_0000_0000,
+        0x7ff8_0000_0000_0000,
+        0x7ff0_0000_0000_0001,
+        1,
+        0x0010_0000_0000_0000,
+        0x3ca0_0000_0000_0000,
+    ];
+    let singles: [u64; 9] = [
+        0,
+        0x8000_0000,
+        0x3f80_0000,
+        0x7f80_0000,
+        0x7fc0_0000,
+        0x7f80_0001,
+        1,
+        0x0080_0000,
+        0x3380_0000,
+    ];
+    for (double, values) in [(true, doubles), (false, singles)] {
+        let prefix = if double { 0xf2 } else { 0xf3 };
+        for op in [0x58u8, 0x5c, 0x59, 0x5e, 0x51] {
+            for &a in &values {
+                // mov rax, a; movq xmm0, rax; op xmm0, xmm1
+                let mut code = vec![0x48, 0xb8];
+                code.extend_from_slice(&a.to_le_bytes());
+                code.extend([0x66, 0x48, 0x0f, 0x6e, 0xc0, prefix, 0x0f, op, 0xc1]);
+                for &b in &values {
+                    let mut cpu = guest.cpu(&mut rng);
+                    cpu.xmm[1] = (cpu.xmm[1] & !u128::from(u64::MAX)) | u128::from(b);
+                    guest.compare(&code, &cpu, 7);
+                }
+            }
+        }
+    }
+}
+
+/// A loop of scalar doubles: its copy assumes the lanes above them 0 behind
+/// a guard (`LoopCopy::guard`). Entered with them 0 (`movq`, `pxor`
+/// before the loop) the guard passes; with them random it fails and the
+/// plain copy runs: every lane as the interpreter leaves it.
+#[test]
+fn loops_of_scalar_doubles_guard_their_assumption() {
+    let guest = Guest::new();
+    let mut rng = Rng(71);
+    #[rustfmt::skip]
+    let body: &[u8] = &[
+        0xf2, 0x0f, 0x58, 0xc1, // loop: addsd xmm0, xmm1
+        0xf2, 0x0f, 0x59, 0xd1, // mulsd xmm2, xmm1
+        0xf2, 0x0f, 0x5e, 0xd9, // divsd xmm3, xmm1
+        0xff, 0xc9,             // dec ecx
+        0x75, 0xf0,             // jnz loop
+    ];
+    #[rustfmt::skip]
+    let zeroing: &[u8] = &[
+        0x66, 0x48, 0x0f, 0x6e, 0xc0, // movq xmm0, rax
+        0x66, 0x0f, 0xef, 0xd2,       // pxor xmm2, xmm2
+        0x66, 0x48, 0x0f, 0x6e, 0xdb, // movq xmm3, rbx
+    ];
+    for round in 0..64u64 {
+        for zeroed in [false, true] {
+            let mut code = vec![0xb9, 0x28, 0x00, 0x00, 0x00]; // mov ecx, 40
+            if zeroed {
+                code.extend_from_slice(zeroing);
+            }
+            code.extend_from_slice(body);
+            let mut cpu = guest.cpu(&mut rng);
+            // Ordinary doubles, so that the loop runs in translated code.
+            cpu.regs[0] = 0x3ff8_0000_0000_0000;
+            cpu.regs[3] = 0x4000_0000_0000_0000 + (round << 40);
+            cpu.xmm[1] = (cpu.xmm[1] & !u128::from(u64::MAX)) | 0x3ff0_0000_1000_0000;
+            guest.compare(&code, &cpu, round);
+        }
+    }
+}
+
 /// A loop whose then-branch jumps forward to the loop's tail (`if/else`
 /// in a loop): the block follows the jmp (`closes_loop`), so the loop runs
 /// in one block and its copy, and gives what the interpreter gives.

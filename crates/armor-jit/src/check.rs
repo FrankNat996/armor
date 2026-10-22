@@ -643,6 +643,12 @@ pub fn samples() -> Vec<Sample> {
         s.add(format!("fcmpe {p}30, {p}7"), |a| {
             a.fcmpe(double, v(30), v(7))
         });
+        s.add(format!("fmov {p}16, {p}2"), |a| {
+            a.fmov_reg(double, v(16), v(2))
+        });
+        s.add(format!("fmov {p}31, {p}0"), |a| {
+            a.fmov_reg(double, v(31), v(0))
+        });
         let g = if double { "x" } else { "w" };
         s.add(format!("fmov {g}5, {p}1"), |a| {
             a.fmov_to_gpr(double, r(5), v(1))

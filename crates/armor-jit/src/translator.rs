@@ -1281,6 +1281,17 @@ pub fn translate_block(
         t.loop_start = Some(start);
     }
     let live = live_flags(block);
+    t.scalar_doubles = block
+        .iter()
+        .map(|g| match g.insn.op {
+            Op::Sse {
+                op: SseOp::FloatArith { double: true, .. },
+                dst: Operand::Reg(Reg::Xmm(n)),
+                ..
+            } => 1 << n,
+            _ => 0,
+        })
+        .fold(0, |a, b| a | b);
     let out_of_budget = t.a.new_label();
     t.a.subs_imm(Width::X, BUDGET, BUDGET, block.len() as u32)?;
     t.a.b_cond(Cond::Mi, out_of_budget);
@@ -1289,10 +1300,26 @@ pub fn translate_block(
     t.side_exits_out_of_line()?;
     // The loop's copy, if an exit asked for one: from the state of that
     // exit, its own budget check and way out of it.
-    while let Some(i) = t.loops.iter().position(|l| l.3) {
-        let (lazy, normal, head, _) = t.loops[i];
-        t.loops[i].3 = false;
+    while let Some(i) = t.loops.iter().position(|l| l.pending) {
+        let LoopCopy {
+            lazy,
+            normal,
+            head,
+            guard,
+            ..
+        } = t.loops[i];
+        t.loops[i].pending = false;
+        if let Some((label, assumed, plain)) = guard {
+            // From the block's body: the lanes above the low double of
+            // each assumed register must be 0, else the plain copy.
+            t.a.bind(label);
+            for n in (0..16).filter(|n| assumed & 1 << n != 0) {
+                t.a.umov(Lanes::D, T1, VReg::new(16 + n), 1)?;
+                t.a.cbz(true, Width::X, T1, plain);
+            }
+        }
         t.a.bind(head);
+        t.copy = Some(head);
         t.lazy = lazy;
         t.normal = normal;
         t.checked.clear();
@@ -1306,6 +1333,7 @@ pub fn translate_block(
         t.a.bind(copy_out_of_budget);
         t.lazy = lazy;
         t.exit(start, EXIT_CONTINUE)?;
+        t.copy = None;
     }
     t.a.bind(out_of_budget);
     t.lazy = Lazy::Dynamic;
@@ -1417,6 +1445,11 @@ pub fn translate_block(
     // UFC raised by the host, made x86's UE.
     for (entry, back, slow, double) in core::mem::take(&mut t.underflows) {
         t.underflow_fixup(entry, back, slow, double)?;
+    }
+    for (label, register, slow) in core::mem::take(&mut t.restores) {
+        t.a.bind(label);
+        t.a.mov_vector(register, V2);
+        t.a.b(slow);
     }
     // Slow paths: the instruction at `rip` goes to the interpreter, which
     // finds the state exactly as before it.
@@ -1677,6 +1710,29 @@ fn bytes(size: Size) -> u32 {
 
 /// The bit of an xmm register's vector register in `Translator::normal`
 /// (0 for the scratch registers, never known).
+/// A copy of the block for a jump back to its start (`Translator::loop_head`):
+/// the state it starts from, its head, whether it is still to emit, and,
+/// for one that assumes more than the jump knows, its guard: the label,
+/// the registers whose lanes above the low double it assumes 0 (bits 0..15
+/// of `normal`), and the copy to go to when they are not.
+#[derive(Clone, Copy)]
+struct LoopCopy {
+    lazy: Lazy,
+    normal: [u32; 2],
+    head: Label,
+    pending: bool,
+    guard: Option<(Label, u32, Label)>,
+}
+
+/// Bits 0..15 of `Translator::normal`: xmm n's bits above its low double
+/// (`normal[0]`) or above its low single (`normal[1]`) are known to be 0.
+fn upper_bit(v: VReg) -> u32 {
+    match v.bits() {
+        n @ 16..32 => 1 << (n - 16),
+        _ => 0,
+    }
+}
+
 fn normal_bit(v: VReg) -> u32 {
     match v.bits() {
         n @ 16..32 => 1 << n,
@@ -1909,7 +1965,14 @@ struct Translator {
     /// Copies of the block's body (`exit_direct`): the state they are
     /// translated from (the flags pending, the xmm values known), their
     /// head, and whether they are still to be emitted.
-    loops: Vec<(Lazy, [u32; 2], Label, bool)>,
+    loops: Vec<LoopCopy>,
+    /// The head of the loop copy being emitted (`None` in the block's own
+    /// body).
+    copy: Option<Label>,
+    /// The xmm registers (bit n) a scalar double operation of the block
+    /// writes: those a loop copy assumes the lanes above 0 for, checked at
+    /// its entry (`loop_head`).
+    scalar_doubles: u32,
     /// The instruction being translated is the block's last.
     last: bool,
     /// Lazy flags at the current point of the emitted code.
@@ -1936,6 +1999,10 @@ struct Translator {
     /// Out of line: the rest of `slow_if_denormal` (entry, back, slow
     /// path, width).
     denormals: Vec<(Label, Label, Label, Width)>,
+    /// A scalar result computed straight into its register (`FloatArith`):
+    /// out of line, the register as it was (in `V2`) put back, then its
+    /// slow path.
+    restores: Vec<(Label, VReg, Label)>,
     /// Out of line: a shift by cl whose count is 0 (entry, back, lazy
     /// flags before it): the pending flags into `FLAGS`, where the shift's
     /// deferred flags then find them (`lazy_shift`).
@@ -2110,6 +2177,8 @@ impl Translator {
             side_exits: Vec::new(),
             loop_start: None,
             loops: Vec::new(),
+            copy: None,
+            scalar_doubles: 0,
             last: false,
             chain_stubs: Vec::new(),
             at_rip: 0,
@@ -2117,6 +2186,7 @@ impl Translator {
             unaligned: Vec::new(),
             underflows: Vec::new(),
             denormals: Vec::new(),
+            restores: Vec::new(),
             zero_counts: Vec::new(),
             kind_carries: Vec::new(),
             nzcv_valid: false,
@@ -3929,18 +3999,37 @@ impl Translator {
                         self.a.fcsel(double, V2, d, b, cond);
                     }
                     _ => {
+                        // The lanes above known 0 (`upper_bit`): the result
+                        // straight into the register, whose next reader then
+                        // does not wait for a copy; the register as it was
+                        // waits in `V2` for the slow paths after it
+                        // (`restores`). Otherwise into `V2`, then the low lane.
+                        let direct = upper_bit(d) & self.normal[usize::from(!double)] != 0;
+                        let (r, mut after) = if direct {
+                            self.a.mov_vector(V2, d);
+                            let real = self.slow_path(at.rip, slow);
+                            let restore = self.a.new_label();
+                            self.restores.push((restore, d, real));
+                            (d, Some(restore))
+                        } else {
+                            (V2, *slow)
+                        };
                         match op {
-                            FloatOp::Add => self.a.fp_arith(FpOp::Add, double, V2, d, b),
-                            FloatOp::Sub => self.a.fp_arith(FpOp::Sub, double, V2, d, b),
-                            FloatOp::Mul => self.a.fp_arith(FpOp::Mul, double, V2, d, b),
-                            FloatOp::Div => self.a.fp_arith(FpOp::Div, double, V2, d, b),
-                            FloatOp::Sqrt => self.a.fsqrt(double, V2, b),
+                            FloatOp::Add => self.a.fp_arith(FpOp::Add, double, r, d, b),
+                            FloatOp::Sub => self.a.fp_arith(FpOp::Sub, double, r, d, b),
+                            FloatOp::Mul => self.a.fp_arith(FpOp::Mul, double, r, d, b),
+                            FloatOp::Div => self.a.fp_arith(FpOp::Div, double, r, d, b),
+                            FloatOp::Sqrt => self.a.fsqrt(double, r, b),
                             _ => unreachable!("checked by supported"),
                         }
-                        self.slow_if_nan(double, V2, at.rip, slow);
+                        self.slow_if_nan(double, r, at.rip, &mut after);
                         if matches!(op, FloatOp::Mul | FloatOp::Div) {
-                            self.underflow(double, V2, at.rip, slow)?;
+                            self.underflow(double, r, at.rip, &mut after)?;
                         }
+                        if direct {
+                            return Ok(());
+                        }
+                        *slow = after;
                     }
                 }
                 self.scalar_result(double, d)
@@ -4322,8 +4411,15 @@ impl Translator {
     }
 
     /// The scalar result in `V2` into the low lane of `d`, keeping the
-    /// other lanes.
+    /// other lanes: a scalar `fmov`, which clears them, when they are known
+    /// to be 0 (`upper_bits`), shorter on the result's way than the lane
+    /// insertion.
     fn scalar_result(&mut self, double: bool, d: VReg) -> Emit {
+        let zero = upper_bit(d) & self.normal[usize::from(!double)] != 0;
+        if zero {
+            self.a.fmov_reg(double, d, V2);
+            return Ok(());
+        }
         let lanes = if double { Lanes::D } else { Lanes::S };
         self.a.ins_element(lanes, d, 0, V2, 0)
     }
@@ -4481,6 +4577,7 @@ impl Translator {
             }
             return;
         };
+        self.update_upper_bits(op, dst, src);
         let bit = |o: &Operand| match o {
             Operand::Reg(Reg::Xmm(n)) => 1u32 << (16 + u32::from(*n)),
             _ => 0,
@@ -4538,6 +4635,52 @@ impl Translator {
             SseOp::PcmpStr { .. } => self.normal = [0; 2],
             _ => result(None, double_known, single_known),
         }
+    }
+
+    /// Whether the lanes above the low double and above the low single of
+    /// `dst` are known 0 after the instruction (`upper_bit`): a load of a
+    /// scalar, `movd`/`movq`, `xor` with itself zero them, a scalar
+    /// operation keeps them, a copy takes the source's; anything else that
+    /// writes `dst` forgets them.
+    fn update_upper_bits(&mut self, op: SseOp, dst: Operand, src: Operand) {
+        let bit = |o: &Operand| match o {
+            Operand::Reg(Reg::Xmm(n)) => 1u32 << n,
+            _ => 0,
+        };
+        let (d, s) = (bit(&dst), bit(&src));
+        if d == 0 {
+            return;
+        }
+        let [above_double, above_single] = self.normal;
+        let had = |set: u32, b: u32| set & b != 0;
+        let (double, single) = match op {
+            SseOp::MovScalar { double } if src.is_mem() => (true, !double),
+            SseOp::MovScalar { double: true } => (
+                had(above_double, d),
+                had(above_double, d) && had(above_single, s),
+            ),
+            SseOp::MovScalar { double: false } => (had(above_double, d), had(above_single, d)),
+            SseOp::Mov128 { .. } if s != 0 => (had(above_double, s), had(above_single, s)),
+            SseOp::MovToXmm { bytes } => (true, bytes <= 4),
+            SseOp::MovFromXmm { .. } => (true, had(above_single, s)),
+            SseOp::Logic(LogicOp::Xor) if d == s => (true, true),
+            SseOp::FloatArith { double, .. }
+            | SseOp::FloatCmpMask { double, .. }
+            | SseOp::IntToFloat { double, .. } => {
+                (had(above_double, d), !double && had(above_single, d))
+            }
+            SseOp::FloatToFloat { to_double } => {
+                (had(above_double, d), !to_double && had(above_single, d))
+            }
+            // Read xmm only.
+            SseOp::FloatCompare { .. } | SseOp::FloatToInt { .. } => return,
+            _ => (false, false),
+        };
+        let set = |known: bool, word: &mut u32| {
+            *word = if known { *word | d } else { *word & !d };
+        };
+        set(double, &mut self.normal[0]);
+        set(single, &mut self.normal[1]);
     }
 
     /// To the slow path if `v` is a NaN.
@@ -4648,16 +4791,62 @@ impl Translator {
             return None;
         }
         let (lazy, normal) = (self.lazy, self.normal);
-        let fits =
-            |l: &Lazy, n: &[u32; 2]| *l == lazy && n[0] & !normal[0] == 0 && n[1] & !normal[1] == 0;
-        if let Some(&(_, _, head, _)) = self.loops.iter().find(|(l, n, _, _)| fits(l, n)) {
-            return Some(head);
+        // The state implies the copy's, but for the bits of `assumed`.
+        let fits = |c: &LoopCopy, assumed: u32| {
+            c.lazy == lazy
+                && (c.normal[0] & !assumed) & !normal[0] == 0
+                && c.normal[1] & !normal[1] == 0
+        };
+        // Within a copy, back to its own head while the state fits it.
+        if let Some(own) = self.copy
+            && let Some(c) = self.loops.iter().find(|c| c.head == own)
+            && fits(c, 0)
+        {
+            return Some(own);
+        }
+        for c in &self.loops {
+            if fits(c, 0) {
+                return Some(c.head);
+            }
+            if let Some((guard, assumed, _)) = c.guard
+                && fits(c, assumed)
+            {
+                return Some(guard);
+            }
         }
         if !self.loops.is_empty() {
             return None;
         }
         let head = self.a.new_label();
-        self.loops.push((lazy, normal, head, true));
+        // Scalar doubles in registers whose lanes above are not known 0:
+        // a copy that assumes them 0 (results straight into the registers,
+        // `FloatArith`), behind a guard; when it fails, the plain copy.
+        let assumed = self.scalar_doubles & !normal[0] & 0xffff;
+        if assumed != 0 {
+            let (guard, plain) = (self.a.new_label(), self.a.new_label());
+            self.loops.push(LoopCopy {
+                lazy,
+                normal: [normal[0] | assumed, normal[1]],
+                head,
+                pending: true,
+                guard: Some((guard, assumed, plain)),
+            });
+            self.loops.push(LoopCopy {
+                lazy,
+                normal,
+                head: plain,
+                pending: true,
+                guard: None,
+            });
+            return Some(guard);
+        }
+        self.loops.push(LoopCopy {
+            lazy,
+            normal,
+            head,
+            pending: true,
+            guard: None,
+        });
         Some(head)
     }
 

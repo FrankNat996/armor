@@ -1358,6 +1358,12 @@ impl Assembler {
     }
 
     /// FMOV: rd (W for a single, X for a double) = the bits of vn.
+    /// FMOV Sd, Sn / Dd, Dn: the low lane, the rest of `vd` cleared.
+    pub fn fmov_reg(&mut self, double: bool, vd: VReg, vn: VReg) {
+        let word = if double { 0x1E60_4000 } else { 0x1E20_4000 };
+        self.emit(word | (vn.bits() << 5) | vd.bits());
+    }
+
     pub fn fmov_to_gpr(&mut self, double: bool, rd: Reg, vn: VReg) {
         let word = if double { 0x9E66_0000 } else { 0x1E26_0000 };
         self.emit(word | (vn.bits() << 5) | rd.bits());
